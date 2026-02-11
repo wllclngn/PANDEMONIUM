@@ -1,0 +1,44 @@
+// PANDEMONIUM SHARED INTERFACE
+// CONSTANTS AND STRUCTURES SHARED BETWEEN BPF AND RUST
+
+#ifndef __INTF_H
+#define __INTF_H
+
+// BPF VERIFIER LOOP BOUNDS
+#define MAX_CPUS  1024   // PER-CPU DSQ CREATION
+#define MAX_NODES 32     // CROSS-NODE STEAL LOOP (REAL SYSTEMS: 1-8 NODES)
+
+// LAT_CRI SCORE HISTOGRAM -- 32 BUCKETS (EACH SPANS 8 SCORE POINTS)
+// BUCKET 0: SCORE 0-7, BUCKET 1: 8-15, ..., BUCKET 31: 248-255
+#define LAT_CRI_HIST_BUCKETS 32
+
+struct lat_cri_histogram {
+	u64 buckets[LAT_CRI_HIST_BUCKETS];
+};
+
+// BEHAVIORAL TIERS -- COMPUTED FROM RUNTIME METRICS, NOT COMM NAME
+enum task_tier {
+	TIER_BATCH        = 0,
+	TIER_INTERACTIVE  = 1,
+	TIER_LAT_CRITICAL = 2,
+};
+
+// PER-CPU STATISTICS (BPF_MAP_TYPE_PERCPU_ARRAY VALUE)
+struct pandemonium_stats {
+	u64 nr_dispatches;
+	u64 nr_idle_hits;      // SELECT_CPU FAST PATH -> SCX_DSQ_LOCAL
+	u64 nr_direct;         // ENQUEUE -> IDLE FOUND -> PER-CPU DSQ
+	u64 nr_overflow;       // ENQUEUE -> NO IDLE -> OVERFLOW DSQ
+	u64 nr_preempt;        // PREEMPTIVE KICKS (SCX_KICK_PREEMPT)
+	u64 nr_interactive;    // TIER_INTERACTIVE + TIER_LAT_CRITICAL WAKEUPS
+	u64 nr_sticky;
+	u64 nr_boosted;        // COMM-NAME BOOST (BUILD_MODE ONLY)
+	u64 nr_kicks;
+	u64 nr_lat_critical;   // TIER_LAT_CRITICAL WAKEUPS
+	u64 nr_batch;          // TIER_BATCH WAKEUPS
+	u64 lat_cri_sum;       // SUM OF lat_cri SCORES AT WAKEUP (FOR AVG)
+	u64 nr_tier_changes;   // TASK TIER CHANGED FROM PREVIOUS CLASSIFICATION
+	u64 nr_compositor;     // COMPOSITOR-BOOSTED WAKEUPS
+};
+
+#endif // __INTF_H

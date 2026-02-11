@@ -1,0 +1,23 @@
+[package]
+name = "pandemonium"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+libbpf-rs = "0.26"
+libc = "0.2"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+ctrlc = { version = "3", features = ["termination"] }
+
+[dev-dependencies]
+regex = "1"
+libc = "0.2"
+
+[build-dependencies]
+libbpf-cargo = "0.26"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
