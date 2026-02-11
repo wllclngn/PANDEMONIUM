@@ -1,21 +1,97 @@
-# PANDEMONIUMv0.9.3
+# PANDEMONIUM
 
-A behavioral-adaptive Linux scheduler built on sched_ext. Classifies tasks by runtime behavior -- not process names -- and adapts scheduling parameters to match. Scheduling decisions happen in BPF with zero kernel-userspace round trips. Everything else is Rust: configuration, monitoring, benchmarking, testing.
+Behavioral-adaptive Linux kernel scheduler. Built on sched_ext. Written in Rust and BPF (GNU C23).
+
+Classifies every task on the system by runtime behavior -- wakeup frequency, context switch rate, execution time, runtime variance -- and adapts scheduling decisions in real time. No heuristic tables. No process name matching. Pure behavioral signal.
+
+**Beats the default Linux scheduler (EEVDF) on both throughput and tail latency under contention.**
+
+```
+CONTENTION BENCHMARK (BUILD + INTERACTIVE PROBE)
+SCHEDULER                   BUILD  SAMPLES   MEDIAN      P99    WORST
+------------------------ -------- -------- -------- -------- --------
+EEVDF (DEFAULT)            17.02s     1780      69us    1991us   10158us
+PANDEMONIUM (BUILD-MODE)   16.37s     1716      67us    1411us    4662us
+
+BUILD DELTA: -3.8% (PANDEMONIUM IS 3.8% FASTER)
+P99 LATENCY DELTA: -580us (PANDEMONIUM IS 580us BETTER)
+
+SCALING BENCHMARK (8 CORES, STRESS WORKERS + INTERACTIVE PROBE)
+SCHEDULER       MEDIAN      P99    WORST
+------------ -------- -------- --------
+EEVDF              58us    3200us   30090us
+PANDEMONIUM        54us      56us    5522us
+
+P99 DELTA: -3144us (PANDEMONIUM IS 57x BETTER)
+```
+
+Contention workload: parallel Rust compilation + interactive wakeup probe (10ms sleep/wake cycle). Scaling workload: N-1 stress workers pinned to idle CPUs + interactive probe. 12-thread AMD system.
+
+## How It Works
+
+### Three-Tier Dispatch
+
+```
+TIER 0  select_cpu()    Idle CPU found -> SCX_DSQ_LOCAL          ~98% of wakeups
+TIER 1  enqueue()       Node-local idle CPU -> per-CPU DSQ       Zero contention
+TIER 2  enqueue()       Direct per-CPU placement + preempt kick  Bypasses overflow
+        (fallback)      Per-node overflow DSQ -> work stealing   NUMA-scoped
+```
+
+When a latency-sensitive task can't find an idle CPU, PANDEMONIUM places it directly onto a busy CPU's per-CPU dispatch queue and issues `SCX_KICK_PREEMPT` to zero the running task's slice. The kicked CPU finds the interactive task first on reschedule -- no overflow queue contention, no searching. This is the mechanism that closes the P99 gap with EEVDF.
+
+### Behavioral Classification
+
+Every task accumulates a latency-criticality score from four EWMA-smoothed signals:
+
+```
+lat_cri = (wakeup_freq * csw_rate) / effective_runtime
+effective_runtime = avg_runtime + (runtime_deviation / 2)
+```
+
+| Tier | Score | Behavior |
+|------|-------|----------|
+| LAT_CRITICAL | >= high threshold | Shortest slices, preemptive kicks, direct placement |
+| INTERACTIVE | >= low threshold | Medium slices, preemptive kicks when short-runtime |
+| BATCH | below low threshold | Core-scaled slices, polite kicks, full throughput |
+
+Thresholds are tunable at load time (`--lat-cri-low`, `--lat-cri-high`) or discovered automatically via `--calibrate`.
+
+Compositors (kwin, sway, Hyprland, gnome-shell, etc.) are always boosted to LAT_CRITICAL. PipeWire runs at RT priority via RTKIT and bypasses sched_ext entirely.
+
+### Adaptive Safety Nets
+
+- **Interactive guard**: When observed wakeup-to-run latency exceeds the base slice, batch task slices are temporarily clamped. The guard window scales proportionally to the detected delay and expires naturally. No permanent global penalty.
+- **Tick preemption** (lightweight mode): On systems with 4 or fewer cores, a tick-based safety net preempts long-running batch tasks when interactive work is pending.
+- **Runtime variance tracking**: Tasks with jittery execution times are penalized in classification, preventing unstable tasks from holding high-priority tiers.
+- **Idle CPU bitmap**: `tick()` snapshots `scx_bpf_get_idle_cpumask()` into a BPF map pinned to `/sys/fs/bpf/pandemonium/idle_cpus`. Exposes kernel idle state to userspace for intelligent load placement. Read via `pandemonium idle-cpus`.
+
+### Core-Count Scaling
+
+All parameters scale continuously with CPU count:
+
+| Cores | Preempt Threshold | Batch Ceiling |
+|-------|-------------------|---------------|
+| 2 | 15 | ~5ms |
+| 8 | 6 | ~20ms |
+| 32 | 3 | ~80ms |
+
+EWMA convergence uses bit shifts only. No floats. BPF-verifier-safe.
 
 ## Requirements
 
 - Linux kernel 6.12+ with `CONFIG_SCHED_CLASS_EXT=y`
-- Rust toolchain (rustup.rs)
+- Rust toolchain
 - clang (BPF compilation)
-- Root privileges (sched_ext requires CAP_SYS_ADMIN)
+- bpftool (vmlinux.h generation from running kernel BTF)
+- system libbpf
+- Root privileges (`CAP_SYS_ADMIN`)
 
-Arch Linux:
-```
-pacman -S clang libbpf rust
-```
+```bash
+# Arch Linux
+pacman -S clang libbpf bpf rust
 
-Check all dependencies:
-```
+# Verify everything
 pandemonium check
 ```
 
@@ -25,46 +101,69 @@ pandemonium check
 CARGO_TARGET_DIR=/tmp/pandemonium-build cargo build --release
 ```
 
-Or let the `start` subcommand handle it:
+Or let `start` handle it:
 ```bash
 pandemonium start
 ```
 
+vmlinux.h is generated at build time from `/sys/kernel/btf/vmlinux` via bpftool and cached at `/tmp/pandemonium-vmlinux.h`. A generic vmlinux.h will not work -- sched_ext types only exist in kernels with `CONFIG_SCHED_CLASS_EXT=y`.
+
 ## Usage
 
-PANDEMONIUM is a single binary with subcommands:
-
 ```
-pandemonium run     Run the scheduler (needs root)
-pandemonium start   Build + run with sudo + capture dmesg + save logs
-pandemonium check   Verify dependencies and kernel config
-pandemonium bench   A/B benchmark (EEVDF baseline vs PANDEMONIUM)
-pandemonium test    Run test gate (unit + integration)
-pandemonium dmesg   Show filtered kernel log
-pandemonium probe   Interactive wakeup probe (standalone)
+pandemonium run         Run the scheduler (needs root)
+pandemonium start       Build + sudo run + dmesg capture + log management
+pandemonium check       Verify dependencies and kernel config
+pandemonium bench       A/B benchmark against EEVDF
+pandemonium bench-run   Build release + run benchmark + save logs
+pandemonium test        Full test gate (unit + integration)
+pandemonium test-scale  A/B scaling benchmark (EEVDF vs PANDEMONIUM, CPU hotplug)
+pandemonium probe       Standalone interactive wakeup probe
+pandemonium idle-cpus   Print idle CPU bitmask (requires running scheduler)
+pandemonium dmesg       Filtered kernel log
 ```
 
 Running with no subcommand defaults to `run`.
 
+### Benchmark Modes
+
+```bash
+# Contention benchmark (P99 tail latency under parallel build + probe)
+pandemonium bench --mode contention -- --build-mode
+
+# Full A/B build benchmark (5 iterations)
+pandemonium bench --mode self --iterations 5
+
+# Audio quality under load (xrun tracking)
+pandemonium bench --mode mixed
+
+# Custom command A/B
+pandemonium bench --mode cmd --cmd "make -j" --clean-cmd "make clean"
+```
+
 ### Examples
 
 ```bash
-# Build, run, capture output + dmesg, save logs
+# Standard operation
 pandemonium start
 
-# Run with verbose monitoring
+# Verbose monitoring with full time series dump on exit
 pandemonium start --observe
 
-# Run scheduler directly (needs root)
+# Compile-heavy workload (boost compiler/linker weights)
 sudo pandemonium run --build-mode --verbose
 
-# Calibrate tier thresholds
+# Tune classification thresholds for your workload
 pandemonium start --calibrate
+
+# Custom thresholds
+sudo pandemonium run --lat-cri-low 12 --lat-cri-high 48
+
+# Override CPU count for scaling formula testing
+sudo pandemonium run --nr-cpus 4 --verbose
 ```
 
 ## Configuration
-
-Flags for the `run` subcommand (pass after `--` when using `start` or `bench`):
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -72,150 +171,106 @@ Flags for the `run` subcommand (pass after `--` when using `start` or `bench`):
 | `--slice-ns` | 5000000 | Base time slice (5ms) |
 | `--slice-min` | 500000 | Minimum slice floor (0.5ms) |
 | `--slice-max` | 20000000 | Maximum slice ceiling (20ms) |
-| `--verbose` | off | Print per-second stats |
-| `--dump-log` | off | Dump full time series on exit |
-| `--lightweight` | auto | Force lightweight mode (skip full classification) |
-| `--no-lightweight` | auto | Force full engine even on few cores |
-| `--calibrate` | off | Collect histogram and suggest thresholds |
-
-Lightweight mode auto-enables on 4 cores or fewer, replacing the full EWMA classification engine with a simple voluntary-CSW heuristic.
-
-## Architecture
-
-### Three-Tier Dispatch
-
-```
-TIER 0  select_cpu()    Idle CPU found -> SCX_DSQ_LOCAL          ~98% of wakeups
-TIER 1  enqueue()       Node-local idle CPU -> per-CPU DSQ       Zero contention
-TIER 2  enqueue()       Per-node overflow DSQ + behavioral kick  NUMA-scoped steal
-```
-
-Dispatch consumption mirrors this: own per-CPU DSQ first, then node overflow, then cross-node steal.
-
-### Behavioral Classification
-
-Every task gets a latency-criticality score from three EWMA-smoothed signals:
-
-```
-lat_cri = (wakeup_freq * csw_rate) / avg_runtime_ms
-```
-
-| Tier | Score | Examples | Behavior |
-|------|-------|----------|----------|
-| LAT_CRITICAL | >= 32 | Compositors, audio, input | Shortest slices, preemptive kicks |
-| INTERACTIVE | 8-31 | Editors, terminals, browsers | Medium slices |
-| BATCH | < 8 | Compilers, encoders | Full slices, relaxed deadline |
-
-Compositors are always boosted to LAT_CRITICAL regardless of score. PipeWire runs at RT priority via RTKIT and bypasses sched_ext entirely.
-
-### EWMA Convergence
-
-```
-Age < 8 wakeups:   50/50 split    Fast convergence for new tasks
-Age >= 8 wakeups:  87.5/12.5      Stability for established tasks
-```
-
-All bit shifts. No floats. BPF-verifier-safe.
-
-### Core-Count Scaling
-
-Batch slice ceiling and preempt threshold scale continuously with CPU count:
-
-| Cores | Preempt Threshold | Batch Ceiling |
-|-------|-------------------|---------------|
-| 2 | 15 | ~5ms |
-| 8 | 6 | ~20ms |
-| 32 | 3 | ~80ms |
-
-## Benchmarking
-
-Built-in A/B comparison against the default EEVDF scheduler:
-
-```bash
-# Self-build benchmark (compile PANDEMONIUM itself)
-pandemonium bench --mode self
-
-# Contention: compile + interactive wakeup probe (measures P99 latency)
-pandemonium bench --mode contention
-
-# Mixed: compile + audio playback (measures xruns)
-pandemonium bench --mode mixed
-
-# Custom command
-pandemonium bench --mode cmd --cmd 'make -j$(nproc)' --clean-cmd 'make clean' --iterations 5
-```
-
-Each benchmark runs N iterations under EEVDF, starts PANDEMONIUM, runs N more, and reports the delta.
-
-Reports are saved to `/tmp/pandemonium/`.
+| `--lat-cri-low` | 8 | Score threshold for INTERACTIVE tier |
+| `--lat-cri-high` | 32 | Score threshold for LAT_CRITICAL tier |
+| `--nr-cpus` | auto | Override CPU count for scaling formulas |
+| `--verbose` | off | Per-second stats output |
+| `--dump-log` | off | Full time series on exit |
+| `--lightweight` | auto | Force lightweight classification mode |
+| `--no-lightweight` | auto | Force full engine on small core counts |
+| `--calibrate` | off | Histogram collection + threshold suggestion |
 
 ## Monitoring
 
-With `--verbose`, PANDEMONIUM prints per-second deltas:
+With `--verbose`, per-second deltas including wakeup latency tracking:
 
 ```
 dispatches/s: 12847  idle: 11923  direct: 412  overflow: 82  preempt: 31
 lat_cri: 45  int: 892  batch: 11910  sticky: 200  boosted: 0
-kicks: 31  avg_score: 12  tier_chg: 8
+kicks: 31  avg_score: 12  tier_chg: 8  wake_avg: 4200  wake_max: 189000
 ```
 
 | Counter | Meaning |
 |---------|---------|
-| dispatches/s | Tasks that completed a CPU slice |
 | idle | Placed via select_cpu idle fast path |
-| direct | Placed on idle per-CPU DSQ in enqueue |
+| direct | Placed on per-CPU DSQ (idle or preemptive) |
 | overflow | Placed on node overflow DSQ |
-| preempt | Preemptive kicks issued |
-| lat_cri / int / batch | Tasks classified per tier |
-| sticky | Tasks with avg runtime < 10us |
-| boosted | Tasks that got build-mode weight boost |
-| avg_score | Average lat_cri score this second |
-| tier_chg | Tasks that changed tier |
+| preempt | Preemptive kicks issued (SCX_KICK_PREEMPT) |
+| lat_cri / int / batch | Wakeups classified per tier |
+| wake_avg / wake_max | Non-batch wakeup-to-run latency (ns) |
 
-On exit, a summary shows totals, peak dispatch rate, idle hit rate, and tier distribution.
+## Testing
 
-## Test Gate
+All tests live in `tests/`:
 
-Five-layer test suite:
-
-| Layer | What | Requires |
-|-------|------|----------|
-| 1 | Rust unit tests | Nothing |
-| 2 | BPF load/classify/unload | Root, sched_ext |
-| 3 | Latency gate (cyclictest) | Root, cyclictest |
-| 4 | Interactive responsiveness | Root |
-| 5 | Contention latency | Root |
+```
+tests/
+  event.rs    Unit tests (ring buffer, snapshot recording, summary/dump safety)
+  gate.rs     Integration test gate (5 layers, requires root + sched_ext kernel)
+  scale.rs    A/B scaling benchmark (EEVDF vs PANDEMONIUM across core counts)
+```
 
 ```bash
-# Full gate
+# Unit tests (no root required)
+cargo test --release --test event
+
+# Full test gate (requires root + sched_ext kernel)
 pandemonium test
 
-# Unit tests only
-CARGO_TARGET_DIR=/tmp/pandemonium-build cargo test --release
+# Or run integration layers directly
+sudo cargo test --test gate --release -- --ignored --test-threads=1 full_gate
+
+# Core-count scaling benchmark (A/B vs EEVDF, CPU hotplug, requires root)
+pandemonium test-scale
 ```
+
+**Test gate layers:**
+
+| Layer | Name | What it tests |
+|-------|------|---------------|
+| 1 | Unit tests | Ring buffer, snapshot recording, summary/dump |
+| 2 | Load/Classify/Unload | BPF lifecycle, dispatch stats, classification |
+| 3 | Latency gate | cyclictest under scheduler (avg latency threshold) |
+| 4 | Interactive | Wakeup overshoot (median < 500us) |
+| 5 | Contention | Interactive latency under full CPU saturation |
+
+**Scaling benchmark** (`tests/scale.rs`): A/B comparison at each core count [1, 2, 4, 8, max] via CPU hotplug. Detects idle CPUs before each phase (BPF idle bitmap for PANDEMONIUM, `/proc/stat` delta for EEVDF), pins stress workers to idle cores via `sched_setaffinity`, reserves 1 core for system tasks. 3s warmup discard + 5s settlement for stable measurement. Reports median, P99, and worst wakeup latency with deltas.
 
 ## Project Layout
 
 ```
 src/
-  main.rs              CLI entry point, subcommand dispatch, scheduler loop
-  scheduler.rs         BPF skeleton lifecycle (open/configure/load/attach/monitor)
+  lib.rs               Library root (exports event module for tests)
+  main.rs              CLI, subcommand dispatch, scheduler loop
+  scheduler.rs         BPF skeleton lifecycle + calibration mode
   event.rs             Pre-allocated ring buffer for stats time series
   bpf/
-    main.bpf.c         BPF scheduler (select_cpu, enqueue, dispatch, tick, etc.)
+    main.bpf.c         BPF scheduler (~890 lines, GNU C23)
     intf.h             Shared constants and structs (BPF <-> Rust)
   cli/
-    mod.rs             Shared constants, helpers (is_scx_active, wait_for_activation)
-    check.rs           Dependency and kernel config verification
-    run.rs             Build, sudo execution, dmesg capture, log management
+    mod.rs             Shared constants, helpers
+    check.rs           Dependency + kernel config verification
+    run.rs             Build, sudo execution, dmesg, log management
     bench.rs           A/B benchmarking (self, contention, mixed, cmd)
-    probe.rs           Interactive wakeup probe (clock_gettime + nanosleep)
+    probe.rs           Interactive wakeup probe
+    idle_cpus.rs       Read BPF idle bitmap from running scheduler
     report.rs          Statistics, formatting, file output
     test_gate.rs       Test gate orchestration
+    child_guard.rs     RAII child process guard (SIGINT -> SIGKILL + killpg)
+    death_pipe.rs      Orphan detection via pipe POLLHUP
+build.rs               vmlinux.h generation + C23 patching + BPF compilation
 tests/
-  gate.rs              Integration test gate (layers 2-5)
-include/               Vendored sched_ext + vmlinux headers
+  event.rs             Unit tests (ring buffer)
+  gate.rs              Integration test gate (5 layers)
+  scale.rs             A/B scaling benchmark (EEVDF vs PANDEMONIUM)
+include/
+  scx/                 Vendored sched_ext headers
 ```
+
+## Attribution
+
+- `include/scx/*` headers from the [sched_ext](https://github.com/sched-ext/scx) project (GPL-2.0)
+- vmlinux.h generated at build time from the running kernel's BTF via bpftool
 
 ## License
 

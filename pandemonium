@@ -1,0 +1,64 @@
+#!/bin/bash
+# PANDEMONIUM LAUNCHER
+# BUILDS IF NEEDED, THEN RUNS THE BINARY WITH ALL ARGS FORWARDED.
+#
+# USAGE:
+#   ./pandemonium start --observe
+#   ./pandemonium bench --mode contention
+#   sudo ./pandemonium bench --mode contention
+#   ./pandemonium test-scale
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+TARGET_DIR="/tmp/pandemonium-build"
+BIN="$TARGET_DIR/release/pandemonium"
+CARGO="$(which cargo)"
+RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+
+# CLEANUP: KILL CHILD PROCESS GROUP ON EXIT
+CHILD_PID=
+cleanup() {
+    if [ -n "$CHILD_PID" ] && kill -0 "$CHILD_PID" 2>/dev/null; then
+        kill -TERM -"$CHILD_PID" 2>/dev/null || true
+        sleep 0.5
+        kill -KILL -"$CHILD_PID" 2>/dev/null || true
+        wait "$CHILD_PID" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# BUILD IF BINARY MISSING OR SOURCE IS NEWER
+build_if_needed() {
+    if [ ! -f "$BIN" ] || [ "$(find "$SCRIPT_DIR/src" "$SCRIPT_DIR/Cargo.toml" "$SCRIPT_DIR/build.rs" -newer "$BIN" 2>/dev/null | head -1)" ]; then
+        echo "BUILDING PANDEMONIUM (RELEASE)..."
+        CARGO_TARGET_DIR="$TARGET_DIR" cargo build --release --manifest-path "$SCRIPT_DIR/Cargo.toml"
+        echo
+    fi
+}
+
+# ROUTE TEST SUBCOMMANDS THROUGH CARGO TEST (WITH SUDO)
+case "$1" in
+    test-scale)
+        build_if_needed
+        echo "RUNNING SCALING BENCHMARK (A/B VS EEVDF)..."
+        echo "THIS REQUIRES ROOT (CPU HOTPLUG + BPF)."
+        echo
+        sudo CARGO_TARGET_DIR="$TARGET_DIR" \
+            RUSTUP_HOME="$RUSTUP_HOME" \
+            CARGO_HOME="$CARGO_HOME" \
+            PATH="$PATH" \
+            "$CARGO" test --test scale --release \
+            --manifest-path "$SCRIPT_DIR/Cargo.toml" \
+            -- --ignored --test-threads=1 --nocapture &
+        CHILD_PID=$!
+        wait "$CHILD_PID"
+        ;;
+    *)
+        build_if_needed
+        exec "$BIN" "$@"
+        ;;
+esac

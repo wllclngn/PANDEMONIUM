@@ -1,6 +1,11 @@
 // PANDEMONIUM -- SCHED_EXT KERNEL SCHEDULER
 // BEHAVIORAL-ADAPTIVE GENERAL-PURPOSE SCHEDULING FOR LINUX
 //
+// ORIGINALLY DERIVED FROM scx_lavd (sched_ext/scx).
+// SUBSTANTIALLY REWRITTEN: DISPATCH TOPOLOGY, BEHAVIORAL ENGINE,
+// CORE-COUNT SCALING, INTERACTIVE GUARD, AND LIGHTWEIGHT MODE
+// ARE PANDEMONIUM-ORIGINAL.
+//
 // ADAPTIVE THREE-TIER DISPATCH:
 //   TIER 0: SELECT_CPU IDLE FAST PATH -> SCX_DSQ_LOCAL (98%+ OF TASKS)
 //   TIER 1: PER-CPU DSQs -- ZERO-CONTENTION DIRECTED PLACEMENT
@@ -24,15 +29,16 @@ const volatile u64 slice_min_ns = 500000;         // 0.5MS FLOOR (INTERACTIVE)
 const volatile u64 slice_max_ns = 20000000;       // 20MS CEILING (COMPILERS)
 const volatile bool build_mode = false;           // OPT-IN COMPILER WEIGHT BOOST
 const volatile bool lightweight_mode = false;     // SKIP FULL CLASSIFICATION (AUTO ON <=4 CORES)
-const volatile u64 nr_cpu_ids = 1;               // SET BY RUST (num_possible_cpus)
+const volatile u64 nr_cpu_ids = 1;               // SET BY RUST (num_possible_cpus) -- DSQ CREATION
+const volatile u64 nr_scaling_cpus = 1;          // SET BY RUST (--nr-cpus override) -- BEHAVIORAL FORMULAS
+const volatile u64 lat_cri_thresh_low = 8;       // ABOVE = TIER_INTERACTIVE
+const volatile u64 lat_cri_thresh_high = 32;     // ABOVE = TIER_LAT_CRITICAL
 
 // BEHAVIORAL ENGINE -- CALIBRATED AT INIT FROM HARDWARE TOPOLOGY
 static u64 scaled_slice_max;                      // CORE-SCALED MAX SLICE
 static u64 preempt_thresh = 10;                   // WAKEUP_FREQ GATE FOR PREEMPT KICKS
 
 // LATENCY-CRITICALITY THRESHOLDS (INTRINSIC TO TASK, NOT HARDWARE)
-#define LAT_CRI_THRESH_HIGH   32                  // ABOVE = TIER_LAT_CRITICAL
-#define LAT_CRI_THRESH_LOW    8                   // ABOVE = TIER_INTERACTIVE
 #define LAT_CRI_CAP           255                 // MAXIMUM SCORE
 
 // BEHAVIORAL WEIGHT MULTIPLIERS (UNITS OF 128 -- POWER-OF-2 FOR SHIFT DIVISION)
@@ -62,6 +68,8 @@ static u64 vtime_now;
 // POLITE KICKS ARE NOOPS (balance_one() KEEPS TASK IF SLICE > 0).
 // tick() ZEROES THE SLICE INSTEAD, FORCING NATURAL YIELD ON NEXT TICK.
 static bool interactive_waiting;
+// SHORT-LIVED GUARDRAIL FOR BATCH SLICES UNDER INTERACTIVE BACKLOG
+static u64 interactive_guard_until;
 
 // USER EXIT INFO FOR CLEAN SHUTDOWN
 UEI_DEFINE(uei);
@@ -82,6 +90,16 @@ struct {
 	__type(value, struct lat_cri_histogram);
 } hist_map SEC(".maps");
 
+// IDLE CPU BITMAP -- PINNED TO BPFFS FOR USERSPACE OBSERVABILITY
+// UPDATED EVERY TICK WITH scx_bpf_get_idle_cpumask() SNAPSHOT.
+// SINGLE u64 COVERS 64 CPUs (DESKTOP/WORKSTATION).
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, u64);
+} idle_bitmap SEC(".maps");
+
 static __always_inline struct pandemonium_stats *get_stats(void)
 {
 	u32 zero = 0;
@@ -95,6 +113,7 @@ struct task_ctx {
 	u64 wakeup_freq;      // EWMA OF WAKEUP FREQUENCY (HIGHER = MORE INTERACTIVE)
 	u64 last_woke_at;     // TIMESTAMP OF LAST WAKEUP
 	u64 avg_runtime;      // EWMA OF RUNTIME PER SCHEDULING CYCLE
+	u64 runtime_dev;      // EWMA OF |RUNTIME - AVG_RUNTIME| (VARIANCE SIGNAL)
 	u64 cached_weight;    // CACHED EFFECTIVE WEIGHT (UPDATED IN STOPPING)
 	u64 prev_nvcsw;       // SNAPSHOT OF task_struct->nvcsw
 	u64 csw_rate;         // EWMA OF VOLUNTARY CONTEXT SWITCHES PER 100MS
@@ -150,9 +169,10 @@ static __always_inline u64 update_freq(u64 freq, u64 interval_ns, u32 age)
 // COMPILER: LOW FREQ, LOW CSW, LONG RUNTIME -> SCORE ~0
 // COMPOSITOR: HIGH FREQ, HIGH CSW, SHORT RUNTIME -> SCORE 100+
 static __always_inline u64 compute_lat_cri(u64 wakeup_freq, u64 csw_rate,
-					    u64 avg_runtime_ns)
+					    u64 avg_runtime_ns, u64 runtime_dev_ns)
 {
-	u64 avg_runtime_ms = avg_runtime_ns >> 20; // >>20 ≈ /1048576 ≈ /1000000
+	u64 effective_runtime_ns = avg_runtime_ns + (runtime_dev_ns >> 1);
+	u64 avg_runtime_ms = effective_runtime_ns >> 20; // >>20 ≈ /1048576 ≈ /1000000
 	u64 score;
 
 	if (avg_runtime_ms == 0)
@@ -166,9 +186,9 @@ static __always_inline u64 compute_lat_cri(u64 wakeup_freq, u64 csw_rate,
 // MAP LATENCY-CRITICALITY SCORE TO BEHAVIORAL TIER
 static __always_inline u32 classify_tier(u64 lat_cri)
 {
-	if (lat_cri >= LAT_CRI_THRESH_HIGH)
+	if (lat_cri >= lat_cri_thresh_high)
 		return TIER_LAT_CRITICAL;
-	if (lat_cri >= LAT_CRI_THRESH_LOW)
+	if (lat_cri >= lat_cri_thresh_low)
 		return TIER_INTERACTIVE;
 	return TIER_BATCH;
 }
@@ -372,6 +392,7 @@ static __always_inline u64 task_deadline(struct task_struct *p,
 // LAT_CRITICAL: 1.5X AVG_RUNTIME (TIGHT, FAST PREEMPTION OPPORTUNITY)
 // INTERACTIVE:  2X AVG_RUNTIME (RESPONSIVE)
 // BATCH:        CORE-SCALED CEILING * WEIGHT / 100 (THROUGHPUT-ORIENTED)
+//              GUARDRAIL: TEMPORARILY CLAMP WHEN INTERACTIVE BACKLOG EXISTS
 static __always_inline u64 task_slice(struct task_ctx *tctx)
 {
 	u64 base;
@@ -391,6 +412,9 @@ static __always_inline u64 task_slice(struct task_ctx *tctx)
 			base = slice_min_ns;
 	} else {
 		ceiling = scaled_slice_max > 0 ? scaled_slice_max : slice_max_ns;
+		if (bpf_ktime_get_ns() < interactive_guard_until &&
+		    ceiling > slice_ns)
+			ceiling = slice_ns;
 		base = ceiling * tctx->cached_weight >> 7;
 		if (base > ceiling)
 			base = ceiling;
@@ -467,20 +491,27 @@ void BPF_STRUCT_OPS(pandemonium_enqueue, struct task_struct *p,
 		return;
 	}
 
-	// TIER 2: NODE-SCOPED OVERFLOW DSQ
-	overflow_id = nr_cpu_ids + (u64)node;
-	scx_bpf_dsq_insert_vtime(p, overflow_id, dyn_slice, dl, enq_flags);
+	// TIER 2: NO IDLE CPU -- BEHAVIORAL DISPATCH DECISION
+	// EACH TASK IS DISPATCHED EXACTLY ONCE: EITHER TO A PER-CPU DSQ
+	// (FAST PATH FOR INTERACTIVE/SHORT TASKS) OR TO THE OVERFLOW DSQ
+	// (FALLBACK FOR BATCH/LONG TASKS). NEVER BOTH.
 	s = get_stats();
-	if (s)
-		s->nr_overflow += 1;
+	overflow_id = nr_cpu_ids + (u64)node;
 
-	// BEHAVIORAL PREEMPTION:
-	// LIGHTWEIGHT: SHORT-RUNTIME TASKS GET SAME-CPU PREEMPTION.
-	//   DISPATCH TO CURRENT CPU'S PER-CPU DSQ + SELF-KICK.
-	//   SELF-KICK: NO IPI (JUST SETS NEED_RESCHED ON CURRENT CPU).
-	//   AFTER WAKEUP PATH RETURNS, CPU RESCHEDULES AND PICKS PROBE
-	//   FROM ITS OWN PER-CPU DSQ (CHECKED FIRST IN dispatch()).
-	// FULL MODE: TIER-BASED KICK STRENGTH.
+	// ARM INTERACTIVE GUARD: CLAMP BATCH SLICES WHILE INTERACTIVE
+	// WORK IS PENDING. WINDOW COVERS THE BATCH CEILING SO A
+	// NEWLY-STARTED BATCH TASK CAN'T OUTLAST THE GUARD.
+	if (tctx && tctx->tier != TIER_BATCH) {
+		u64 ceil = scaled_slice_max > 0 ? scaled_slice_max : slice_max_ns;
+		u64 window = ceil + slice_ns;
+		interactive_waiting = true;
+		interactive_guard_until = bpf_ktime_get_ns() + window;
+	}
+
+	// LIGHTWEIGHT MODE: SHORT-RUNTIME TASKS → PER-CPU DSQ + SELF-KICK
+	// SELF-KICK: NO IPI (JUST SETS NEED_RESCHED ON CURRENT CPU).
+	// AFTER WAKEUP PATH RETURNS, CPU RESCHEDULES AND PICKS TASK
+	// FROM ITS OWN PER-CPU DSQ (CHECKED FIRST IN dispatch()).
 	if (lightweight_mode) {
 		if (tctx && tctx->avg_runtime < 1000000) {
 			s32 this_cpu = bpf_get_smp_processor_id();
@@ -494,21 +525,50 @@ void BPF_STRUCT_OPS(pandemonium_enqueue, struct task_struct *p,
 			}
 			return;
 		}
+		// LONG TASK → OVERFLOW DSQ + OPTIONAL PREEMPT KICK
+		scx_bpf_dsq_insert_vtime(p, overflow_id, dyn_slice, dl, enq_flags);
+		if (s)
+			s->nr_overflow += 1;
+		if (tctx && tctx->tier == TIER_INTERACTIVE) {
+			interactive_waiting = true;
+			cpu = __COMPAT_scx_bpf_pick_any_cpu_node(
+				p->cpus_ptr, node, 0);
+			if (cpu >= 0) {
+				scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
+				if (s) {
+					s->nr_preempt += 1;
+					s->nr_kicks += 1;
+				}
+			}
+		}
 		return;
 	}
 
+	// FULL MODE: TIER-BASED DISPATCH
 	cpu = __COMPAT_scx_bpf_pick_any_cpu_node(p->cpus_ptr, node, 0);
-	if (cpu >= 0) {
-		if (tctx &&
-		    (tctx->tier == TIER_LAT_CRITICAL ||
-		     (tctx->tier == TIER_INTERACTIVE &&
-		      tctx->wakeup_freq > preempt_thresh))) {
-			scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
-			if (s)
-				s->nr_preempt += 1;
-		} else {
-			scx_bpf_kick_cpu(cpu, 0);
+	if (cpu >= 0 && tctx &&
+	    (tctx->tier == TIER_LAT_CRITICAL ||
+	     (tctx->tier == TIER_INTERACTIVE &&
+	      (tctx->wakeup_freq > preempt_thresh ||
+	       tctx->avg_runtime < slice_ns)))) {
+		// INTERACTIVE/LAT-CRITICAL → PER-CPU DSQ + PREEMPT KICK
+		scx_bpf_dsq_insert_vtime(p, (u64)cpu,
+					  dyn_slice, dl, enq_flags);
+		scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
+		if (s) {
+			s->nr_direct += 1;
+			s->nr_preempt += 1;
+			s->nr_kicks += 1;
 		}
+		return;
+	}
+
+	// FALLBACK: OVERFLOW DSQ + POLITE KICK
+	scx_bpf_dsq_insert_vtime(p, overflow_id, dyn_slice, dl, enq_flags);
+	if (s)
+		s->nr_overflow += 1;
+	if (cpu >= 0) {
+		scx_bpf_kick_cpu(cpu, 0);
 		if (s)
 			s->nr_kicks += 1;
 	}
@@ -620,7 +680,7 @@ void BPF_STRUCT_OPS(pandemonium_runnable, struct task_struct *p,
 
 	// BEHAVIORAL CLASSIFICATION
 	tctx->lat_cri = compute_lat_cri(tctx->wakeup_freq, tctx->csw_rate,
-					 tctx->avg_runtime);
+					 tctx->avg_runtime, tctx->runtime_dev);
 	new_tier = classify_tier(tctx->lat_cri);
 
 	// HISTOGRAM: RECORD LAT_CRI DISTRIBUTION (FOR CALIBRATION)
@@ -662,13 +722,43 @@ void BPF_STRUCT_OPS(pandemonium_runnable, struct task_struct *p,
 void BPF_STRUCT_OPS(pandemonium_running, struct task_struct *p)
 {
 	struct task_ctx *tctx;
+	struct pandemonium_stats *s;
+	u64 now;
 
 	if (time_before(vtime_now, p->scx.dsq_vtime))
 		vtime_now = p->scx.dsq_vtime;
 
 	tctx = lookup_task_ctx(p);
 	if (tctx) {
-		tctx->last_run_at = bpf_ktime_get_ns();
+		now = bpf_ktime_get_ns();
+		tctx->last_run_at = now;
+		if (tctx->last_woke_at && now > tctx->last_woke_at) {
+			u64 wake_lat = now - tctx->last_woke_at;
+
+			if (tctx->tier != TIER_BATCH) {
+				s = get_stats();
+				if (s) {
+					s->wake_lat_samples += 1;
+					s->wake_lat_sum += wake_lat;
+					if (wake_lat > s->wake_lat_max)
+						s->wake_lat_max = wake_lat;
+				}
+			}
+
+			if (wake_lat > slice_ns) {
+				u64 guard = wake_lat;
+				u64 max_guard = slice_ns << 2;
+				u64 until;
+
+				if (guard > max_guard)
+					guard = max_guard;
+				if (guard < slice_ns)
+					guard = slice_ns;
+				until = now + guard;
+				if (until > interactive_guard_until)
+					interactive_guard_until = until;
+			}
+		}
 		p->scx.slice = task_slice(tctx);
 	}
 }
@@ -690,7 +780,13 @@ void BPF_STRUCT_OPS(pandemonium_stopping, struct task_struct *p,
 
 	now = bpf_ktime_get_ns();
 	slice = now > tctx->last_run_at ? now - tctx->last_run_at : 0;
-	tctx->avg_runtime = calc_avg(tctx->avg_runtime, slice, tctx->ewma_age);
+	{
+		u64 avg = tctx->avg_runtime;
+		u64 diff = slice > avg ? slice - avg : avg - slice;
+
+		tctx->avg_runtime = calc_avg(avg, slice, tctx->ewma_age);
+		tctx->runtime_dev = calc_avg(tctx->runtime_dev, diff, tctx->ewma_age);
+	}
 
 	if (weight > 0)
 		delta_vtime = (slice << 7) / weight;
@@ -707,11 +803,25 @@ out:
 }
 
 // TICK: SAFETY NET FOR LIGHTWEIGHT MODE.
-// IF enqueue() PREEMPT-KICK MISSED (RACE, NO CPU FOUND), tick() CATCHES IT.
-// ALSO HANDLES EDGE CASES WHERE interactive_waiting LINGERS.
+// WHEN interactive_waiting IS ARMED AND A BATCH TASK IS RUNNING,
+// PREEMPT IT TO FREE THE CPU FOR PENDING INTERACTIVE WORK.
+// FULL MODE USES DIRECT SCX_KICK_PREEMPT IN enqueue() INSTEAD.
 void BPF_STRUCT_OPS(pandemonium_tick, struct task_struct *p)
 {
 	struct task_ctx *tctx;
+	const struct cpumask *idle;
+	u64 idle_mask = 0;
+	u32 idle_key = 0;
+	s32 i;
+
+	// SNAPSHOT IDLE CPUMASK INTO BPF MAP FOR USERSPACE VISIBILITY
+	idle = scx_bpf_get_idle_cpumask();
+	bpf_for(i, 0, IDLE_BITMAP_CPUS) {
+		if (bpf_cpumask_test_cpu(i, idle))
+			idle_mask |= 1ULL << i;
+	}
+	scx_bpf_put_idle_cpumask(idle);
+	bpf_map_update_elem(&idle_bitmap, &idle_key, &idle_mask, 0);
 
 	if (!lightweight_mode || !interactive_waiting)
 		return;
@@ -720,8 +830,8 @@ void BPF_STRUCT_OPS(pandemonium_tick, struct task_struct *p)
 	if (!tctx)
 		return;
 
-	// ONLY PREEMPT LONG-RUNNING TASKS (COMPILERS). SHORT TASKS YIELD SOON.
-	if (tctx->avg_runtime >= 1000000) {
+	// PREEMPT LONG-RUNNING BATCH TASKS WHEN INTERACTIVE WORK IS WAITING.
+	if (tctx->tier == TIER_BATCH && tctx->avg_runtime >= 1000000) {
 		scx_bpf_kick_cpu(scx_bpf_task_cpu(p), SCX_KICK_PREEMPT);
 		interactive_waiting = false;
 	}
@@ -743,7 +853,8 @@ void BPF_STRUCT_OPS(pandemonium_enable, struct task_struct *p)
 		tctx->wakeup_freq = 20;
 		tctx->last_woke_at = bpf_ktime_get_ns();
 		tctx->avg_runtime = 100000;
-		tctx->cached_weight = WEIGHT_BATCH;
+		tctx->runtime_dev = 0;
+		tctx->cached_weight = WEIGHT_INTERACTIVE;
 		tctx->prev_nvcsw = p->nvcsw;
 		tctx->csw_rate = 0;
 		tctx->lat_cri = 0;
@@ -759,10 +870,13 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(pandemonium_init)
 	u64 sm;
 	u32 i;
 
-	// DETECT NUMA TOPOLOGY
+	// DETECT NUMA TOPOLOGY (CLAMP TO CPU COUNT -- HOTPLUG CAN LEAVE
+	// MORE NODES THAN ONLINE CPUs, CAUSING ORPHAN OVERFLOW DSQs)
 	nr_nodes = __COMPAT_scx_bpf_nr_node_ids();
 	if (nr_nodes < 1)
 		nr_nodes = 1;
+	if (nr_nodes > nr_cpu_ids)
+		nr_nodes = nr_cpu_ids;
 
 	// CREATE PER-CPU DSQs
 	for (i = 0; i < nr_cpu_ids && i < MAX_CPUS; i++)
@@ -773,19 +887,20 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(pandemonium_init)
 		scx_bpf_create_dsq(nr_cpu_ids + i, (s32)i);
 
 	// CORE-COUNT SCALING: BATCH SLICES GROW WITH CORE COUNT
+	// USES nr_scaling_cpus (--nr-cpus OVERRIDE) NOT nr_cpu_ids (POSSIBLE CPUs)
 	// 2 CORES: ~5MS CEILING (RESPONSIVE)
 	// 8 CORES: ~20MS CEILING (BASELINE)
 	// 32 CORES: ~80MS CEILING (THROUGHPUT)
-	sm = slice_max_ns * nr_cpu_ids >> 3;
+	sm = slice_max_ns * nr_scaling_cpus >> 3;
 	if (sm < slice_ns)
 		sm = slice_ns;
 	if (sm > slice_max_ns * 4)
 		sm = slice_max_ns * 4;
 	scaled_slice_max = sm;
 
-	// CONTINUOUS PREEMPT THRESHOLD: 60 / (nr_cpu_ids + 2), CLAMPED [3, 20]
+	// CONTINUOUS PREEMPT THRESHOLD: 60 / (nr_scaling_cpus + 2), CLAMPED [3, 20]
 	// 2 CORES: 15  |  4 CORES: 10  |  8 CORES: 6  |  16 CORES: 3  |  32+: 3
-	preempt_thresh = 60 / (nr_cpu_ids + 2);
+	preempt_thresh = 60 / (nr_scaling_cpus + 2);
 	if (preempt_thresh < 3)
 		preempt_thresh = 3;
 	if (preempt_thresh > 20)

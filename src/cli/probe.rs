@@ -2,11 +2,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
 
-pub fn run_probe() {
+pub fn run_probe(death_pipe_fd: Option<i32>) {
     ctrlc::set_handler(move || {
         RUNNING.store(false, Ordering::Relaxed);
     })
     .ok();
+
+    if let Some(fd) = death_pipe_fd {
+        super::death_pipe::spawn_death_watcher(fd, &RUNNING);
+    }
 
     // UNBUFFERED STDOUT -- ONE LINE PER SAMPLE
     // (println! is line-buffered to tty, which is correct here)

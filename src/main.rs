@@ -1,4 +1,4 @@
-// PANDEMONIUM v0.9.3 -- SCHED_EXT KERNEL SCHEDULER
+// PANDEMONIUM v0.9.4 -- SCHED_EXT KERNEL SCHEDULER
 // BEHAVIORAL-ADAPTIVE GENERAL-PURPOSE SCHEDULING FOR LINUX
 //
 // SCHEDULING DECISIONS HAPPEN IN BPF (ZERO KERNEL-USERSPACE ROUND TRIPS)
@@ -11,7 +11,6 @@
 mod bpf_skel;
 
 mod cli;
-mod event;
 mod scheduler;
 
 use std::mem::MaybeUninit;
@@ -41,7 +40,7 @@ enum SubCmd {
     Check,
 
     /// Run interactive wakeup probe (stdout: overshoot_us per line)
-    Probe,
+    Probe(ProbeArgs),
 
     /// Build, run with sudo, capture output + dmesg, save logs
     Start(StartArgs),
@@ -52,8 +51,14 @@ enum SubCmd {
     /// A/B benchmark (EEVDF baseline vs PANDEMONIUM)
     Bench(BenchArgs),
 
+    /// Build release then run bench (logs to /tmp/pandemonium)
+    BenchRun(BenchRunArgs),
+
     /// Run test gate (unit + integration)
     Test,
+
+    /// Print idle CPU bitmask (requires running PANDEMONIUM scheduler)
+    IdleCpus,
 }
 
 #[derive(Parser)]
@@ -70,6 +75,12 @@ struct RunArgs {
     #[arg(long, default_value_t = 20_000_000)]
     slice_max: u64,
 
+    #[arg(long, default_value_t = 8)]
+    lat_cri_low: u64,
+
+    #[arg(long, default_value_t = 32)]
+    lat_cri_high: u64,
+
     #[arg(long)]
     verbose: bool,
 
@@ -84,6 +95,17 @@ struct RunArgs {
 
     #[arg(long)]
     no_lightweight: bool,
+
+    /// Override CPU count for scaling formulas (default: auto-detect)
+    #[arg(long)]
+    nr_cpus: Option<u64>,
+}
+
+#[derive(Parser)]
+struct ProbeArgs {
+    /// Death pipe FD for orphan detection (internal use)
+    #[arg(long)]
+    death_pipe_fd: Option<i32>,
 }
 
 #[derive(Parser)]
@@ -124,6 +146,33 @@ struct BenchArgs {
     sched_args: Vec<String>,
 }
 
+#[derive(Parser)]
+struct BenchRunArgs {
+    /// Benchmark mode
+    #[arg(long, value_enum)]
+    mode: cli::bench::BenchMode,
+
+    /// Command to benchmark (for --mode cmd)
+    #[arg(long)]
+    cmd: Option<String>,
+
+    /// Number of iterations per phase
+    #[arg(long, default_value_t = 3)]
+    iterations: usize,
+
+    /// Clean command between iterations (for --mode cmd)
+    #[arg(long)]
+    clean_cmd: Option<String>,
+
+    /// Convenience flag to pass --build-mode to scheduler
+    #[arg(long)]
+    build_mode: bool,
+
+    /// Extra args forwarded to `pandemonium run`
+    #[arg(last = true)]
+    sched_args: Vec<String>,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -136,18 +185,21 @@ fn main() -> Result<()> {
                     slice_ns: 5_000_000,
                     slice_min: 500_000,
                     slice_max: 20_000_000,
+                    lat_cri_low: 8,
+                    lat_cri_high: 32,
                     verbose: false,
                     dump_log: false,
                     calibrate: false,
                     lightweight: false,
                     no_lightweight: false,
+                    nr_cpus: None,
                 },
             };
             run_scheduler(args)
         }
         Some(SubCmd::Check) => cli::check::run_check(),
-        Some(SubCmd::Probe) => {
-            cli::probe::run_probe();
+        Some(SubCmd::Probe(args)) => {
+            cli::probe::run_probe(args.death_pipe_fd);
             Ok(())
         }
         Some(SubCmd::Start(args)) => {
@@ -161,7 +213,16 @@ fn main() -> Result<()> {
             args.clean_cmd.as_deref(),
             &args.sched_args,
         ),
+        Some(SubCmd::BenchRun(args)) => cli::bench::run_bench_run(
+            args.mode,
+            args.cmd.as_deref(),
+            args.iterations,
+            args.clean_cmd.as_deref(),
+            args.build_mode,
+            &args.sched_args,
+        ),
         Some(SubCmd::Test) => cli::test_gate::run_test_gate(),
+        Some(SubCmd::IdleCpus) => cli::idle_cpus::run_idle_cpus(),
     }
 }
 
@@ -170,7 +231,9 @@ fn run_scheduler(args: RunArgs) -> Result<()> {
         SHUTDOWN.store(true, Ordering::Relaxed);
     })?;
 
-    let nr_cpus = libbpf_rs::num_possible_cpus().unwrap_or(1) as u64;
+    let nr_cpus = args.nr_cpus.unwrap_or_else(|| {
+        libbpf_rs::num_possible_cpus().unwrap_or(1) as u64
+    });
     let governor = std::fs::read_to_string(
         "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor",
     )
@@ -186,7 +249,7 @@ fn run_scheduler(args: RunArgs) -> Result<()> {
         nr_cpus <= 4
     };
 
-    println!("PANDEMONIUM v0.9.3");
+    println!("PANDEMONIUM v0.9.4");
     println!(
         "CPUS:            {} (governor: {})",
         nr_cpus,
@@ -206,6 +269,10 @@ fn run_scheduler(args: RunArgs) -> Result<()> {
         "SLICE:           {} ns (min={}, max={})",
         args.slice_ns, args.slice_min, args.slice_max
     );
+    println!(
+        "LAT_CRI THRESH:  low={} high={}",
+        args.lat_cri_low, args.lat_cri_high
+    );
     println!("VERBOSE:         {}", args.verbose);
     if args.calibrate {
         println!("MODE:            CALIBRATE");
@@ -215,14 +282,21 @@ fn run_scheduler(args: RunArgs) -> Result<()> {
     let mut open_object = MaybeUninit::uninit();
 
     if args.calibrate {
+        if args.lat_cri_low >= args.lat_cri_high {
+            anyhow::bail!("lat_cri_low must be < lat_cri_high");
+        }
+
         let mut sched = Scheduler::init(
             &mut open_object,
             args.build_mode,
             args.slice_ns,
             args.slice_min,
             args.slice_max,
+            args.lat_cri_low,
+            args.lat_cri_high,
             args.verbose,
             lightweight,
+            args.nr_cpus,
         )?;
 
         println!("PANDEMONIUM IS ACTIVE (CALIBRATING)");
@@ -232,14 +306,21 @@ fn run_scheduler(args: RunArgs) -> Result<()> {
     }
 
     loop {
+        if args.lat_cri_low >= args.lat_cri_high {
+            anyhow::bail!("lat_cri_low must be < lat_cri_high");
+        }
+
         let mut sched = Scheduler::init(
             &mut open_object,
             args.build_mode,
             args.slice_ns,
             args.slice_min,
             args.slice_max,
+            args.lat_cri_low,
+            args.lat_cri_high,
             args.verbose,
             lightweight,
+            args.nr_cpus,
         )?;
 
         println!("PANDEMONIUM IS ACTIVE (CTRL+C TO EXIT)");

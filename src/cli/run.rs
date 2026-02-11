@@ -1,4 +1,5 @@
 use std::io::{BufRead, BufReader};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -162,6 +163,7 @@ pub fn run_start(observe: bool, calibrate: bool, sched_args: &[String]) -> Resul
     let mut child = Command::new("sudo")
         .arg(&bin)
         .args(&cmd_args)
+        .process_group(0)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;

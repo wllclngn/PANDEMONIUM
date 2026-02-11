@@ -4,6 +4,9 @@ pub mod run;
 pub mod bench;
 pub mod report;
 pub mod test_gate;
+pub mod child_guard;
+pub mod death_pipe;
+pub mod idle_cpus;
 
 pub const TARGET_DIR: &str = "/tmp/pandemonium-build";
 pub const LOG_DIR: &str = "/tmp/pandemonium";

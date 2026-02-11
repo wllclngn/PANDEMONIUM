@@ -10,7 +10,7 @@ use libbpf_rs::MapCore;
 use libbpf_rs::skel::{OpenSkel, SkelBuilder};
 
 use crate::bpf_skel::*;
-use crate::event::EventLog;
+use pandemonium::event::EventLog;
 
 // SCX EXIT CODES (FROM KERNEL)
 const SCX_EXIT_NONE: i32 = 0;
@@ -41,12 +41,17 @@ struct PandemoniumStats {
     lat_cri_sum: u64,
     nr_tier_changes: u64,
     nr_compositor: u64,
+    wake_lat_sum: u64,
+    wake_lat_max: u64,
+    wake_lat_samples: u64,
 }
 
 pub struct Scheduler<'a> {
     skel: MainSkel<'a>,
     _link: libbpf_rs::Link,
     verbose: bool,
+    lat_cri_low: u64,
+    lat_cri_high: u64,
     pub log: EventLog,
 }
 
@@ -57,8 +62,11 @@ impl<'a> Scheduler<'a> {
         slice_ns: u64,
         slice_min_ns: u64,
         slice_max_ns: u64,
+        lat_cri_low: u64,
+        lat_cri_high: u64,
         verbose: bool,
         lightweight: bool,
+        nr_cpus_override: Option<u64>,
     ) -> Result<Self> {
         // OPEN
         let builder = MainSkelBuilder::default();
@@ -70,10 +78,15 @@ impl<'a> Scheduler<'a> {
         rodata.slice_min_ns = slice_min_ns;
         rodata.slice_max_ns = slice_max_ns;
         rodata.build_mode = build_mode;
+        rodata.lat_cri_thresh_low = lat_cri_low;
+        rodata.lat_cri_thresh_high = lat_cri_high;
 
-        // PASS CPU COUNT FOR PER-CPU DSQ CREATION
-        let nr_cpus = libbpf_rs::num_possible_cpus()? as u64;
-        rodata.nr_cpu_ids = nr_cpus;
+        // DSQs MUST COVER ALL POSSIBLE CPUs (KERNEL MAY REFERENCE ANY OF THEM).
+        // SCALING FORMULAS USE THE OVERRIDE (--nr-cpus) FOR BEHAVIORAL TUNING.
+        let possible = libbpf_rs::num_possible_cpus()? as u64;
+        let scaling = nr_cpus_override.unwrap_or(possible);
+        rodata.nr_cpu_ids = possible;
+        rodata.nr_scaling_cpus = scaling;
         rodata.lightweight_mode = lightweight;
 
         // POPULATE SCX ENUM VALUES
@@ -101,10 +114,20 @@ impl<'a> Scheduler<'a> {
         // STRUCT_OPS MUST BE ATTACHED VIA bpf_map__attach_struct_ops() DIRECTLY.
         let link = skel.maps.pandemonium_ops.attach_struct_ops()?;
 
+        // PIN IDLE BITMAP FOR `pandemonium idle-cpus` SUBCOMMAND
+        let pin_dir = "/sys/fs/bpf/pandemonium";
+        let pin_path = "/sys/fs/bpf/pandemonium/idle_cpus";
+        std::fs::create_dir_all(pin_dir).ok();
+        // REMOVE STALE PIN FROM PREVIOUS UNCLEAN SHUTDOWN
+        std::fs::remove_file(pin_path).ok();
+        skel.maps.idle_bitmap.pin(pin_path)?;
+
         Ok(Self {
             skel,
             _link: link,
             verbose,
+            lat_cri_low,
+            lat_cri_high,
             log: EventLog::new(),
         })
     }
@@ -160,11 +183,16 @@ impl<'a> Scheduler<'a> {
                 total.nr_boosted += stats.nr_boosted;
                 total.nr_kicks += stats.nr_kicks;
                 total.nr_lat_critical += stats.nr_lat_critical;
-                total.nr_batch += stats.nr_batch;
-                total.lat_cri_sum += stats.lat_cri_sum;
-                total.nr_tier_changes += stats.nr_tier_changes;
-                total.nr_compositor += stats.nr_compositor;
+            total.nr_batch += stats.nr_batch;
+            total.lat_cri_sum += stats.lat_cri_sum;
+            total.nr_tier_changes += stats.nr_tier_changes;
+            total.nr_compositor += stats.nr_compositor;
+            total.wake_lat_sum += stats.wake_lat_sum;
+            if stats.wake_lat_max > total.wake_lat_max {
+                total.wake_lat_max = stats.wake_lat_max;
             }
+            total.wake_lat_samples += stats.wake_lat_samples;
+        }
         }
 
         total
@@ -193,21 +221,30 @@ impl<'a> Scheduler<'a> {
             let delta_lat_cri_sum = stats.lat_cri_sum - prev.lat_cri_sum;
             let delta_tier_chg = stats.nr_tier_changes - prev.nr_tier_changes;
             let delta_compositor = stats.nr_compositor - prev.nr_compositor;
+            let delta_wake_sum = stats.wake_lat_sum - prev.wake_lat_sum;
+            let delta_wake_samples = stats.wake_lat_samples - prev.wake_lat_samples;
+            let wake_avg = if delta_wake_samples > 0 {
+                delta_wake_sum / delta_wake_samples
+            } else {
+                0
+            };
 
             let total_wakeups = delta_lat_cri + delta_int + delta_batch;
             let avg_score = if total_wakeups > 0 { delta_lat_cri_sum / total_wakeups } else { 0 };
 
-            println!("dispatches/s: {:<8} idle: {:<8} direct: {:<6} overflow: {:<6} preempt: {:<6} lat_cri: {:<6} int: {:<6} batch: {:<6} sticky: {:<6} boosted: {:<6} kicks: {:<6} avg_score: {:<6} tier_chg: {:<6} compositor: {:<6}",
-                delta_d, delta_idle, delta_direct, delta_overflow, delta_preempt, delta_lat_cri, delta_int, delta_batch, delta_sticky, delta_boost, delta_kicks, avg_score, delta_tier_chg, delta_compositor);
+            println!("dispatches/s: {:<8} idle: {:<8} direct: {:<6} overflow: {:<6} preempt: {:<6} lat_cri: {:<6} int: {:<6} batch: {:<6} sticky: {:<6} boosted: {:<6} kicks: {:<6} avg_score: {:<6} tier_chg: {:<6} compositor: {:<6} wake_avg: {:<6} wake_max: {:<6}",
+                delta_d, delta_idle, delta_direct, delta_overflow, delta_preempt, delta_lat_cri, delta_int, delta_batch, delta_sticky, delta_boost, delta_kicks, avg_score, delta_tier_chg, delta_compositor, wake_avg, stats.wake_lat_max);
 
             self.log.snapshot(delta_d, delta_idle, delta_direct + delta_overflow,
                               delta_lat_cri, delta_int, delta_batch);
 
             if self.verbose {
-                println!("  TOTAL dispatches={} idle={} direct={} overflow={} preempt={} lat_cri={} int={} batch={} sticky={} boosted={} kicks={} tier_changes={} compositor={}",
+                println!("  TOTAL dispatches={} idle={} direct={} overflow={} preempt={} lat_cri={} int={} batch={} sticky={} boosted={} kicks={} tier_changes={} compositor={} wake_avg={} wake_max={}",
                     stats.nr_dispatches, stats.nr_idle_hits, stats.nr_direct, stats.nr_overflow, stats.nr_preempt,
                     stats.nr_lat_critical, stats.nr_interactive, stats.nr_batch, stats.nr_sticky, stats.nr_boosted, stats.nr_kicks,
-                    stats.nr_tier_changes, stats.nr_compositor);
+                    stats.nr_tier_changes, stats.nr_compositor,
+                    if stats.wake_lat_samples > 0 { stats.wake_lat_sum / stats.wake_lat_samples } else { 0 },
+                    stats.wake_lat_max);
             }
 
             prev = stats;
@@ -327,7 +364,10 @@ impl<'a> Scheduler<'a> {
         println!("  --lat-cri-low {}   (P90: 90%% OF TASKS SCORE BELOW THIS = BATCH)", p90_score);
         println!("  --lat-cri-high {}  (P99: TOP 1%% = LATENCY-CRITICAL)", p99_score);
         println!();
-        println!("CURRENT THRESHOLDS: LOW=8, HIGH=32");
+        println!(
+            "CURRENT THRESHOLDS: LOW={}, HIGH={}",
+            self.lat_cri_low, self.lat_cri_high
+        );
         println!();
 
         // SHOW TIER DISTRIBUTION AT SUGGESTED THRESHOLDS
@@ -354,5 +394,12 @@ impl<'a> Scheduler<'a> {
 
     fn exited(&self) -> bool {
         self.skel.maps.data_data.as_ref().unwrap().uei.kind != SCX_EXIT_NONE
+    }
+}
+
+impl Drop for Scheduler<'_> {
+    fn drop(&mut self) {
+        let _ = self.skel.maps.idle_bitmap.unpin("/sys/fs/bpf/pandemonium/idle_cpus");
+        let _ = std::fs::remove_dir("/sys/fs/bpf/pandemonium");
     }
 }

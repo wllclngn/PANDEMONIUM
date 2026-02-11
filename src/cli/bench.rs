@@ -1,11 +1,14 @@
-use std::process::{Child, Command, Stdio};
+use std::fs::{self, File};
+use std::os::unix::process::CommandExt;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 use clap::ValueEnum;
 
+use super::child_guard::ChildGuard;
 use super::report::{format_delta, format_latency_delta, mean_stdev, percentile, save_report};
-use super::{binary_path, is_scx_active, self_exe, wait_for_activation, TARGET_DIR};
+use super::{binary_path, is_scx_active, self_exe, wait_for_activation, LOG_DIR, TARGET_DIR};
 
 #[derive(Clone, ValueEnum)]
 pub enum BenchMode {
@@ -18,6 +21,71 @@ pub enum BenchMode {
     Mixed,
     /// A/B with user-provided command
     Cmd,
+}
+
+// BUILD RELEASE BINARY AND RUN BENCH, SAVING LOGS
+pub fn run_bench_run(
+    mode: BenchMode,
+    cmd: Option<&str>,
+    iterations: usize,
+    clean_cmd: Option<&str>,
+    build_mode: bool,
+    sched_args: &[String],
+) -> Result<()> {
+    fs::create_dir_all(LOG_DIR)?;
+
+    let build_out = File::create(format!("{}/build.out", LOG_DIR))?;
+    let build_err = File::create(format!("{}/build.err", LOG_DIR))?;
+    let status = Command::new("cargo")
+        .args(["build", "--release"])
+        .env("CARGO_TARGET_DIR", TARGET_DIR)
+        .stdout(Stdio::from(build_out))
+        .stderr(Stdio::from(build_err))
+        .status()?;
+    if !status.success() {
+        bail!("BUILD FAILED. SEE {}/build.err", LOG_DIR);
+    }
+
+    let mut extra_args: Vec<String> = sched_args.to_vec();
+    if build_mode && !extra_args.iter().any(|arg| arg == "--build-mode") {
+        extra_args.push("--build-mode".to_string());
+    }
+
+    let bench_out = File::create(format!("{}/bench.out", LOG_DIR))?;
+    let bench_err = File::create(format!("{}/bench.err", LOG_DIR))?;
+    let mut bench_cmd = Command::new(binary_path());
+    let mode_name = mode
+        .to_possible_value()
+        .ok_or_else(|| anyhow::anyhow!("INVALID BENCH MODE"))?
+        .get_name()
+        .to_string();
+    bench_cmd
+        .arg("bench")
+        .arg("--mode")
+        .arg(mode_name)
+        .arg("--iterations")
+        .arg(iterations.to_string());
+    if let Some(c) = cmd {
+        bench_cmd.arg("--cmd").arg(c);
+    }
+    if let Some(cc) = clean_cmd {
+        bench_cmd.arg("--clean-cmd").arg(cc);
+    }
+    if !extra_args.is_empty() {
+        bench_cmd.arg("--").args(extra_args);
+    }
+
+    let status = bench_cmd
+        .stdout(Stdio::from(bench_out))
+        .stderr(Stdio::from(bench_err))
+        .status()?;
+    if !status.success() {
+        bail!("BENCH FAILED. SEE {}/bench.err", LOG_DIR);
+    }
+
+    println!("BUILD LOGS: {}/build.out {}/build.err", LOG_DIR, LOG_DIR);
+    println!("BENCH LOGS: {}/bench.out {}/bench.err", LOG_DIR, LOG_DIR);
+    Ok(())
 }
 
 fn timed_run(cmd: &str) -> Option<f64> {
@@ -50,7 +118,7 @@ fn timed_run(cmd: &str) -> Option<f64> {
     }
 }
 
-fn start_scheduler(sched_args: &[String]) -> Result<Child> {
+fn start_scheduler(sched_args: &[String]) -> Result<ChildGuard> {
     let bin = binary_path();
     let mut args = vec!["run".to_string()];
     args.extend(sched_args.iter().cloned());
@@ -58,34 +126,25 @@ fn start_scheduler(sched_args: &[String]) -> Result<Child> {
     let child = Command::new("sudo")
         .arg(&bin)
         .args(&args)
+        .process_group(0)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    Ok(child)
+    Ok(ChildGuard::new(child))
 }
 
-fn stop_scheduler(child: &mut Child) {
-    unsafe {
-        libc::kill(child.id() as i32, libc::SIGINT);
-    }
-    match child.wait() {
-        Ok(_) => {}
-        Err(_) => {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
+fn stop_scheduler(guard: &mut ChildGuard) {
+    guard.stop();
 }
 
-fn ensure_scheduler_started(sched_args: &[String]) -> Result<Child> {
-    let child = start_scheduler(sched_args)?;
+fn ensure_scheduler_started(sched_args: &[String]) -> Result<ChildGuard> {
+    let guard = start_scheduler(sched_args)?;
     if !wait_for_activation(10) {
         bail!("PANDEMONIUM DID NOT ACTIVATE WITHIN 10S");
     }
     println!("  PANDEMONIUM IS ACTIVE");
-    // STABILIZE
     std::thread::sleep(Duration::from_secs(2));
-    Ok(child)
+    Ok(guard)
 }
 
 pub fn run_bench(
@@ -486,12 +545,27 @@ fn bench_contention(sched_args: &[String]) -> Result<()> {
         // CLEAN BUILD
         let _ = Command::new("sh").args(["-c", &clean_cmd]).output();
 
-        // START PROBE (SAME BINARY, probe SUBCOMMAND)
-        let mut probe_proc = Command::new(&probe_exe)
-            .arg("probe")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
+        // START PROBE WITH DEATH PIPE + PROCESS GROUP
+        let (death_read, death_write) = super::death_pipe::create_death_pipe()
+            .map_err(|e| anyhow::anyhow!("DEATH PIPE: {}", e))?;
+        let death_write_copy = death_write;
+        let probe_proc = unsafe {
+            Command::new(&probe_exe)
+                .arg("probe")
+                .arg("--death-pipe-fd")
+                .arg(death_read.to_string())
+                .process_group(0)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .pre_exec(move || {
+                    libc::close(death_write_copy);
+                    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong);
+                    Ok(())
+                })
+                .spawn()?
+        };
+        super::death_pipe::close_fd(death_read);
+        let probe_guard = ChildGuard::new(probe_proc);
 
         // RUN BUILD
         println!("  BUILDING...");
@@ -508,10 +582,8 @@ fn bench_contention(sched_args: &[String]) -> Result<()> {
                 "  BUILD FAILED (EXIT {})",
                 build_result.status.code().unwrap_or(-1)
             );
-            unsafe {
-                libc::kill(probe_proc.id() as i32, libc::SIGTERM);
-            }
-            let _ = probe_proc.wait();
+            drop(probe_guard);
+            super::death_pipe::close_fd(death_write);
             if let Some(ref mut p) = pand_proc {
                 stop_scheduler(p);
             }
@@ -521,11 +593,13 @@ fn bench_contention(sched_args: &[String]) -> Result<()> {
         // LET PROBE SETTLE
         std::thread::sleep(Duration::from_secs(1));
 
-        // STOP PROBE
+        // STOP PROBE AND COLLECT OUTPUT
         unsafe {
-            libc::kill(probe_proc.id() as i32, libc::SIGTERM);
+            libc::killpg(probe_guard.id() as i32, libc::SIGTERM);
         }
-        let probe_output = probe_proc.wait_with_output()?;
+        let probe_child = probe_guard.into_child();
+        let probe_output = probe_child.wait_with_output()?;
+        super::death_pipe::close_fd(death_write);
         let probe_stdout = String::from_utf8_lossy(&probe_output.stdout);
 
         // STOP SCHEDULER IF RUNNING

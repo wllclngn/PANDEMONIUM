@@ -3,7 +3,7 @@
 // PRE-ALLOCATED RING BUFFER. NO HEAP ALLOCATION DURING MONITORING.
 // WRAPS AROUND AT CAPACITY -- OLDEST ENTRIES OVERWRITTEN.
 
-const MAX_SNAPSHOTS: usize = 8192;
+pub const MAX_SNAPSHOTS: usize = 8192;
 
 #[derive(Clone, Copy)]
 pub struct Snapshot {
@@ -54,8 +54,20 @@ impl EventLog {
         }
     }
 
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn head(&self) -> usize {
+        self.head
+    }
+
+    pub fn get(&self, idx: usize) -> &Snapshot {
+        &self.snapshots[idx]
+    }
+
     // ITERATE SNAPSHOTS IN CHRONOLOGICAL ORDER
-    fn iter_chronological(&self) -> impl Iterator<Item = &Snapshot> {
+    pub fn iter_chronological(&self) -> impl Iterator<Item = &Snapshot> {
         let start = if self.len < MAX_SNAPSHOTS { 0 } else { self.head };
         (0..self.len).map(move |i| {
             &self.snapshots[(start + i) % MAX_SNAPSHOTS]
@@ -150,70 +162,3 @@ fn now_ns() -> u64 {
     (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn snapshot_records() {
-        let mut log = EventLog::new();
-        assert_eq!(log.len, 0);
-
-        log.snapshot(100, 90, 10, 5, 30, 65);
-        assert_eq!(log.len, 1);
-        assert_eq!(log.snapshots[0].dispatches, 100);
-        assert_eq!(log.snapshots[0].idle_hits, 90);
-        assert_eq!(log.snapshots[0].any_hits, 10);
-        assert_eq!(log.snapshots[0].lat_cri, 5);
-        assert_eq!(log.snapshots[0].interactive, 30);
-        assert_eq!(log.snapshots[0].batch, 65);
-        assert!(log.snapshots[0].ts_ns > 0);
-    }
-
-    #[test]
-    fn ring_buffer_wraps() {
-        let mut log = EventLog::new();
-
-        // FILL TO CAPACITY
-        for i in 0..MAX_SNAPSHOTS {
-            log.snapshot(i as u64, 0, 0, 0, 0, 0);
-        }
-        assert_eq!(log.len, MAX_SNAPSHOTS);
-        assert_eq!(log.head, 0); // WRAPPED BACK TO START
-
-        // WRITE ONE MORE -- OVERWRITES OLDEST
-        log.snapshot(9999, 0, 0, 0, 0, 0);
-        assert_eq!(log.len, MAX_SNAPSHOTS);
-        assert_eq!(log.head, 1);
-        assert_eq!(log.snapshots[0].dispatches, 9999);
-
-        // CHRONOLOGICAL ITERATION STARTS FROM OLDEST (INDEX 1)
-        let ordered: Vec<u64> = log.iter_chronological()
-            .map(|s| s.dispatches)
-            .collect();
-        assert_eq!(ordered[0], 1); // OLDEST SURVIVING ENTRY
-        assert_eq!(*ordered.last().unwrap(), 9999); // NEWEST
-        assert_eq!(ordered.len(), MAX_SNAPSHOTS);
-    }
-
-    #[test]
-    fn summary_no_panic_empty() {
-        let log = EventLog::new();
-        log.summary(); // SHOULD NOT PANIC WITH 0 SNAPSHOTS
-    }
-
-    #[test]
-    fn summary_no_panic_one() {
-        let mut log = EventLog::new();
-        log.snapshot(100, 50, 50, 10, 20, 70);
-        log.summary(); // SHOULD NOT PANIC WITH 1 SNAPSHOT
-    }
-
-    #[test]
-    fn dump_no_panic() {
-        let mut log = EventLog::new();
-        log.snapshot(100, 50, 50, 5, 25, 70);
-        log.snapshot(200, 150, 50, 10, 40, 150);
-        log.dump(); // SHOULD NOT PANIC
-    }
-}

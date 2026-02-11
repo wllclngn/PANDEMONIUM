@@ -9,6 +9,7 @@
 // LAYER 4: INTERACTIVE RESPONSIVENESS (WAKEUP LATENCY)
 
 use std::fs;
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -70,6 +71,7 @@ fn start_pandemonium(extra_args: &[&str]) -> std::process::Child {
 
     Command::new(&bin)
         .args(extra_args)
+        .process_group(0)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -78,8 +80,9 @@ fn start_pandemonium(extra_args: &[&str]) -> std::process::Child {
 
 /// Send SIGINT and wait for exit. Returns captured stdout.
 fn stop_pandemonium(child: &mut std::process::Child) -> String {
+    let pgid = child.id() as i32;
     unsafe {
-        libc::kill(child.id() as i32, libc::SIGINT);
+        libc::killpg(pgid, libc::SIGINT);
     }
 
     // DRAIN STDOUT BEFORE WAITING

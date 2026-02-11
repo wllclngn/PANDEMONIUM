@@ -1,10 +1,10 @@
 [package]
 name = "pandemonium"
-version = "0.9.3"
+version = "0.9.4"
 edition = "2021"
 
 [dependencies]
-libbpf-rs = "0.26"
+libbpf-rs = { version = "0.26", default-features = false }
 libc = "0.2"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
