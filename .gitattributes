@@ -1,0 +1,2 @@
+include/scx/** linguist-vendored
+src/bpf_skel.rs linguist-generated

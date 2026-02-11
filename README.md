@@ -1,4 +1,4 @@
-# PANDEMONIUMv0.9.2
+# PANDEMONIUMv0.9.3
 
 A behavioral-adaptive Linux scheduler built on sched_ext. Classifies tasks by runtime behavior -- not process names -- and adapts scheduling parameters to match. Scheduling decisions happen in BPF with zero kernel-userspace round trips. Everything else is Rust: configuration, monitoring, benchmarking, testing.
 

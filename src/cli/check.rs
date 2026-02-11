@@ -40,7 +40,7 @@ pub fn run_check() -> Result<()> {
     println!();
 
     let mut ok = true;
-    let tools = ["cargo", "rustc", "clang", "sudo"];
+    let tools = ["cargo", "rustc", "clang", "bpftool", "sudo"];
     for tool in &tools {
         if check_tool(tool) {
             println!("  {:<24}OK", tool);

@@ -1,4 +1,4 @@
-// PANDEMONIUM v0.9.2 -- SCHED_EXT KERNEL SCHEDULER
+// PANDEMONIUM v0.9.3 -- SCHED_EXT KERNEL SCHEDULER
 // BEHAVIORAL-ADAPTIVE GENERAL-PURPOSE SCHEDULING FOR LINUX
 //
 // SCHEDULING DECISIONS HAPPEN IN BPF (ZERO KERNEL-USERSPACE ROUND TRIPS)
@@ -186,7 +186,7 @@ fn run_scheduler(args: RunArgs) -> Result<()> {
         nr_cpus <= 4
     };
 
-    println!("PANDEMONIUM v0.9.2");
+    println!("PANDEMONIUM v0.9.3");
     println!(
         "CPUS:            {} (governor: {})",
         nr_cpus,

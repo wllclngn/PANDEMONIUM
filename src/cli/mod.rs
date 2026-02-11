@@ -33,13 +33,3 @@ pub fn wait_for_activation(timeout_secs: u64) -> bool {
     false
 }
 
-pub fn wait_for_deactivation(timeout_secs: u64) -> bool {
-    let start = std::time::Instant::now();
-    while start.elapsed().as_secs() < timeout_secs {
-        if !is_scx_active() {
-            return true;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    false
-}
