@@ -1,0 +1,258 @@
+use std::io::{BufRead, BufReader};
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::Duration;
+
+use anyhow::{bail, Result};
+
+use super::{binary_path, LOG_DIR, TARGET_DIR};
+
+fn build_scheduler() -> Result<()> {
+    println!("BUILDING PANDEMONIUM (RELEASE)...");
+
+    let project_root = env!("CARGO_MANIFEST_DIR");
+    let output = Command::new("cargo")
+        .args(["build", "--release"])
+        .env("CARGO_TARGET_DIR", TARGET_DIR)
+        .current_dir(project_root)
+        .stderr(Stdio::piped())
+        .stdout(Stdio::null())
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("BUILD FAILED:\n{}", stderr);
+    }
+
+    let bin = binary_path();
+    let size = std::fs::metadata(&bin)
+        .map(|m| m.len() / 1024)
+        .unwrap_or(0);
+    println!("BUILD COMPLETE. BINARY: {} ({} KB)", bin, size);
+    println!();
+    Ok(())
+}
+
+fn capture_dmesg_cursor() -> Option<String> {
+    let output = Command::new("journalctl")
+        .args(["-k", "--no-pager", "-n", "1", "--show-cursor"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.trim().lines().rev() {
+        if line.starts_with("-- cursor:") {
+            return Some(line.splitn(2, ':').nth(1)?.trim().to_string());
+        }
+    }
+    None
+}
+
+fn capture_dmesg_after(cursor: Option<&str>) -> String {
+    let mut cmd = Command::new("journalctl");
+    cmd.args(["-k", "--no-pager"]);
+    if let Some(c) = cursor {
+        cmd.args(["--after-cursor", c]);
+    }
+    let output = match cmd.output() {
+        Ok(o) if o.status.success() => o,
+        _ => return String::new(),
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut relevant = Vec::new();
+    for line in stdout.lines() {
+        if line.is_empty() || line.starts_with("-- ") {
+            continue;
+        }
+        let low = line.to_lowercase();
+        if low.contains("sched_ext") || low.contains("scx") || low.contains("pandemonium") {
+            relevant.push(line.to_string());
+        }
+    }
+    relevant.join("\n")
+}
+
+fn save_logs(scheduler_output: &str, dmesg: &str, returncode: i32) -> Result<(String, String, String)> {
+    std::fs::create_dir_all(LOG_DIR)?;
+
+    let stamp = chrono_stamp();
+
+    let sched_path = format!("{}/run-{}.log", LOG_DIR, stamp);
+    std::fs::write(&sched_path, scheduler_output)?;
+
+    let dmesg_path = format!("{}/dmesg-{}.log", LOG_DIR, stamp);
+    std::fs::write(
+        &dmesg_path,
+        if dmesg.is_empty() {
+            "(NO RELEVANT KERNEL MESSAGES)\n"
+        } else {
+            dmesg
+        },
+    )?;
+
+    let report_path = format!("{}/report-{}.log", LOG_DIR, stamp);
+    let report = format!(
+        "PANDEMONIUM RUN -- {stamp}\n\
+         EXIT CODE: {returncode}\n\
+         {sep}\n\
+         SCHEDULER OUTPUT\n\
+         {sep}\n\
+         {scheduler_output}\n\
+         {sep}\n\
+         KERNEL LOG (DMESG)\n\
+         {sep}\n\
+         {dmesg_text}\n",
+        sep = "=".repeat(60),
+        dmesg_text = if dmesg.is_empty() {
+            "(NO RELEVANT KERNEL MESSAGES)"
+        } else {
+            dmesg
+        },
+    );
+    std::fs::write(&report_path, &report)?;
+
+    let latest = format!("{}/latest.log", LOG_DIR);
+    let _ = std::fs::remove_file(&latest);
+    let _ = std::os::unix::fs::symlink(&report_path, &latest);
+
+    Ok((sched_path, dmesg_path, report_path))
+}
+
+fn chrono_stamp() -> String {
+    let output = Command::new("date")
+        .arg("+%Y%m%d-%H%M%S")
+        .output()
+        .ok();
+    match output {
+        Some(o) if o.status.success() => {
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        }
+        _ => "unknown".to_string(),
+    }
+}
+
+pub fn run_start(observe: bool, calibrate: bool, sched_args: &[String]) -> Result<()> {
+    // BUILD FIRST
+    build_scheduler()?;
+
+    let bin = binary_path();
+    if !Path::new(&bin).exists() {
+        bail!("BINARY NOT FOUND AT {}", bin);
+    }
+
+    let mut cmd_args = vec!["run".to_string()];
+    if observe {
+        cmd_args.push("--verbose".to_string());
+        cmd_args.push("--dump-log".to_string());
+    }
+    if calibrate {
+        cmd_args.push("--calibrate".to_string());
+    }
+    cmd_args.extend(sched_args.iter().cloned());
+
+    let full_cmd = format!("sudo {} {}", bin, cmd_args.join(" "));
+    println!("RUNNING: {}", full_cmd);
+    println!("{}", "=".repeat(60));
+    println!();
+
+    let cursor = capture_dmesg_cursor();
+
+    let mut child = Command::new("sudo")
+        .arg(&bin)
+        .args(&cmd_args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let stdout = child.stdout.take().unwrap();
+    let reader = BufReader::new(stdout);
+    let mut output_lines = Vec::new();
+
+    for line in reader.lines() {
+        match line {
+            Ok(l) => {
+                println!("{}", l);
+                output_lines.push(l);
+            }
+            Err(_) => break,
+        }
+    }
+
+    let status = child.wait()?;
+
+    let scheduler_output = output_lines.join("\n");
+    let returncode = status.code().unwrap_or(-1);
+
+    println!();
+    println!("{}", "=".repeat(60));
+    println!("PANDEMONIUM EXITED WITH CODE {}", returncode);
+
+    // BRIEF PAUSE FOR KERNEL LOG FLUSH
+    std::thread::sleep(Duration::from_millis(200));
+    let dmesg = capture_dmesg_after(cursor.as_deref());
+
+    // SAVE LOGS
+    let (sched_path, dmesg_path, report_path) = save_logs(&scheduler_output, &dmesg, returncode)?;
+
+    // PRINT DMESG
+    println!();
+    println!("{}", "=".repeat(60));
+    println!("KERNEL LOG (DMESG)");
+    println!("{}", "=".repeat(60));
+    if dmesg.is_empty() {
+        println!("  (NO RELEVANT KERNEL MESSAGES)");
+    } else {
+        for line in dmesg.lines() {
+            println!("  {}", line);
+        }
+    }
+
+    // STATUS
+    println!();
+    match returncode {
+        0 => println!("STATUS: CLEAN EXIT"),
+        130 => println!("STATUS: USER INTERRUPTED (CTRL+C)"),
+        _ => println!("STATUS: EXIT CODE {}", returncode),
+    }
+
+    // LOG LOCATIONS
+    println!();
+    println!("LOGS SAVED TO {}/", LOG_DIR);
+    println!("  SCHEDULER: {}", sched_path);
+    println!("  DMESG:     {}", dmesg_path);
+    println!("  COMBINED:  {}", report_path);
+    println!("  LATEST:    {}/latest.log", LOG_DIR);
+
+    Ok(())
+}
+
+pub fn run_dmesg() -> Result<()> {
+    let output = Command::new("journalctl")
+        .args(["-k", "--no-pager", "-n", "50"])
+        .output()?;
+
+    if !output.status.success() {
+        bail!("journalctl failed");
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut found = false;
+    for line in stdout.lines() {
+        if line.is_empty() || line.starts_with("-- ") {
+            continue;
+        }
+        let low = line.to_lowercase();
+        if low.contains("sched_ext") || low.contains("scx") || low.contains("pandemonium") {
+            println!("{}", line);
+            found = true;
+        }
+    }
+
+    if !found {
+        println!("(NO RECENT SCHED_EXT/PANDEMONIUM KERNEL MESSAGES)");
+    }
+
+    Ok(())
+}
