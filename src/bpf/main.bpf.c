@@ -36,7 +36,6 @@ const volatile u64 lat_cri_thresh_high = 32;     // ABOVE = TIER_LAT_CRITICAL
 
 // BEHAVIORAL ENGINE -- CALIBRATED AT INIT FROM HARDWARE TOPOLOGY
 static u64 scaled_slice_max;                      // CORE-SCALED MAX SLICE
-static u64 preempt_thresh = 10;                   // WAKEUP_FREQ GATE FOR PREEMPT KICKS
 
 // LATENCY-CRITICALITY THRESHOLDS (INTRINSIC TO TASK, NOT HARDWARE)
 #define LAT_CRI_CAP           255                 // MAXIMUM SCORE
@@ -61,15 +60,6 @@ static u32 nr_nodes;
 
 // GLOBAL VTIME WATERMARK
 static u64 vtime_now;
-
-// LIGHTWEIGHT TICK-BASED PREEMPTION SIGNAL
-// SET BY enqueue() WHEN NON-BATCH TASK HITS OVERFLOW DSQ.
-// CLEARED BY tick() AFTER YIELDING A BATCH TASK.
-// POLITE KICKS ARE NOOPS (balance_one() KEEPS TASK IF SLICE > 0).
-// tick() ZEROES THE SLICE INSTEAD, FORCING NATURAL YIELD ON NEXT TICK.
-static bool interactive_waiting;
-// SHORT-LIVED GUARDRAIL FOR BATCH SLICES UNDER INTERACTIVE BACKLOG
-static u64 interactive_guard_until;
 
 // USER EXIT INFO FOR CLEAN SHUTDOWN
 UEI_DEFINE(uei);
@@ -99,6 +89,13 @@ struct {
 	__type(key, u32);
 	__type(value, u64);
 } idle_bitmap SEC(".maps");
+
+// WAKEUP LATENCY RING BUFFER -- KERNEL PUSHES SAMPLES, USERSPACE DRAINS
+// 256KB = ~16K SAMPLES. PINNED TO BPFFS FOR BENCHMARK ACCESS.
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 256 * 1024);
+} wake_lat_rb SEC(".maps");
 
 static __always_inline struct pandemonium_stats *get_stats(void)
 {
@@ -392,7 +389,6 @@ static __always_inline u64 task_deadline(struct task_struct *p,
 // LAT_CRITICAL: 1.5X AVG_RUNTIME (TIGHT, FAST PREEMPTION OPPORTUNITY)
 // INTERACTIVE:  2X AVG_RUNTIME (RESPONSIVE)
 // BATCH:        CORE-SCALED CEILING * WEIGHT / 100 (THROUGHPUT-ORIENTED)
-//              GUARDRAIL: TEMPORARILY CLAMP WHEN INTERACTIVE BACKLOG EXISTS
 static __always_inline u64 task_slice(struct task_ctx *tctx)
 {
 	u64 base;
@@ -412,9 +408,6 @@ static __always_inline u64 task_slice(struct task_ctx *tctx)
 			base = slice_min_ns;
 	} else {
 		ceiling = scaled_slice_max > 0 ? scaled_slice_max : slice_max_ns;
-		if (bpf_ktime_get_ns() < interactive_guard_until &&
-		    ceiling > slice_ns)
-			ceiling = slice_ns;
 		base = ceiling * tctx->cached_weight >> 7;
 		if (base > ceiling)
 			base = ceiling;
@@ -498,16 +491,6 @@ void BPF_STRUCT_OPS(pandemonium_enqueue, struct task_struct *p,
 	s = get_stats();
 	overflow_id = nr_cpu_ids + (u64)node;
 
-	// ARM INTERACTIVE GUARD: CLAMP BATCH SLICES WHILE INTERACTIVE
-	// WORK IS PENDING. WINDOW COVERS THE BATCH CEILING SO A
-	// NEWLY-STARTED BATCH TASK CAN'T OUTLAST THE GUARD.
-	if (tctx && tctx->tier != TIER_BATCH) {
-		u64 ceil = scaled_slice_max > 0 ? scaled_slice_max : slice_max_ns;
-		u64 window = ceil + slice_ns;
-		interactive_waiting = true;
-		interactive_guard_until = bpf_ktime_get_ns() + window;
-	}
-
 	// LIGHTWEIGHT MODE: SHORT-RUNTIME TASKS → PER-CPU DSQ + SELF-KICK
 	// SELF-KICK: NO IPI (JUST SETS NEED_RESCHED ON CURRENT CPU).
 	// AFTER WAKEUP PATH RETURNS, CPU RESCHEDULES AND PICKS TASK
@@ -530,7 +513,6 @@ void BPF_STRUCT_OPS(pandemonium_enqueue, struct task_struct *p,
 		if (s)
 			s->nr_overflow += 1;
 		if (tctx && tctx->tier == TIER_INTERACTIVE) {
-			interactive_waiting = true;
 			cpu = __COMPAT_scx_bpf_pick_any_cpu_node(
 				p->cpus_ptr, node, 0);
 			if (cpu >= 0) {
@@ -545,13 +527,10 @@ void BPF_STRUCT_OPS(pandemonium_enqueue, struct task_struct *p,
 	}
 
 	// FULL MODE: TIER-BASED DISPATCH
+	// NON-BATCH → PER-CPU DSQ + PREEMPT KICK (TRUST THE CLASSIFICATION ENGINE)
+	// BATCH → OVERFLOW DSQ (THROUGHPUT-ORIENTED, NO PREEMPTION)
 	cpu = __COMPAT_scx_bpf_pick_any_cpu_node(p->cpus_ptr, node, 0);
-	if (cpu >= 0 && tctx &&
-	    (tctx->tier == TIER_LAT_CRITICAL ||
-	     (tctx->tier == TIER_INTERACTIVE &&
-	      (tctx->wakeup_freq > preempt_thresh ||
-	       tctx->avg_runtime < slice_ns)))) {
-		// INTERACTIVE/LAT-CRITICAL → PER-CPU DSQ + PREEMPT KICK
+	if (cpu >= 0 && tctx && tctx->tier != TIER_BATCH) {
 		scx_bpf_dsq_insert_vtime(p, (u64)cpu,
 					  dyn_slice, dl, enq_flags);
 		scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
@@ -563,14 +542,25 @@ void BPF_STRUCT_OPS(pandemonium_enqueue, struct task_struct *p,
 		return;
 	}
 
-	// FALLBACK: OVERFLOW DSQ + POLITE KICK
+	// FALLBACK: OVERFLOW DSQ + PREEMPT KICK FOR NON-BATCH
+	// POLITE KICKS ARE NOOPS WHEN TARGET HAS REMAINING SLICE.
+	// NON-BATCH TASKS THAT MISSED THE DIRECT PATH (EWMA WARMUP,
+	// TRANSIENT LOW SCORE) STILL DESERVE PROMPT SERVICE.
 	scx_bpf_dsq_insert_vtime(p, overflow_id, dyn_slice, dl, enq_flags);
 	if (s)
 		s->nr_overflow += 1;
 	if (cpu >= 0) {
-		scx_bpf_kick_cpu(cpu, 0);
-		if (s)
-			s->nr_kicks += 1;
+		if (tctx && tctx->tier != TIER_BATCH) {
+			scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
+			if (s) {
+				s->nr_preempt += 1;
+				s->nr_kicks += 1;
+			}
+		} else {
+			scx_bpf_kick_cpu(cpu, 0);
+			if (s)
+				s->nr_kicks += 1;
+		}
 	}
 }
 
@@ -744,20 +734,6 @@ void BPF_STRUCT_OPS(pandemonium_running, struct task_struct *p)
 						s->wake_lat_max = wake_lat;
 				}
 			}
-
-			if (wake_lat > slice_ns) {
-				u64 guard = wake_lat;
-				u64 max_guard = slice_ns << 2;
-				u64 until;
-
-				if (guard > max_guard)
-					guard = max_guard;
-				if (guard < slice_ns)
-					guard = slice_ns;
-				until = now + guard;
-				if (until > interactive_guard_until)
-					interactive_guard_until = until;
-			}
 		}
 		p->scx.slice = task_slice(tctx);
 	}
@@ -802,39 +778,42 @@ out:
 		s->nr_dispatches += 1;
 }
 
-// TICK: SAFETY NET FOR LIGHTWEIGHT MODE.
-// WHEN interactive_waiting IS ARMED AND A BATCH TASK IS RUNNING,
-// PREEMPT IT TO FREE THE CPU FOR PENDING INTERACTIVE WORK.
-// FULL MODE USES DIRECT SCX_KICK_PREEMPT IN enqueue() INSTEAD.
+// TICK: IDLE BITMAP UPDATE + LIGHTWEIGHT MODE PREEMPTION SAFETY NET.
+// BITMAP UPDATE RUNS ONLY ON CPU 0 TO AVOID PER-CPU OVERHEAD.
 void BPF_STRUCT_OPS(pandemonium_tick, struct task_struct *p)
 {
 	struct task_ctx *tctx;
-	const struct cpumask *idle;
-	u64 idle_mask = 0;
-	u32 idle_key = 0;
-	s32 i;
 
 	// SNAPSHOT IDLE CPUMASK INTO BPF MAP FOR USERSPACE VISIBILITY
-	idle = scx_bpf_get_idle_cpumask();
-	bpf_for(i, 0, IDLE_BITMAP_CPUS) {
-		if (bpf_cpumask_test_cpu(i, idle))
-			idle_mask |= 1ULL << i;
-	}
-	scx_bpf_put_idle_cpumask(idle);
-	bpf_map_update_elem(&idle_bitmap, &idle_key, &idle_mask, 0);
+	// ONLY CPU 0 DOES THIS -- AVOIDS 12x OVERHEAD ON 12-CORE SYSTEM
+	if (bpf_get_smp_processor_id() == 0) {
+		const struct cpumask *idle;
+		u64 idle_mask = 0;
+		u32 idle_key = 0;
+		u32 n;
+		s32 i;
 
-	if (!lightweight_mode || !interactive_waiting)
+		for (n = 0; n < nr_nodes && n < MAX_NODES; n++) {
+			idle = __COMPAT_scx_bpf_get_idle_cpumask_node(n);
+			bpf_for(i, 0, IDLE_BITMAP_CPUS) {
+				if (bpf_cpumask_test_cpu(i, idle))
+					idle_mask |= 1ULL << i;
+			}
+			scx_bpf_put_idle_cpumask(idle);
+		}
+		bpf_map_update_elem(&idle_bitmap, &idle_key, &idle_mask, 0);
+	}
+
+	if (!lightweight_mode)
 		return;
 
 	tctx = lookup_task_ctx(p);
 	if (!tctx)
 		return;
 
-	// PREEMPT LONG-RUNNING BATCH TASKS WHEN INTERACTIVE WORK IS WAITING.
-	if (tctx->tier == TIER_BATCH && tctx->avg_runtime >= 1000000) {
+	// PREEMPT LONG-RUNNING BATCH TASKS TO FREE CPU FOR INTERACTIVE WORK
+	if (tctx->tier == TIER_BATCH && tctx->avg_runtime >= 1000000)
 		scx_bpf_kick_cpu(scx_bpf_task_cpu(p), SCX_KICK_PREEMPT);
-		interactive_waiting = false;
-	}
 }
 
 // ENABLE: NEW TASK ENTERS SCHED_EXT
@@ -897,14 +876,6 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(pandemonium_init)
 	if (sm > slice_max_ns * 4)
 		sm = slice_max_ns * 4;
 	scaled_slice_max = sm;
-
-	// CONTINUOUS PREEMPT THRESHOLD: 60 / (nr_scaling_cpus + 2), CLAMPED [3, 20]
-	// 2 CORES: 15  |  4 CORES: 10  |  8 CORES: 6  |  16 CORES: 3  |  32+: 3
-	preempt_thresh = 60 / (nr_scaling_cpus + 2);
-	if (preempt_thresh < 3)
-		preempt_thresh = 3;
-	if (preempt_thresh > 20)
-		preempt_thresh = 20;
 
 	return 0;
 }

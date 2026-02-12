@@ -328,6 +328,7 @@ fn spawn_probe(probe_exe: &str) -> Result<ProcGuard, String> {
     Ok(ProcGuard::new(proc))
 }
 
+// SYNCHRONOUS: SIGNAL + DRAIN + RETURN OUTPUT
 fn kill_probe(guard: ProcGuard) -> Result<String, String> {
     unsafe {
         libc::killpg(guard.id() as i32, libc::SIGTERM);
@@ -337,6 +338,35 @@ fn kill_probe(guard: ProcGuard) -> Result<String, String> {
         .wait_with_output()
         .map_err(|e| format!("PROBE WAIT FAILED: {}", e))?;
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+// ASYNCHRONOUS: SIGNAL + DRAIN ON BACKGROUND THREAD
+// RETURNS JOIN HANDLE -- CALLER COLLECTS OUTPUT LATER
+fn kill_probe_async(guard: ProcGuard) -> std::thread::JoinHandle<Result<String, String>> {
+    unsafe {
+        libc::killpg(guard.id() as i32, libc::SIGTERM);
+    }
+    let child = guard.into_child();
+    std::thread::spawn(move || {
+        let output = child
+            .wait_with_output()
+            .map_err(|e| format!("PROBE WAIT FAILED: {}", e))?;
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    })
+}
+
+fn parse_probe_output(stdout: &str) -> (usize, f64, f64, f64) {
+    let mut overshoots: Vec<f64> = stdout
+        .lines()
+        .filter_map(|line| line.trim().parse::<f64>().ok())
+        .collect();
+    overshoots.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+    let samples = overshoots.len();
+    let med = percentile(&overshoots, 50.0);
+    let p99 = percentile(&overshoots, 99.0);
+    let worst = overshoots.last().copied().unwrap_or(0.0);
+    (samples, med, p99, worst)
 }
 
 fn run_scale_phase(
@@ -358,17 +388,7 @@ fn run_scale_phase(
 
     stop_stress_workers(stress_running, stress_handles);
 
-    let mut overshoots: Vec<f64> = probe_stdout
-        .lines()
-        .filter_map(|line| line.trim().parse::<f64>().ok())
-        .collect();
-    overshoots.sort_by(|a, b| a.partial_cmp(b).unwrap());
-
-    let samples = overshoots.len();
-    let med = percentile(&overshoots, 50.0);
-    let p99 = percentile(&overshoots, 99.0);
-    let worst = overshoots.last().copied().unwrap_or(0.0);
-
+    let (samples, med, p99, worst) = parse_probe_output(&probe_stdout);
     Ok((samples, med, p99, worst))
 }
 
@@ -404,10 +424,12 @@ struct ScaleResult {
     lightweight: bool,
     slice_ceil_ms: u64,
     preempt_thresh: u64,
+    eevdf_workers: usize,
     eevdf_samples: usize,
     eevdf_median: f64,
     eevdf_p99: f64,
     eevdf_worst: f64,
+    pand_workers: usize,
     pand_samples: usize,
     pand_median: f64,
     pand_p99: f64,
@@ -492,7 +514,7 @@ fn scaling_benchmark() {
         println!("  ONLINE: {} CPUs", online);
 
         // COMPUTE EXPECTED SCALING PARAMS (MIRROR BPF FORMULAS)
-        let lightweight = n <= 4;
+        let lightweight = false;
         let sm = (20_000_000u64 * n as u64) >> 3;
         let slice_ceil = sm.max(5_000_000).min(80_000_000);
         let pt = 60u64 / (n as u64 + 2);
@@ -513,12 +535,22 @@ fn scaling_benchmark() {
             "  PHASE 1: EEVDF ({}s)  IDLE: {}  STRESSING: {} CPUs {:?}",
             DURATION_SECS, idle.len(), e_stress_cpus.len(), e_stress_cpus
         );
-        let (e_samples, e_med, e_p99, e_worst) =
-            run_scale_phase(&probe_exe, &e_stress_cpus, DURATION_SECS).expect("EEVDF PHASE FAILED");
-        println!(
-            "    SAMPLES: {}  MEDIAN: {:.0}us  P99: {:.0}us  WORST: {:.0}us",
-            e_samples, e_med, e_p99, e_worst
-        );
+
+        // EEVDF MEASUREMENT WITH ASYNC DRAIN
+        // WARMUP + MEASUREMENT RUN SYNCHRONOUSLY UNDER EEVDF.
+        // PROBE OUTPUT DRAINS ON BACKGROUND THREAD WHILE WE SETTLE + START PANDEMONIUM.
+        let (e_stress_running, e_stress_handles) = spawn_stress_workers(&e_stress_cpus);
+        let warmup_probe = spawn_probe(&probe_exe).expect("EEVDF WARMUP FAILED");
+        std::thread::sleep(Duration::from_secs(WARMUP_SECS));
+        let _ = kill_probe(warmup_probe);
+        let e_probe = spawn_probe(&probe_exe).expect("EEVDF PROBE FAILED");
+        std::thread::sleep(Duration::from_secs(DURATION_SECS));
+        let eevdf_drain = kill_probe_async(e_probe);
+        stop_stress_workers(e_stress_running, e_stress_handles);
+
+        // SETTLE: SYNC + SLEEP WHILE EEVDF PROBE OUTPUT DRAINS IN BACKGROUND
+        unsafe { libc::sync(); }
+        std::thread::sleep(Duration::from_secs(2));
 
         // PHASE 2: PANDEMONIUM
         let sched_args = vec!["--nr-cpus".to_string(), n.to_string()];
@@ -526,6 +558,7 @@ fn scaling_benchmark() {
             Ok(c) => c,
             Err(e) => {
                 println!("  FAILED TO START SCHEDULER: {} -- SKIPPING", e);
+                let _ = eevdf_drain.join();
                 restore_all_cpus(max_cpus);
                 std::thread::sleep(Duration::from_millis(500));
                 continue;
@@ -534,12 +567,30 @@ fn scaling_benchmark() {
 
         if !wait_for_activation(10) {
             println!("  SCHEDULER DID NOT ACTIVATE -- SKIPPING");
+            let _ = eevdf_drain.join();
             stop_scheduler(&mut pand_proc);
             restore_all_cpus(max_cpus);
             std::thread::sleep(Duration::from_millis(500));
             continue;
         }
         std::thread::sleep(Duration::from_secs(5));
+
+        // COLLECT EEVDF RESULTS (DRAINED IN BACKGROUND DURING SETTLE + STARTUP)
+        let eevdf_stdout = eevdf_drain.join().unwrap().expect("EEVDF DRAIN FAILED");
+        let (e_samples, e_med, e_p99, e_worst) = parse_probe_output(&eevdf_stdout);
+        println!(
+            "    EEVDF: {}  MEDIAN: {:.0}us  P99: {:.0}us  WORST: {:.0}us",
+            e_samples, e_med, e_p99, e_worst
+        );
+
+        // VERIFY SCHEDULER SURVIVED SETTLEMENT (CATCHES BPF RUNTIME ERRORS)
+        if !is_scx_active() {
+            println!("  SCHEDULER CRASHED DURING SETTLEMENT -- SKIPPING");
+            stop_scheduler(&mut pand_proc);
+            restore_all_cpus(max_cpus);
+            std::thread::sleep(Duration::from_millis(500));
+            continue;
+        }
 
         let idle = detect_idle_cpus(&probe_exe, true);
         let p_worker_count = idle.len().saturating_sub(1);
@@ -565,10 +616,12 @@ fn scaling_benchmark() {
             lightweight,
             slice_ceil_ms: slice_ceil / 1_000_000,
             preempt_thresh,
+            eevdf_workers: e_stress_cpus.len(),
             eevdf_samples: e_samples,
             eevdf_median: e_med,
             eevdf_p99: e_p99,
             eevdf_worst: e_worst,
+            pand_workers: p_stress_cpus.len(),
             pand_samples: p_samples,
             pand_median: p_med,
             pand_p99: p_p99,
@@ -592,12 +645,13 @@ fn scaling_benchmark() {
     // EEVDF TABLE
     report.push("EEVDF (DEFAULT SCHEDULER)".to_string());
     report.push(format!(
-        "{:>5} {:>8} {:>8} {:>8} {:>8}",
-        "CORES", "SAMPLES", "MEDIAN", "P99", "WORST"
+        "{:>5} {:>8} {:>8} {:>8} {:>8} {:>8}",
+        "CORES", "WORKERS", "SAMPLES", "MEDIAN", "P99", "WORST"
     ));
     report.push(format!(
-        "{} {} {} {} {}",
+        "{} {} {} {} {} {}",
         "-".repeat(5),
+        "-".repeat(8),
         "-".repeat(8),
         "-".repeat(8),
         "-".repeat(8),
@@ -605,8 +659,8 @@ fn scaling_benchmark() {
     ));
     for r in &results {
         report.push(format!(
-            "{:>5} {:>8} {:>7.0}us {:>7.0}us {:>7.0}us",
-            r.cores, r.eevdf_samples, r.eevdf_median, r.eevdf_p99, r.eevdf_worst,
+            "{:>5} {:>8} {:>8} {:>7.0}us {:>7.0}us {:>7.0}us",
+            r.cores, r.eevdf_workers, r.eevdf_samples, r.eevdf_median, r.eevdf_p99, r.eevdf_worst,
         ));
     }
     report.push(String::new());
@@ -614,11 +668,11 @@ fn scaling_benchmark() {
     // PANDEMONIUM TABLE
     report.push("PANDEMONIUM".to_string());
     report.push(format!(
-        "{:>5} {:>14} {:>10} {:>8} {:>8} {:>8} {:>8} {:>8}",
-        "CORES", "MODE", "SLICE_CEIL", "PREEMPT", "SAMPLES", "MEDIAN", "P99", "WORST"
+        "{:>5} {:>14} {:>10} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
+        "CORES", "MODE", "SLICE_CEIL", "PREEMPT", "WORKERS", "SAMPLES", "MEDIAN", "P99", "WORST"
     ));
     report.push(format!(
-        "{} {} {} {} {} {} {} {}",
+        "{} {} {} {} {} {} {} {} {}",
         "-".repeat(5),
         "-".repeat(14),
         "-".repeat(10),
@@ -627,14 +681,16 @@ fn scaling_benchmark() {
         "-".repeat(8),
         "-".repeat(8),
         "-".repeat(8),
+        "-".repeat(8),
     ));
     for r in &results {
         report.push(format!(
-            "{:>5} {:>14} {:>9}ms {:>8} {:>8} {:>7.0}us {:>7.0}us {:>7.0}us",
+            "{:>5} {:>14} {:>9}ms {:>8} {:>8} {:>8} {:>7.0}us {:>7.0}us {:>7.0}us",
             r.cores,
             if r.lightweight { "LIGHTWEIGHT" } else { "FULL" },
             r.slice_ceil_ms,
             r.preempt_thresh,
+            r.pand_workers,
             r.pand_samples,
             r.pand_median,
             r.pand_p99,

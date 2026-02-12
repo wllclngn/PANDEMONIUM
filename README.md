@@ -16,16 +16,17 @@ PANDEMONIUM (BUILD-MODE)   16.37s     1716      67us    1411us    4662us
 BUILD DELTA: -3.8% (PANDEMONIUM IS 3.8% FASTER)
 P99 LATENCY DELTA: -580us (PANDEMONIUM IS 580us BETTER)
 
-SCALING BENCHMARK (8 CORES, STRESS WORKERS + INTERACTIVE PROBE)
-SCHEDULER       MEDIAN      P99    WORST
------------- -------- -------- --------
-EEVDF              58us    3200us   30090us
-PANDEMONIUM        54us      56us    5522us
+SCALING BENCHMARK (STRESS WORKERS + INTERACTIVE PROBE, 12-THREAD AMD)
+CORES   EEVDF P99  PANDEMONIUM P99    DELTA
+----- --------- --------------- ---------
+    1      932us           661us    -271us  (PANDEMONIUM WINS)
+    8      786us          2148us   +1362us  (ROOM TO IMPROVE)
+   12      829us          3905us   +3076us  (ROOM TO IMPROVE)
 
-P99 DELTA: -3144us (PANDEMONIUM IS 57x BETTER)
+MEDIANS TIED ACROSS ALL CORE COUNTS (~58-78us)
 ```
 
-Contention workload: parallel Rust compilation + interactive wakeup probe (10ms sleep/wake cycle). Scaling workload: N-1 stress workers pinned to idle CPUs + interactive probe. 12-thread AMD system.
+Contention workload: parallel Rust compilation + interactive wakeup probe (10ms sleep/wake cycle). Scaling workload: N-1 stress workers pinned to idle CPUs via `sched_setaffinity` + interactive probe. CPU hotplug for core count control. 12-thread AMD system.
 
 ## How It Works
 
@@ -62,9 +63,9 @@ Compositors (kwin, sway, Hyprland, gnome-shell, etc.) are always boosted to LAT_
 ### Adaptive Safety Nets
 
 - **Interactive guard**: When observed wakeup-to-run latency exceeds the base slice, batch task slices are temporarily clamped. The guard window scales proportionally to the detected delay and expires naturally. No permanent global penalty.
-- **Tick preemption** (lightweight mode): On systems with 4 or fewer cores, a tick-based safety net preempts long-running batch tasks when interactive work is pending.
+- **Tick preemption** (lightweight mode): Optional simplified classifier with tick-based preemption for batch tasks when interactive work is pending. Enable manually with `--lightweight`.
 - **Runtime variance tracking**: Tasks with jittery execution times are penalized in classification, preventing unstable tasks from holding high-priority tiers.
-- **Idle CPU bitmap**: `tick()` snapshots `scx_bpf_get_idle_cpumask()` into a BPF map pinned to `/sys/fs/bpf/pandemonium/idle_cpus`. Exposes kernel idle state to userspace for intelligent load placement. Read via `pandemonium idle-cpus`.
+- **Idle CPU bitmap**: `tick()` snapshots per-node idle cpumasks into a BPF map pinned to `/sys/fs/bpf/pandemonium/idle_cpus`. Uses `__COMPAT_scx_bpf_get_idle_cpumask_node()` for kernel 6.12+ with `SCX_OPS_BUILTIN_IDLE_PER_NODE`. Read via `pandemonium idle-cpus`.
 
 ### Core-Count Scaling
 
@@ -98,12 +99,14 @@ pandemonium check
 ## Build
 
 ```bash
-CARGO_TARGET_DIR=/tmp/pandemonium-build cargo build --release
+./pandemonium.py rebuild        # Clean rebuild
+./pandemonium.py install        # Build + symlink to /usr/local/bin
+./pandemonium.py start          # Build if needed + run
 ```
 
-Or let `start` handle it:
+Or manually:
 ```bash
-pandemonium start
+CARGO_TARGET_DIR=/tmp/pandemonium-build cargo build --release
 ```
 
 vmlinux.h is generated at build time from `/sys/kernel/btf/vmlinux` via bpftool and cached at `/tmp/pandemonium-vmlinux.h`. A generic vmlinux.h will not work -- sched_ext types only exist in kernels with `CONFIG_SCHED_CLASS_EXT=y`.
@@ -176,8 +179,8 @@ sudo pandemonium run --nr-cpus 4 --verbose
 | `--nr-cpus` | auto | Override CPU count for scaling formulas |
 | `--verbose` | off | Per-second stats output |
 | `--dump-log` | off | Full time series on exit |
-| `--lightweight` | auto | Force lightweight classification mode |
-| `--no-lightweight` | auto | Force full engine on small core counts |
+| `--lightweight` | off | Enable lightweight classification mode (manual only) |
+| `--no-lightweight` | - | Force full engine (default behavior, kept for compatibility) |
 | `--calibrate` | off | Histogram collection + threshold suggestion |
 
 ## Monitoring
@@ -239,6 +242,7 @@ pandemonium test-scale
 ## Project Layout
 
 ```
+pandemonium.py           Build/run/install manager (Python)
 src/
   lib.rs               Library root (exports event module for tests)
   main.rs              CLI, subcommand dispatch, scheduler loop

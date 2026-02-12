@@ -1,4 +1,4 @@
-// PANDEMONIUM v0.9.4 -- SCHED_EXT KERNEL SCHEDULER
+// PANDEMONIUM v0.9.5 -- SCHED_EXT KERNEL SCHEDULER
 // BEHAVIORAL-ADAPTIVE GENERAL-PURPOSE SCHEDULING FOR LINUX
 //
 // SCHEDULING DECISIONS HAPPEN IN BPF (ZERO KERNEL-USERSPACE ROUND TRIPS)
@@ -56,6 +56,9 @@ enum SubCmd {
 
     /// Run test gate (unit + integration)
     Test,
+
+    /// A/B scaling benchmark (EEVDF vs PANDEMONIUM across core counts)
+    TestScale,
 
     /// Print idle CPU bitmask (requires running PANDEMONIUM scheduler)
     IdleCpus,
@@ -222,6 +225,7 @@ fn main() -> Result<()> {
             &args.sched_args,
         ),
         Some(SubCmd::Test) => cli::test_gate::run_test_gate(),
+        Some(SubCmd::TestScale) => cli::test_gate::run_test_scale(),
         Some(SubCmd::IdleCpus) => cli::idle_cpus::run_idle_cpus(),
     }
 }
@@ -246,10 +250,10 @@ fn run_scheduler(args: RunArgs) -> Result<()> {
     } else if args.lightweight {
         true
     } else {
-        nr_cpus <= 4
+        false
     };
 
-    println!("PANDEMONIUM v0.9.4");
+    println!("PANDEMONIUM v0.9.5");
     println!(
         "CPUS:            {} (governor: {})",
         nr_cpus,
@@ -260,7 +264,7 @@ fn run_scheduler(args: RunArgs) -> Result<()> {
         "LIGHTWEIGHT:     {}{}",
         lightweight,
         if !args.lightweight && !args.no_lightweight && lightweight {
-            " (auto: <=4 cores)"
+            " (auto)"
         } else {
             ""
         }
@@ -294,7 +298,6 @@ fn run_scheduler(args: RunArgs) -> Result<()> {
             args.slice_max,
             args.lat_cri_low,
             args.lat_cri_high,
-            args.verbose,
             lightweight,
             args.nr_cpus,
         )?;
@@ -318,7 +321,6 @@ fn run_scheduler(args: RunArgs) -> Result<()> {
             args.slice_max,
             args.lat_cri_low,
             args.lat_cri_high,
-            args.verbose,
             lightweight,
             args.nr_cpus,
         )?;

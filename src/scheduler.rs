@@ -49,7 +49,6 @@ struct PandemoniumStats {
 pub struct Scheduler<'a> {
     skel: MainSkel<'a>,
     _link: libbpf_rs::Link,
-    verbose: bool,
     lat_cri_low: u64,
     lat_cri_high: u64,
     pub log: EventLog,
@@ -64,7 +63,6 @@ impl<'a> Scheduler<'a> {
         slice_max_ns: u64,
         lat_cri_low: u64,
         lat_cri_high: u64,
-        verbose: bool,
         lightweight: bool,
         nr_cpus_override: Option<u64>,
     ) -> Result<Self> {
@@ -114,18 +112,23 @@ impl<'a> Scheduler<'a> {
         // STRUCT_OPS MUST BE ATTACHED VIA bpf_map__attach_struct_ops() DIRECTLY.
         let link = skel.maps.pandemonium_ops.attach_struct_ops()?;
 
-        // PIN IDLE BITMAP FOR `pandemonium idle-cpus` SUBCOMMAND
+        // PIN MAPS FOR USERSPACE ACCESS
         let pin_dir = "/sys/fs/bpf/pandemonium";
-        let pin_path = "/sys/fs/bpf/pandemonium/idle_cpus";
         std::fs::create_dir_all(pin_dir).ok();
-        // REMOVE STALE PIN FROM PREVIOUS UNCLEAN SHUTDOWN
-        std::fs::remove_file(pin_path).ok();
-        skel.maps.idle_bitmap.pin(pin_path)?;
+        
+        // IDLE BITMAP FOR `pandemonium idle-cpus`
+        let idle_pin = "/sys/fs/bpf/pandemonium/idle_cpus";
+        std::fs::remove_file(idle_pin).ok();
+        skel.maps.idle_bitmap.pin(idle_pin)?;
+        
+        // WAKEUP LATENCY RING BUFFER FOR BENCHMARKS
+        let rb_pin = "/sys/fs/bpf/pandemonium/wake_lat_rb";
+        std::fs::remove_file(rb_pin).ok();
+        skel.maps.wake_lat_rb.pin(rb_pin)?;
 
         Ok(Self {
             skel,
             _link: link,
-            verbose,
             lat_cri_low,
             lat_cri_high,
             log: EventLog::new(),
@@ -183,16 +186,16 @@ impl<'a> Scheduler<'a> {
                 total.nr_boosted += stats.nr_boosted;
                 total.nr_kicks += stats.nr_kicks;
                 total.nr_lat_critical += stats.nr_lat_critical;
-            total.nr_batch += stats.nr_batch;
-            total.lat_cri_sum += stats.lat_cri_sum;
-            total.nr_tier_changes += stats.nr_tier_changes;
-            total.nr_compositor += stats.nr_compositor;
-            total.wake_lat_sum += stats.wake_lat_sum;
-            if stats.wake_lat_max > total.wake_lat_max {
-                total.wake_lat_max = stats.wake_lat_max;
+                total.nr_batch += stats.nr_batch;
+                total.lat_cri_sum += stats.lat_cri_sum;
+                total.nr_tier_changes += stats.nr_tier_changes;
+                total.nr_compositor += stats.nr_compositor;
+                total.wake_lat_sum += stats.wake_lat_sum;
+                if stats.wake_lat_max > total.wake_lat_max {
+                    total.wake_lat_max = stats.wake_lat_max;
+                }
+                total.wake_lat_samples += stats.wake_lat_samples;
             }
-            total.wake_lat_samples += stats.wake_lat_samples;
-        }
         }
 
         total
@@ -237,15 +240,6 @@ impl<'a> Scheduler<'a> {
 
             self.log.snapshot(delta_d, delta_idle, delta_direct + delta_overflow,
                               delta_lat_cri, delta_int, delta_batch);
-
-            if self.verbose {
-                println!("  TOTAL dispatches={} idle={} direct={} overflow={} preempt={} lat_cri={} int={} batch={} sticky={} boosted={} kicks={} tier_changes={} compositor={} wake_avg={} wake_max={}",
-                    stats.nr_dispatches, stats.nr_idle_hits, stats.nr_direct, stats.nr_overflow, stats.nr_preempt,
-                    stats.nr_lat_critical, stats.nr_interactive, stats.nr_batch, stats.nr_sticky, stats.nr_boosted, stats.nr_kicks,
-                    stats.nr_tier_changes, stats.nr_compositor,
-                    if stats.wake_lat_samples > 0 { stats.wake_lat_sum / stats.wake_lat_samples } else { 0 },
-                    stats.wake_lat_max);
-            }
 
             prev = stats;
         }
@@ -400,6 +394,7 @@ impl<'a> Scheduler<'a> {
 impl Drop for Scheduler<'_> {
     fn drop(&mut self) {
         let _ = self.skel.maps.idle_bitmap.unpin("/sys/fs/bpf/pandemonium/idle_cpus");
+        let _ = self.skel.maps.wake_lat_rb.unpin("/sys/fs/bpf/pandemonium/wake_lat_rb");
         let _ = std::fs::remove_dir("/sys/fs/bpf/pandemonium");
     }
 }
