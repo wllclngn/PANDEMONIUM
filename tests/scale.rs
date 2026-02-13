@@ -4,7 +4,7 @@
 // REQUIRES ROOT + SCHED_EXT KERNEL.
 // RUN: sudo cargo test --test scale --release -- --ignored --test-threads=1
 //
-// TESTS [1, 2, 4, 8, MAX] CORE COUNTS. AT EACH POINT:
+// TESTS [2, 4, 8, MAX] CORE COUNTS. AT EACH POINT:
 //   PHASE 1: EEVDF BASELINE (STRESS WORKERS + INTERACTIVE PROBE)
 //   PHASE 2: PANDEMONIUM (SAME WORKLOAD, SCHEDULER LOADED WITH --nr-cpus N)
 //
@@ -19,6 +19,38 @@ use std::time::{Duration, Instant};
 
 const LOG_DIR: &str = "/tmp/pandemonium";
 const DURATION_SECS: u64 = 15;
+
+// ---------------------------------------------------------------------------
+// LOGGING (mirrors arch-update.py / ABRAXAS pattern)
+// ---------------------------------------------------------------------------
+
+fn _timestamp() -> String {
+    unsafe {
+        let mut t: libc::time_t = 0;
+        libc::time(&mut t);
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&t, &mut tm);
+        format!("[{:02}:{:02}:{:02}]", tm.tm_hour, tm.tm_min, tm.tm_sec)
+    }
+}
+
+macro_rules! log_info {
+    ($($arg:tt)*) => {
+        println!("{} [INFO]   {}", _timestamp(), format!($($arg)*));
+    };
+}
+
+macro_rules! log_warn {
+    ($($arg:tt)*) => {
+        println!("{} [WARN]   {}", _timestamp(), format!($($arg)*));
+    };
+}
+
+macro_rules! log_error {
+    ($($arg:tt)*) => {
+        println!("{} [ERROR]  {}", _timestamp(), format!($($arg)*));
+    };
+}
 
 // ---------------------------------------------------------------------------
 // CPU HOTPLUG
@@ -140,84 +172,6 @@ impl Drop for ProcGuard {
 }
 
 // ---------------------------------------------------------------------------
-// CPU IDLE DETECTION
-// ---------------------------------------------------------------------------
-
-struct CpuTimes {
-    idle: u64,
-    total: u64,
-}
-
-fn read_proc_stat() -> Vec<CpuTimes> {
-    let raw = fs::read_to_string("/proc/stat").unwrap_or_default();
-    let mut cpus = Vec::new();
-    for line in raw.lines() {
-        if !line.starts_with("cpu") || line.starts_with("cpu ") {
-            continue;
-        }
-        let fields: Vec<u64> = line.split_whitespace()
-            .skip(1)
-            .filter_map(|s| s.parse().ok())
-            .collect();
-        if fields.len() < 4 {
-            continue;
-        }
-        // idle + iowait
-        let idle = fields[3] + fields.get(4).copied().unwrap_or(0);
-        let total: u64 = fields.iter().sum();
-        cpus.push(CpuTimes { idle, total });
-    }
-    cpus
-}
-
-fn detect_idle_cpus_procstat(threshold_pct: f64) -> Vec<u32> {
-    let t1 = read_proc_stat();
-    std::thread::sleep(Duration::from_millis(200));
-    let t2 = read_proc_stat();
-
-    let mut idle_cpus = Vec::new();
-    for (i, (a, b)) in t1.iter().zip(t2.iter()).enumerate() {
-        let total_delta = b.total.saturating_sub(a.total);
-        if total_delta == 0 {
-            continue;
-        }
-        let idle_delta = b.idle.saturating_sub(a.idle);
-        let idle_pct = idle_delta as f64 / total_delta as f64 * 100.0;
-        if idle_pct >= threshold_pct {
-            idle_cpus.push(i as u32);
-        }
-    }
-    idle_cpus
-}
-
-fn detect_idle_cpus_bpf(probe_exe: &str) -> Option<Vec<u32>> {
-    let output = Command::new(probe_exe)
-        .arg("idle-cpus")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Some(
-        stdout.split_whitespace()
-            .filter_map(|s| s.parse::<u32>().ok())
-            .collect(),
-    )
-}
-
-fn detect_idle_cpus(probe_exe: &str, use_bpf: bool) -> Vec<u32> {
-    if use_bpf {
-        if let Some(cpus) = detect_idle_cpus_bpf(probe_exe) {
-            if !cpus.is_empty() {
-                return cpus;
-            }
-        }
-    }
-    detect_idle_cpus_procstat(80.0)
-}
-
-// ---------------------------------------------------------------------------
 // STRESS WORKERS (PINNED TO SPECIFIC CPUs)
 // ---------------------------------------------------------------------------
 
@@ -259,6 +213,24 @@ fn binary_path() -> String {
     format!("{}/release/pandemonium", target_dir)
 }
 
+// KILL STALE PANDEMONIUM SCHEDULER PROCESSES FROM PREVIOUS FAILED RUNS
+fn kill_stale_schedulers() {
+    let output = Command::new("pgrep")
+        .args(["-f", "pandemonium run"])
+        .output();
+    if let Ok(o) = output {
+        let stdout = String::from_utf8_lossy(&o.stdout);
+        for line in stdout.lines() {
+            if let Ok(pid) = line.trim().parse::<i32>() {
+                unsafe { libc::kill(pid, libc::SIGKILL); }
+            }
+        }
+        if !stdout.trim().is_empty() {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+}
+
 fn is_scx_active() -> bool {
     fs::read_to_string("/sys/kernel/sched_ext/root/ops")
         .map(|s| !s.trim().is_empty())
@@ -294,6 +266,33 @@ fn start_scheduler(extra_args: &[String]) -> Result<ProcGuard, String> {
 
 fn stop_scheduler(guard: &mut ProcGuard) {
     guard.stop();
+}
+
+// STOP SCHEDULER AND CAPTURE OUTPUT
+fn stop_and_drain(mut guard: ProcGuard) -> String {
+    let pgid = guard.id();
+    // SIGNAL STOP VIA SIGINT
+    unsafe { libc::killpg(pgid, libc::SIGINT); }
+    let deadline = std::time::Instant::now() + Duration::from_millis(2000);
+    if let Some(child) = guard.child.as_mut() {
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if std::time::Instant::now() >= deadline => {
+                    unsafe { libc::killpg(pgid, libc::SIGKILL); }
+                    let _ = child.wait();
+                    break;
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Err(_) => break,
+            }
+        }
+    }
+    let child = guard.into_child();
+    match child.wait_with_output() {
+        Ok(output) => String::from_utf8_lossy(&output.stdout).to_string(),
+        Err(_) => String::new(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -421,35 +420,40 @@ fn save_report(content: &str) -> Result<String, String> {
 
 struct ScaleResult {
     cores: u32,
-    lightweight: bool,
-    slice_ceil_ms: u64,
-    preempt_thresh: u64,
-    eevdf_workers: usize,
+    workers: usize,
     eevdf_samples: usize,
     eevdf_median: f64,
     eevdf_p99: f64,
     eevdf_worst: f64,
-    pand_workers: usize,
-    pand_samples: usize,
-    pand_median: f64,
-    pand_p99: f64,
-    pand_worst: f64,
+    bpf_samples: usize,
+    bpf_median: f64,
+    bpf_p99: f64,
+    bpf_worst: f64,
+    bpf_sched_output: String,
+    full_samples: usize,
+    full_median: f64,
+    full_p99: f64,
+    full_worst: f64,
+    full_sched_output: String,
 }
 
 #[test]
 #[ignore]
 fn scaling_benchmark() {
-    let sep = "=".repeat(60);
-    println!("{}", sep);
-    println!("PANDEMONIUM SCALING BENCHMARK (A/B)");
-    println!("{}", sep);
-    println!();
+    log_info!("PANDEMONIUM SCALING BENCHMARK (A/B/C)");
 
     assert_eq!(
         unsafe { libc::geteuid() },
         0,
         "SCALING BENCHMARK REQUIRES ROOT (CPU HOTPLUG + BPF)"
     );
+    // KILL STALE PANDEMONIUM PROCESSES FROM PREVIOUS FAILED RUNS
+    kill_stale_schedulers();
+
+    if is_scx_active() {
+        // GIVE IT A MOMENT TO DEACTIVATE AFTER KILLING STALE PROCESSES
+        std::thread::sleep(Duration::from_secs(2));
+    }
     assert!(
         !is_scx_active(),
         "SCHED_EXT IS ALREADY ACTIVE. STOP IT BEFORE BENCHMARKING."
@@ -462,10 +466,10 @@ fn scaling_benchmark() {
 
     let max_cpus = parse_online_cpus();
     assert!(max_cpus >= 2, "SCALING BENCHMARK REQUIRES AT LEAST 2 CPUs");
-    println!("RESTORED {} CPUs (possible: {})", max_cpus, possible);
+    log_info!("Restored {} CPUs (possible: {})", max_cpus, possible);
 
     // TEST POINTS: POWERS OF 2 UP TO MAX, PLUS MAX ITSELF
-    let mut points: Vec<u32> = vec![1, 2, 4, 8, 16, 32, 64]
+    let mut points: Vec<u32> = vec![2, 4, 8, 16, 32, 64]
         .into_iter()
         .filter(|&n| n <= max_cpus)
         .collect();
@@ -473,15 +477,15 @@ fn scaling_benchmark() {
         points.push(max_cpus);
     }
 
-    println!("ONLINE CPUs: {}", max_cpus);
-    println!("TEST POINTS: {:?}", points);
-    println!(
-        "DURATION:    {}s PER PHASE, 2 PHASES PER POINT",
+    log_info!("Online CPUs: {}", max_cpus);
+    log_info!("Test points: {:?}", points);
+    log_info!(
+        "Duration: {}s per phase, 3 phases per point",
         DURATION_SECS
     );
-    println!(
-        "TOTAL:       ~{}s + OVERHEAD",
-        points.len() as u64 * DURATION_SECS * 2
+    log_info!(
+        "Estimated: ~{}s + overhead",
+        points.len() as u64 * DURATION_SECS * 3
     );
     println!();
 
@@ -500,46 +504,148 @@ fn scaling_benchmark() {
     let mut results: Vec<ScaleResult> = Vec::new();
 
     for &n in &points {
-        println!("{}", "-".repeat(40));
-        println!("TESTING {} CORE{}", n, if n == 1 { "" } else { "S" });
-        println!("{}", "-".repeat(40));
+        println!();
+        log_info!("TESTING {} CORE{}", n, if n == 1 { "" } else { "S" });
 
         // RESTRICT CPUs
         if n < max_cpus {
+            log_info!("Restricting to {} CPUs via hotplug...", n);
             restrict_cpus(n, max_cpus).expect("CPU HOTPLUG FAILED");
             std::thread::sleep(Duration::from_millis(500));
         }
 
         let online = parse_online_cpus();
-        println!("  ONLINE: {} CPUs", online);
+        log_info!("Online: {} CPUs", online);
 
-        // COMPUTE EXPECTED SCALING PARAMS (MIRROR BPF FORMULAS)
-        let lightweight = false;
-        let sm = (20_000_000u64 * n as u64) >> 3;
-        let slice_ceil = sm.max(5_000_000).min(80_000_000);
-        let pt = 60u64 / (n as u64 + 2);
-        let preempt_thresh = pt.max(3).min(20);
+        // DETERMINISTIC WORKER COUNT: STRESS n-1 CPUs, RESERVE 1 FOR PROBE.
+        // ALL THREE PHASES GET IDENTICAL LOAD.
+        let worker_count = (n as usize).saturating_sub(1);
+        let stress_cpus: Vec<u32> = (0..worker_count as u32).collect();
 
-        println!(
-            "  MODE: {}  SLICE_CEIL: {}ms  PREEMPT_THRESH: {}",
-            if lightweight { "LIGHTWEIGHT" } else { "FULL" },
-            slice_ceil / 1_000_000,
-            preempt_thresh
+        // --- PHASE 1: PANDEMONIUM BPF-ONLY (--no-adaptive) ---
+        let bpf_args = vec![
+            "--nr-cpus".to_string(), n.to_string(),
+            "--no-adaptive".to_string(),
+        ];
+        let mut bpf_proc = match start_scheduler(&bpf_args) {
+            Ok(c) => c,
+            Err(e) => {
+                log_error!("Failed to start scheduler: {} -- skipping", e);
+                restore_all_cpus(max_cpus);
+                std::thread::sleep(Duration::from_millis(500));
+                continue;
+            }
+        };
+
+        if !wait_for_activation(10) {
+            log_error!("Scheduler did not activate -- skipping");
+            stop_scheduler(&mut bpf_proc);
+            restore_all_cpus(max_cpus);
+            std::thread::sleep(Duration::from_millis(500));
+            continue;
+        }
+        std::thread::sleep(Duration::from_secs(5));
+
+        if !is_scx_active() {
+            log_error!("Scheduler crashed during settlement -- skipping");
+            let crash_output = stop_and_drain(bpf_proc);
+            for line in crash_output.lines().take(10) {
+                let line = line.trim();
+                if !line.is_empty() {
+                    println!("    SCHED: {}", line);
+                }
+            }
+            restore_all_cpus(max_cpus);
+            std::thread::sleep(Duration::from_millis(500));
+            continue;
+        }
+
+        log_info!(
+            "Phase 1: BPF-ONLY ({}s)  Stressing: {} CPUs {:?}",
+            DURATION_SECS, stress_cpus.len(), stress_cpus
+        );
+        let (b_samples, b_med, b_p99, b_worst) =
+            run_scale_phase(&probe_exe, &stress_cpus, DURATION_SECS).expect("BPF-ONLY PHASE FAILED");
+
+        let bpf_alive = is_scx_active();
+        if !bpf_alive {
+            log_warn!("Scheduler crashed during measurement");
+        }
+        log_info!(
+            "  Samples: {}  Median: {:.0}us  P99: {:.0}us  Worst: {:.0}us{}",
+            b_samples, b_med, b_p99, b_worst,
+            if bpf_alive { "" } else { "  [TAINTED]" }
         );
 
-        // PHASE 1: EEVDF BASELINE
-        let idle = detect_idle_cpus(&probe_exe, false);
-        let e_worker_count = idle.len().saturating_sub(1);
-        let e_stress_cpus: Vec<u32> = idle[..e_worker_count].to_vec();
-        println!(
-            "  PHASE 1: EEVDF ({}s)  IDLE: {}  STRESSING: {} CPUs {:?}",
-            DURATION_SECS, idle.len(), e_stress_cpus.len(), e_stress_cpus
+        let bpf_output = stop_and_drain(bpf_proc);
+        kill_stale_schedulers();
+        unsafe { libc::sync(); }
+        std::thread::sleep(Duration::from_secs(2));
+
+        // --- PHASE 2: PANDEMONIUM FULL (BPF + ADAPTIVE) ---
+        let full_args = vec!["--nr-cpus".to_string(), n.to_string()];
+        let mut full_proc = match start_scheduler(&full_args) {
+            Ok(c) => c,
+            Err(e) => {
+                log_error!("Failed to start adaptive scheduler: {} -- skipping", e);
+                restore_all_cpus(max_cpus);
+                std::thread::sleep(Duration::from_millis(500));
+                continue;
+            }
+        };
+
+        if !wait_for_activation(10) {
+            log_error!("Adaptive scheduler did not activate -- skipping");
+            stop_scheduler(&mut full_proc);
+            restore_all_cpus(max_cpus);
+            std::thread::sleep(Duration::from_millis(500));
+            continue;
+        }
+        std::thread::sleep(Duration::from_secs(5));
+
+        if !is_scx_active() {
+            log_error!("Adaptive scheduler crashed during settlement -- skipping");
+            let crash_output = stop_and_drain(full_proc);
+            for line in crash_output.lines().take(10) {
+                let line = line.trim();
+                if !line.is_empty() {
+                    println!("    SCHED: {}", line);
+                }
+            }
+            restore_all_cpus(max_cpus);
+            std::thread::sleep(Duration::from_millis(500));
+            continue;
+        }
+
+        log_info!(
+            "Phase 2: BPF+ADAPTIVE ({}s)  Stressing: {} CPUs {:?}",
+            DURATION_SECS, stress_cpus.len(), stress_cpus
+        );
+        let (f_samples, f_med, f_p99, f_worst) =
+            run_scale_phase(&probe_exe, &stress_cpus, DURATION_SECS).expect("FULL PHASE FAILED");
+
+        let full_alive = is_scx_active();
+        if !full_alive {
+            log_warn!("Adaptive scheduler crashed during measurement");
+        }
+        log_info!(
+            "  Samples: {}  Median: {:.0}us  P99: {:.0}us  Worst: {:.0}us{}",
+            f_samples, f_med, f_p99, f_worst,
+            if full_alive { "" } else { "  [TAINTED]" }
         );
 
-        // EEVDF MEASUREMENT WITH ASYNC DRAIN
-        // WARMUP + MEASUREMENT RUN SYNCHRONOUSLY UNDER EEVDF.
-        // PROBE OUTPUT DRAINS ON BACKGROUND THREAD WHILE WE SETTLE + START PANDEMONIUM.
-        let (e_stress_running, e_stress_handles) = spawn_stress_workers(&e_stress_cpus);
+        let full_output = stop_and_drain(full_proc);
+        kill_stale_schedulers();
+        unsafe { libc::sync(); }
+        std::thread::sleep(Duration::from_secs(2));
+
+        // --- PHASE 3: EEVDF BASELINE (LAST -- CLEANUP SLOP DOESN'T MATTER) ---
+        log_info!(
+            "Phase 3: EEVDF ({}s)  Stressing: {} CPUs {:?}",
+            DURATION_SECS, stress_cpus.len(), stress_cpus
+        );
+
+        let (e_stress_running, e_stress_handles) = spawn_stress_workers(&stress_cpus);
         let warmup_probe = spawn_probe(&probe_exe).expect("EEVDF WARMUP FAILED");
         std::thread::sleep(Duration::from_secs(WARMUP_SECS));
         let _ = kill_probe(warmup_probe);
@@ -548,93 +654,44 @@ fn scaling_benchmark() {
         let eevdf_drain = kill_probe_async(e_probe);
         stop_stress_workers(e_stress_running, e_stress_handles);
 
-        // SETTLE: SYNC + SLEEP WHILE EEVDF PROBE OUTPUT DRAINS IN BACKGROUND
-        unsafe { libc::sync(); }
-        std::thread::sleep(Duration::from_secs(2));
+        restore_all_cpus(max_cpus);
 
-        // PHASE 2: PANDEMONIUM
-        let sched_args = vec!["--nr-cpus".to_string(), n.to_string()];
-        let mut pand_proc = match start_scheduler(&sched_args) {
-            Ok(c) => c,
-            Err(e) => {
-                println!("  FAILED TO START SCHEDULER: {} -- SKIPPING", e);
-                let _ = eevdf_drain.join();
-                restore_all_cpus(max_cpus);
-                std::thread::sleep(Duration::from_millis(500));
-                continue;
-            }
-        };
-
-        if !wait_for_activation(10) {
-            println!("  SCHEDULER DID NOT ACTIVATE -- SKIPPING");
-            let _ = eevdf_drain.join();
-            stop_scheduler(&mut pand_proc);
-            restore_all_cpus(max_cpus);
-            std::thread::sleep(Duration::from_millis(500));
-            continue;
-        }
-        std::thread::sleep(Duration::from_secs(5));
-
-        // COLLECT EEVDF RESULTS (DRAINED IN BACKGROUND DURING SETTLE + STARTUP)
-        let eevdf_stdout = eevdf_drain.join().unwrap().expect("EEVDF DRAIN FAILED");
+        let eevdf_stdout = eevdf_drain.join().unwrap().unwrap_or_default();
         let (e_samples, e_med, e_p99, e_worst) = parse_probe_output(&eevdf_stdout);
-        println!(
-            "    EEVDF: {}  MEDIAN: {:.0}us  P99: {:.0}us  WORST: {:.0}us",
+        log_info!(
+            "  Samples: {}  Median: {:.0}us  P99: {:.0}us  Worst: {:.0}us",
             e_samples, e_med, e_p99, e_worst
         );
 
-        // VERIFY SCHEDULER SURVIVED SETTLEMENT (CATCHES BPF RUNTIME ERRORS)
-        if !is_scx_active() {
-            println!("  SCHEDULER CRASHED DURING SETTLEMENT -- SKIPPING");
-            stop_scheduler(&mut pand_proc);
-            restore_all_cpus(max_cpus);
-            std::thread::sleep(Duration::from_millis(500));
-            continue;
-        }
-
-        let idle = detect_idle_cpus(&probe_exe, true);
-        let p_worker_count = idle.len().saturating_sub(1);
-        let p_stress_cpus: Vec<u32> = idle[..p_worker_count].to_vec();
-        println!(
-            "  PHASE 2: PANDEMONIUM ({}s)  IDLE: {}  STRESSING: {} CPUs {:?}",
-            DURATION_SECS, idle.len(), p_stress_cpus.len(), p_stress_cpus
-        );
-        let (p_samples, p_med, p_p99, p_worst) =
-            run_scale_phase(&probe_exe, &p_stress_cpus, DURATION_SECS).expect("PANDEMONIUM PHASE FAILED");
-        println!(
-            "    SAMPLES: {}  MEDIAN: {:.0}us  P99: {:.0}us  WORST: {:.0}us",
-            p_samples, p_med, p_p99, p_worst
-        );
-
-        stop_scheduler(&mut pand_proc);
-        restore_all_cpus(max_cpus);
         std::thread::sleep(Duration::from_millis(500));
-        println!();
 
         results.push(ScaleResult {
             cores: n,
-            lightweight,
-            slice_ceil_ms: slice_ceil / 1_000_000,
-            preempt_thresh,
-            eevdf_workers: e_stress_cpus.len(),
+            workers: worker_count,
             eevdf_samples: e_samples,
             eevdf_median: e_med,
             eevdf_p99: e_p99,
             eevdf_worst: e_worst,
-            pand_workers: p_stress_cpus.len(),
-            pand_samples: p_samples,
-            pand_median: p_med,
-            pand_p99: p_p99,
-            pand_worst: p_worst,
+            bpf_samples: b_samples,
+            bpf_median: b_med,
+            bpf_p99: b_p99,
+            bpf_worst: b_worst,
+            bpf_sched_output: bpf_output,
+            full_samples: f_samples,
+            full_median: f_med,
+            full_p99: f_p99,
+            full_worst: f_worst,
+            full_sched_output: full_output,
         });
     }
 
     assert!(!results.is_empty(), "NO SCALE POINTS COMPLETED");
 
     // REPORT
+    let sep = "=".repeat(60);
     let mut report = Vec::new();
     report.push(sep.clone());
-    report.push("PANDEMONIUM SCALING BENCHMARK (A/B VS EEVDF)".to_string());
+    report.push("PANDEMONIUM SCALING BENCHMARK (A/B/C)".to_string());
     report.push(sep.clone());
     report.push(format!(
         "WORKLOAD: N STRESS WORKERS + INTERACTIVE PROBE ({}s PER PHASE, {} CPUs MAX)",
@@ -642,92 +699,125 @@ fn scaling_benchmark() {
     ));
     report.push(String::new());
 
-    // EEVDF TABLE
-    report.push("EEVDF (DEFAULT SCHEDULER)".to_string());
-    report.push(format!(
+    let table_header = format!(
         "{:>5} {:>8} {:>8} {:>8} {:>8} {:>8}",
         "CORES", "WORKERS", "SAMPLES", "MEDIAN", "P99", "WORST"
-    ));
-    report.push(format!(
+    );
+    let table_sep = format!(
         "{} {} {} {} {} {}",
-        "-".repeat(5),
-        "-".repeat(8),
-        "-".repeat(8),
-        "-".repeat(8),
-        "-".repeat(8),
-        "-".repeat(8),
-    ));
+        "-".repeat(5), "-".repeat(8), "-".repeat(8),
+        "-".repeat(8), "-".repeat(8), "-".repeat(8),
+    );
+    let delta_header = format!(
+        "{:>5} {:>10} {:>10} {:>10}",
+        "CORES", "MEDIAN", "P99", "WORST"
+    );
+    let delta_sep = format!(
+        "{} {} {} {}",
+        "-".repeat(5), "-".repeat(10), "-".repeat(10), "-".repeat(10),
+    );
+
+    // EEVDF TABLE
+    report.push("EEVDF (DEFAULT SCHEDULER)".to_string());
+    report.push(table_header.clone());
+    report.push(table_sep.clone());
     for r in &results {
         report.push(format!(
             "{:>5} {:>8} {:>8} {:>7.0}us {:>7.0}us {:>7.0}us",
-            r.cores, r.eevdf_workers, r.eevdf_samples, r.eevdf_median, r.eevdf_p99, r.eevdf_worst,
+            r.cores, r.workers, r.eevdf_samples, r.eevdf_median, r.eevdf_p99, r.eevdf_worst,
         ));
     }
     report.push(String::new());
 
-    // PANDEMONIUM TABLE
-    report.push("PANDEMONIUM".to_string());
-    report.push(format!(
-        "{:>5} {:>14} {:>10} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
-        "CORES", "MODE", "SLICE_CEIL", "PREEMPT", "WORKERS", "SAMPLES", "MEDIAN", "P99", "WORST"
-    ));
-    report.push(format!(
-        "{} {} {} {} {} {} {} {} {}",
-        "-".repeat(5),
-        "-".repeat(14),
-        "-".repeat(10),
-        "-".repeat(8),
-        "-".repeat(8),
-        "-".repeat(8),
-        "-".repeat(8),
-        "-".repeat(8),
-        "-".repeat(8),
-    ));
+    // PANDEMONIUM BPF-ONLY TABLE
+    report.push("PANDEMONIUM (BPF ONLY)".to_string());
+    report.push(table_header.clone());
+    report.push(table_sep.clone());
     for r in &results {
         report.push(format!(
-            "{:>5} {:>14} {:>9}ms {:>8} {:>8} {:>8} {:>7.0}us {:>7.0}us {:>7.0}us",
-            r.cores,
-            if r.lightweight { "LIGHTWEIGHT" } else { "FULL" },
-            r.slice_ceil_ms,
-            r.preempt_thresh,
-            r.pand_workers,
-            r.pand_samples,
-            r.pand_median,
-            r.pand_p99,
-            r.pand_worst,
+            "{:>5} {:>8} {:>8} {:>7.0}us {:>7.0}us {:>7.0}us",
+            r.cores, r.workers, r.bpf_samples, r.bpf_median, r.bpf_p99, r.bpf_worst,
         ));
     }
     report.push(String::new());
 
-    // DELTA TABLE
-    report.push("DELTA (NEGATIVE = PANDEMONIUM IS BETTER)".to_string());
-    report.push(format!(
-        "{:>5} {:>10} {:>10} {:>10}",
-        "CORES", "MEDIAN", "P99", "WORST"
-    ));
-    report.push(format!(
-        "{} {} {} {}",
-        "-".repeat(5),
-        "-".repeat(10),
-        "-".repeat(10),
-        "-".repeat(10),
-    ));
+    // PANDEMONIUM FULL TABLE
+    report.push("PANDEMONIUM (BPF + ADAPTIVE)".to_string());
+    report.push(table_header.clone());
+    report.push(table_sep.clone());
     for r in &results {
-        let med_d = r.pand_median - r.eevdf_median;
-        let p99_d = r.pand_p99 - r.eevdf_p99;
-        let worst_d = r.pand_worst - r.eevdf_worst;
+        report.push(format!(
+            "{:>5} {:>8} {:>8} {:>7.0}us {:>7.0}us {:>7.0}us",
+            r.cores, r.workers, r.full_samples, r.full_median, r.full_p99, r.full_worst,
+        ));
+    }
+    report.push(String::new());
+
+    // DELTA: BPF-ONLY VS EEVDF
+    report.push("DELTA: BPF vs EEVDF (NEGATIVE = PANDEMONIUM IS BETTER)".to_string());
+    report.push(delta_header.clone());
+    report.push(delta_sep.clone());
+    for r in &results {
         report.push(format!(
             "{:>5} {:>+9.0}us {:>+9.0}us {:>+9.0}us",
-            r.cores, med_d, p99_d, worst_d,
+            r.cores,
+            r.bpf_median - r.eevdf_median,
+            r.bpf_p99 - r.eevdf_p99,
+            r.bpf_worst - r.eevdf_worst,
         ));
+    }
+    report.push(String::new());
+
+    // DELTA: FULL VS BPF-ONLY (ADAPTIVE GAIN)
+    report.push("DELTA: ADAPTIVE GAIN (FULL vs BPF-ONLY, NEGATIVE = ADAPTIVE HELPS)".to_string());
+    report.push(delta_header.clone());
+    report.push(delta_sep.clone());
+    for r in &results {
+        report.push(format!(
+            "{:>5} {:>+9.0}us {:>+9.0}us {:>+9.0}us",
+            r.cores,
+            r.full_median - r.bpf_median,
+            r.full_p99 - r.bpf_p99,
+            r.full_worst - r.bpf_worst,
+        ));
+    }
+    // SCHEDULER TELEMETRY PER PHASE
+    report.push("SCHEDULER TELEMETRY (MONITOR OUTPUT)".to_string());
+    report.push("-".repeat(60).to_string());
+    for r in &results {
+        report.push(format!("--- {} CORE{}: BPF-ONLY ---",
+            r.cores, if r.cores == 1 { "" } else { "S" }));
+        for line in r.bpf_sched_output.lines() {
+            let line = line.trim();
+            if line.starts_with("d/s:") || line.starts_with("kick:") {
+                report.push(format!("  {}", line));
+            }
+        }
+        report.push(format!("--- {} CORE{}: BPF+ADAPTIVE ---",
+            r.cores, if r.cores == 1 { "" } else { "S" }));
+        for line in r.full_sched_output.lines() {
+            let line = line.trim();
+            if line.starts_with("d/s:") || line.starts_with("kick:") {
+                report.push(format!("  {}", line));
+            }
+        }
+        report.push(String::new());
     }
     report.push(sep.clone());
 
     let report_text = report.join("\n") + "\n";
+
+    // PRINT REPORT TO TERMINAL WITH TIMESTAMPS
+    println!();
+    log_info!("BENCHMARK RESULTS");
     for line in &report {
-        println!("{}", line);
+        if line.is_empty() {
+            println!();
+        } else {
+            log_info!("{}", line);
+        }
     }
 
     let path = save_report(&report_text).expect("FAILED TO SAVE REPORT");
-    println!("\nSAVED TO {}", path);
+    log_info!("Report saved to {}", path);
 }

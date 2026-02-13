@@ -12,10 +12,10 @@ fn snapshot_records() {
     assert_eq!(log.len(), 1);
     assert_eq!(log.get(0).dispatches, 100);
     assert_eq!(log.get(0).idle_hits, 90);
-    assert_eq!(log.get(0).any_hits, 10);
-    assert_eq!(log.get(0).lat_cri, 5);
-    assert_eq!(log.get(0).interactive, 30);
-    assert_eq!(log.get(0).batch, 65);
+    assert_eq!(log.get(0).shared, 10);
+    assert_eq!(log.get(0).preempt, 5);
+    assert_eq!(log.get(0).keep_run, 30);
+    assert_eq!(log.get(0).wake_avg_us, 65);
     assert!(log.get(0).ts_ns > 0);
 }
 

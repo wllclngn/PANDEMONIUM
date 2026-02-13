@@ -10,10 +10,14 @@ pub struct Snapshot {
     pub ts_ns:       u64,
     pub dispatches:  u64,
     pub idle_hits:   u64,
-    pub any_hits:    u64,
-    pub lat_cri:     u64,
-    pub interactive: u64,
-    pub batch:       u64,
+    pub shared:      u64,
+    pub preempt:     u64,
+    pub keep_run:    u64,
+    pub wake_avg_us: u64,
+    pub hard_kicks:  u64,
+    pub soft_kicks:  u64,
+    pub lat_idle_us: u64,
+    pub lat_kick_us: u64,
 }
 
 pub struct EventLog {
@@ -26,8 +30,9 @@ impl EventLog {
     pub fn new() -> Self {
         Self {
             snapshots: vec![
-                Snapshot { ts_ns: 0, dispatches: 0, idle_hits: 0, any_hits: 0,
-                           lat_cri: 0, interactive: 0, batch: 0 };
+                Snapshot { ts_ns: 0, dispatches: 0, idle_hits: 0, shared: 0,
+                           preempt: 0, keep_run: 0, wake_avg_us: 0,
+                           hard_kicks: 0, soft_kicks: 0, lat_idle_us: 0, lat_kick_us: 0 };
                 MAX_SNAPSHOTS
             ],
             head: 0,
@@ -37,16 +42,22 @@ impl EventLog {
 
     // RECORD ONE STATS SNAPSHOT. CALLED ONCE PER SECOND FROM THE MONITOR LOOP.
     // OVERWRITES OLDEST ENTRY WHEN FULL.
-    pub fn snapshot(&mut self, dispatches: u64, idle_hits: u64, any_hits: u64,
-                    lat_cri: u64, interactive: u64, batch: u64) {
+    pub fn snapshot(&mut self, dispatches: u64, idle_hits: u64, shared: u64,
+                    preempt: u64, keep_run: u64, wake_avg_us: u64,
+                    hard_kicks: u64, soft_kicks: u64,
+                    lat_idle_us: u64, lat_kick_us: u64) {
         self.snapshots[self.head] = Snapshot {
             ts_ns: now_ns(),
             dispatches,
             idle_hits,
-            any_hits,
-            lat_cri,
-            interactive,
-            batch,
+            shared,
+            preempt,
+            keep_run,
+            wake_avg_us,
+            hard_kicks,
+            soft_kicks,
+            lat_idle_us,
+            lat_kick_us,
         };
         self.head = (self.head + 1) % MAX_SNAPSHOTS;
         if self.len < MAX_SNAPSHOTS {
@@ -84,20 +95,22 @@ impl EventLog {
         let first = iter.next().unwrap();
         let base_ts = first.ts_ns;
 
-        println!("\n{:<10} {:<12} {:<10} {:<10} {:<10} {:<10} {:<10}",
-            "TIME_S", "DISPATCH/S", "IDLE/S", "ANY/S", "LAT_CRI", "INT", "BATCH");
-        println!("{}", "-".repeat(72));
+        println!("\n{:<10} {:<12} {:<10} {:<10} {:<10} {:<10} {:<10} {:<8} {:<8} {:<10} {:<10}",
+            "TIME_S", "DISPATCH/S", "IDLE/S", "SHARED/S", "PREEMPT", "KEEP_RUN", "WAKE_US",
+            "KICK_H", "KICK_S", "LAT_IDLE", "LAT_KICK");
+        println!("{}", "-".repeat(108));
 
-        // PRINT FIRST ENTRY
-        println!("{:<10.1} {:<12} {:<10} {:<10} {:<10} {:<10} {:<10}",
-            0.0, first.dispatches, first.idle_hits, first.any_hits,
-            first.lat_cri, first.interactive, first.batch);
+        println!("{:<10.1} {:<12} {:<10} {:<10} {:<10} {:<10} {:<10} {:<8} {:<8} {:<10} {:<10}",
+            0.0, first.dispatches, first.idle_hits, first.shared,
+            first.preempt, first.keep_run, first.wake_avg_us,
+            first.hard_kicks, first.soft_kicks, first.lat_idle_us, first.lat_kick_us);
 
         for s in iter {
             let elapsed_s = (s.ts_ns - base_ts) as f64 / 1_000_000_000.0;
-            println!("{:<10.1} {:<12} {:<10} {:<10} {:<10} {:<10} {:<10}",
-                elapsed_s, s.dispatches, s.idle_hits, s.any_hits,
-                s.lat_cri, s.interactive, s.batch);
+            println!("{:<10.1} {:<12} {:<10} {:<10} {:<10} {:<10} {:<10} {:<8} {:<8} {:<10} {:<10}",
+                elapsed_s, s.dispatches, s.idle_hits, s.shared,
+                s.preempt, s.keep_run, s.wake_avg_us,
+                s.hard_kicks, s.soft_kicks, s.lat_idle_us, s.lat_kick_us);
         }
 
         if self.len == MAX_SNAPSHOTS {
@@ -116,10 +129,9 @@ impl EventLog {
 
         let total_d: u64 = snapshots.iter().map(|s| s.dispatches).sum();
         let total_idle: u64 = snapshots.iter().map(|s| s.idle_hits).sum();
-        let total_any: u64 = snapshots.iter().map(|s| s.any_hits).sum();
-        let total_lat_cri: u64 = snapshots.iter().map(|s| s.lat_cri).sum();
-        let total_int: u64 = snapshots.iter().map(|s| s.interactive).sum();
-        let total_batch: u64 = snapshots.iter().map(|s| s.batch).sum();
+        let total_shared: u64 = snapshots.iter().map(|s| s.shared).sum();
+        let total_preempt: u64 = snapshots.iter().map(|s| s.preempt).sum();
+        let total_keep: u64 = snapshots.iter().map(|s| s.keep_run).sum();
 
         let peak_d = snapshots.iter().map(|s| s.dispatches).max().unwrap_or(0);
 
@@ -131,20 +143,14 @@ impl EventLog {
         println!("{}", "=".repeat(50));
         println!("  TOTAL DISPATCHES:  {}", total_d);
         println!("  TOTAL IDLE HITS:   {}", total_idle);
-        println!("  TOTAL ANY HITS:    {}", total_any);
+        println!("  TOTAL SHARED:      {}", total_shared);
+        println!("  TOTAL PREEMPT:     {}", total_preempt);
+        println!("  TOTAL KEEP_RUN:    {}", total_keep);
         println!("  PEAK DISPATCH/S:   {}", peak_d);
         if elapsed_s > 0.0 {
             println!("  AVG DISPATCH/S:    {:.0}", total_d as f64 / elapsed_s);
-            let idle_pct = total_idle as f64 / (total_idle + total_any).max(1) as f64 * 100.0;
+            let idle_pct = if total_d > 0 { total_idle as f64 / total_d as f64 * 100.0 } else { 0.0 };
             println!("  IDLE HIT RATE:     {:.1}%", idle_pct);
-        }
-        let total_tier = total_lat_cri + total_int + total_batch;
-        if total_tier > 0 {
-            let lc_pct = total_lat_cri as f64 / total_tier as f64 * 100.0;
-            let int_pct = total_int as f64 / total_tier as f64 * 100.0;
-            let bat_pct = total_batch as f64 / total_tier as f64 * 100.0;
-            println!("  TIER DISTRIBUTION: LAT_CRI {:.1}% / INT {:.1}% / BATCH {:.1}%",
-                lc_pct, int_pct, bat_pct);
         }
         println!("  ELAPSED:           {:.1}s", elapsed_s);
         println!("  SAMPLES:           {}", self.len);
@@ -161,4 +167,3 @@ fn now_ns() -> u64 {
     }
     (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64)
 }
-

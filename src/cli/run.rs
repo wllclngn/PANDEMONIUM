@@ -134,7 +134,7 @@ fn chrono_stamp() -> String {
     }
 }
 
-pub fn run_start(observe: bool, calibrate: bool, sched_args: &[String]) -> Result<()> {
+pub fn run_start(observe: bool, sched_args: &[String]) -> Result<()> {
     // BUILD FIRST
     build_scheduler()?;
 
@@ -147,9 +147,6 @@ pub fn run_start(observe: bool, calibrate: bool, sched_args: &[String]) -> Resul
     if observe {
         cmd_args.push("--verbose".to_string());
         cmd_args.push("--dump-log".to_string());
-    }
-    if calibrate {
-        cmd_args.push("--calibrate".to_string());
     }
     cmd_args.extend(sched_args.iter().cloned());
 

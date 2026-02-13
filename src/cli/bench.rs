@@ -29,7 +29,6 @@ pub fn run_bench_run(
     cmd: Option<&str>,
     iterations: usize,
     clean_cmd: Option<&str>,
-    build_mode: bool,
     sched_args: &[String],
 ) -> Result<()> {
     fs::create_dir_all(LOG_DIR)?;
@@ -46,10 +45,7 @@ pub fn run_bench_run(
         bail!("BUILD FAILED. SEE {}/build.err", LOG_DIR);
     }
 
-    let mut extra_args: Vec<String> = sched_args.to_vec();
-    if build_mode && !extra_args.iter().any(|arg| arg == "--build-mode") {
-        extra_args.push("--build-mode".to_string());
-    }
+    let extra_args: Vec<String> = sched_args.to_vec();
 
     let bench_out = File::create(format!("{}/bench.out", LOG_DIR))?;
     let bench_err = File::create(format!("{}/bench.err", LOG_DIR))?;
@@ -159,11 +155,7 @@ pub fn run_bench(
             &format!("CARGO_TARGET_DIR={} cargo build --release", TARGET_DIR),
             iterations,
             Some(&format!("cargo clean --target-dir {}", TARGET_DIR)),
-            &if sched_args.is_empty() {
-                vec!["--build-mode".to_string()]
-            } else {
-                sched_args.to_vec()
-            },
+            sched_args,
         ),
         BenchMode::Cmd => {
             let cmd = cmd.ok_or_else(|| anyhow::anyhow!("--cmd required for --mode cmd"))?;
@@ -380,11 +372,7 @@ fn bench_mixed(sched_args: &[String]) -> Result<()> {
     let build_cmd = format!("CARGO_TARGET_DIR={} cargo build --release", TARGET_DIR);
     let clean_cmd = format!("cargo clean --target-dir {}", TARGET_DIR);
 
-    let sched_args = if sched_args.is_empty() {
-        vec!["--build-mode".to_string()]
-    } else {
-        sched_args.to_vec()
-    };
+    let sched_args = sched_args.to_vec();
 
     // PHASE 1: EEVDF
     println!("PHASE 1: EEVDF (DEFAULT SCHEDULER)");
@@ -408,7 +396,7 @@ fn bench_mixed(sched_args: &[String]) -> Result<()> {
     println!();
 
     // PHASE 3: PANDEMONIUM
-    println!("PHASE 3: PANDEMONIUM (BUILD-MODE)");
+    println!("PHASE 3: PANDEMONIUM");
     println!("{}", "-".repeat(40));
     let _ = Command::new("sh").args(["-c", &clean_cmd]).output();
     let xruns_before = pw_get_xruns();
@@ -510,11 +498,7 @@ fn bench_contention(sched_args: &[String]) -> Result<()> {
     let probe_exe = format!("{}/probe", super::LOG_DIR);
     std::fs::copy(self_exe(), &probe_exe)?;
 
-    let sched_args = if sched_args.is_empty() {
-        vec!["--build-mode".to_string()]
-    } else {
-        sched_args.to_vec()
-    };
+    let sched_args = sched_args.to_vec();
 
     struct PhaseResult {
         name: String,
@@ -527,7 +511,7 @@ fn bench_contention(sched_args: &[String]) -> Result<()> {
 
     let phases: Vec<(&str, bool)> = vec![
         ("EEVDF (DEFAULT)", false),
-        ("PANDEMONIUM (BUILD-MODE)", true),
+        ("PANDEMONIUM", true),
     ];
 
     let mut results = Vec::new();
