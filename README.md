@@ -1,8 +1,6 @@
 # PANDEMONIUM
 
-A behavioral-adaptive Linux kernel scheduler built on sched_ext. Written in Rust and BPF (GNU C23). Classifies every task on the system by runtime behavior -- wakeup frequency, context switch rate, execution time, runtime variance -- and adapts scheduling decisions in real time. No heuristic tables. No process name matching. Pure behavioral signal.
-
-**Beats the default Linux scheduler (EEVDF) on both throughput and tail latency under contention.**
+A Linux kernel scheduler that observes how every task behaves -- wakeup patterns, context switch rates, execution times -- and adapts dispatch decisions within milliseconds. Built on sched_ext in Rust and BPF (GNU C23), PANDEMONIUM replaces static heuristics with a lock-free adaptive control loop that tightens and relaxes scheduling knobs based on live P99 latency. Beats the default Linux scheduler (EEVDF) on both throughput and tail latency under contention.
 
 **Key Features:**
 
