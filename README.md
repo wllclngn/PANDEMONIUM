@@ -1,39 +1,39 @@
 # PANDEMONIUM
 
-A Linux kernel scheduler that observes how every task behaves -- wakeup patterns, context switch rates, execution times, sleep durations -- and adapts dispatch decisions within milliseconds. Built on sched_ext in Rust and BPF (GNU C23), PANDEMONIUM replaces static heuristics with a lock-free adaptive control loop that tightens and relaxes scheduling knobs based on live P99 latency. Tasks are classified across lifetimes via a process database that learns from behavioral convergence.
+Built in Rust and C23, PANDEMONIUM is a Linux kernel scheduler built for sched_ext. Utilizing BPF patterns, PANDEMONIUM classifies every task by its behavior--wakeup frequency, context switch rate, runtime, sleep patterns--and adapts scheduling decisions in real time. Two-thread adaptive control loop (zero mutexes), three-tier behavioral dispatch and a process database that learns task classifications across lifetimes.
 
 ## Performance
 
-Benchmarked on 12 AMD Zen CPUs, kernel 6.18.9-arch1-2, clang 21.1.6:
+Benchmarked on 12 AMD Zen CPUs, kernel 6.18.9-arch1-2, clang 21.1.6. Numbers below are representative ranges across multiple single-iteration bench-scale runs under real desktop load.
 
 ### Throughput (kernel build, vs EEVDF baseline)
 
 | Cores | PANDEMONIUM | scx_bpfland |
 |-------|-------------|-------------|
-| 2     | +5.7%       | +0.3%       |
-| 4     | +3.6%       | +1.0%       |
-| 8     | +4.8%       | +3.1%       |
-| 12    | **-0.1%**   | +0.7%       |
+| 2     | +3.3-5.7%   | +0.3-2.4%   |
+| 4     | +2.8-6.0%   | +0.5-1.4%   |
+| 8     | +3.1-4.8%   | +3.1-6.6%   |
+| 12    | +1.8-3.5%   | +0.7-3.9%   |
 
-At full core count, PANDEMONIUM matches EEVDF throughput. The 3-5% overhead at low core counts is inherent per-dispatch cost from 5 BPF callbacks per scheduling cycle -- amortized at higher core counts.
+3-4% overhead at low core counts is inherent per-dispatch cost from 5 BPF callbacks per scheduling cycle -- amortized at higher core counts. At 12 cores, overhead is 2-3.5% in exchange for 8-19x better tail latency.
 
 ### P99 Wakeup Latency (interactive probe under CPU saturation)
 
-| Cores | EEVDF    | PANDEMONIUM | scx_bpfland | vs EEVDF |
-|-------|----------|-------------|-------------|----------|
-| 2     | 855us    | 85us        | 1489us      | **10x**  |
-| 4     | 827us    | 78us        | 1379us      | **10x**  |
-| 8     | 822us    | 67us        | 1194us      | **12x**  |
-| 12    | 1181us   | 68us        | 1006us      | **17x**  |
+| Cores | EEVDF     | PANDEMONIUM | scx_bpfland | vs EEVDF    |
+|-------|-----------|-------------|-------------|-------------|
+| 2     | 830-995us | 85-119us    | 1034-1932us | **8-10x**   |
+| 4     | 827-884us | 78-101us    | 1009-1756us | **8-10x**   |
+| 8     | 822-1596us| 67-83us     | 1003-1194us | **12-19x**  |
+| 12    | 941-1632us| 68-95us     | 1001-1007us | **10-17x**  |
 
-10-17x better tail latency than the kernel default scheduler. Consistently sub-100us P99 across all core counts under full CPU saturation.
+8-19x better tail latency than the kernel default scheduler. Sub-120us P99 across all core counts under full CPU saturation.
 
 ## Key Features
 
 ### Three-Tier Dispatch
-- **Idle CPU Fast Path**: `select_cpu()` places wakeups directly to per-CPU DSQ with zero contention
+- **Idle CPU Fast Path**: `select_cpu()` places wakeups directly to per-CPU DSQ with zero contention, kicks with `SCX_KICK_IDLE`
 - **Node-Local Placement**: `enqueue()` finds idle CPUs within the NUMA node, dispatches to per-CPU DSQ with `SCX_KICK_PREEMPT` for non-batch tasks
-- **Direct Preemptive Placement**: Latency-sensitive tasks placed directly onto busy CPU's per-CPU DSQ with `SCX_KICK_PREEMPT`
+- **Direct Preemptive Placement**: LAT_CRITICAL tasks (any path) and INTERACTIVE wakeups placed directly onto busy CPU's per-CPU DSQ with `SCX_KICK_PREEMPT`. Requeued INTERACTIVE tasks fall to overflow DSQ to avoid unnecessary BPF helper calls
 - **NUMA-Scoped Overflow**: Per-node overflow DSQ with cross-node work stealing as final fallback
 - **Tick Safety Net**: `tick()` preempts batch tasks when interactive work is waiting in the overflow DSQ
 - **BPF Timer**: Independent 1ms preemption scan, reliable under NO_HZ_FULL
@@ -113,13 +113,14 @@ include/
 ### BPF Scheduler (main.bpf.c)
 
 ```
-select_cpu()  ->  Idle CPU found?  ->  Per-CPU DSQ (fast path)
+select_cpu()  ->  Idle CPU found?  ->  Per-CPU DSQ (fast path, KICK_IDLE)
                       |
                       v (no)
 enqueue()     ->  Node-local idle?  ->  Per-CPU DSQ + PREEMPT kick
                       |
                       v (no)
-              ->  Latency-sensitive? ->  Direct per-CPU + KICK_PREEMPT
+              ->  LAT_CRITICAL or   ->  Direct per-CPU + KICK_PREEMPT
+                  INTERACTIVE wakeup?
                       |
                       v (no)
               ->  Per-node overflow DSQ  ->  dispatch() work stealing
