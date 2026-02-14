@@ -250,7 +250,7 @@ fn wait_for_activation(timeout_secs: u64) -> bool {
 
 fn start_scheduler(extra_args: &[String]) -> Result<ProcGuard, String> {
     let bin = binary_path();
-    let mut args = vec!["run".to_string()];
+    let mut args = Vec::new();
     args.extend(extra_args.iter().cloned());
 
     let child = Command::new("sudo")
@@ -293,6 +293,58 @@ fn stop_and_drain(mut guard: ProcGuard) -> String {
         Ok(output) => String::from_utf8_lossy(&output.stdout).to_string(),
         Err(_) => String::new(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// EXTERNAL SCX SCHEDULERS
+// ---------------------------------------------------------------------------
+
+fn find_scx_schedulers() -> Vec<(String, String)> {
+    let names: Vec<String> = if let Ok(val) = std::env::var("PANDEMONIUM_SCX_SCHEDULERS") {
+        val.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    } else {
+        // Full field: ["scx_rusty", "scx_bpfland", "scx_lavd", "scx_flash", "scx_layered", "scx_p2dq"]
+        vec![
+            "scx_bpfland".to_string(),
+        ]
+    };
+    let mut found = Vec::new();
+    for name in names {
+        if let Ok(output) = Command::new("which").arg(&name).output() {
+            if output.status.success() {
+                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !path.is_empty() {
+                    found.push((name, path));
+                }
+            }
+        }
+    }
+    found
+}
+
+fn start_external_scheduler(path: &str) -> Result<ProcGuard, String> {
+    let child = Command::new("sudo")
+        .arg(path)
+        .process_group(0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("FAILED TO START {}: {}", path, e))?;
+    Ok(ProcGuard::new(child))
+}
+
+fn wait_for_deactivation(timeout_secs: u64) -> bool {
+    let start = Instant::now();
+    while start.elapsed().as_secs() < timeout_secs {
+        if !is_scx_active() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -418,9 +470,16 @@ fn save_report(content: &str) -> Result<String, String> {
 // SCALING TEST
 // ---------------------------------------------------------------------------
 
+struct ExternalResult {
+    name: String,
+    samples: usize,
+    median: f64,
+    p99: f64,
+    worst: f64,
+}
+
 struct ScaleResult {
     cores: u32,
-    workers: usize,
     eevdf_samples: usize,
     eevdf_median: f64,
     eevdf_p99: f64,
@@ -435,6 +494,7 @@ struct ScaleResult {
     full_p99: f64,
     full_worst: f64,
     full_sched_output: String,
+    externals: Vec<ExternalResult>,
 }
 
 #[test]
@@ -477,15 +537,26 @@ fn scaling_benchmark() {
         points.push(max_cpus);
     }
 
+    let scx_schedulers = find_scx_schedulers();
+    let phases_per_point = 3 + scx_schedulers.len() as u64;
+
     log_info!("Online CPUs: {}", max_cpus);
     log_info!("Test points: {:?}", points);
+    if scx_schedulers.is_empty() {
+        log_warn!("No external scx schedulers found");
+    } else {
+        log_info!(
+            "External schedulers: {}",
+            scx_schedulers.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", ")
+        );
+    }
     log_info!(
-        "Duration: {}s per phase, 3 phases per point",
-        DURATION_SECS
+        "Duration: {}s per phase, {} phases per point",
+        DURATION_SECS, phases_per_point
     );
     log_info!(
         "Estimated: ~{}s + overhead",
-        points.len() as u64 * DURATION_SECS * 3
+        points.len() as u64 * DURATION_SECS * phases_per_point
     );
     println!();
 
@@ -639,7 +710,81 @@ fn scaling_benchmark() {
         unsafe { libc::sync(); }
         std::thread::sleep(Duration::from_secs(2));
 
-        // --- PHASE 3: EEVDF BASELINE (LAST -- CLEANUP SLOP DOESN'T MATTER) ---
+        // --- EXTERNAL SCX SCHEDULERS ---
+        let mut ext_results: Vec<ExternalResult> = Vec::new();
+        for (scx_name, scx_path) in &scx_schedulers {
+            if is_scx_active() {
+                log_warn!("sched_ext still active before {} -- waiting", scx_name);
+                if !wait_for_deactivation(5) {
+                    log_error!("sched_ext stuck active -- skipping {}", scx_name);
+                    continue;
+                }
+            }
+
+            let mut scx_proc = match start_external_scheduler(scx_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    log_warn!("Failed to start {}: {} -- skipping", scx_name, e);
+                    continue;
+                }
+            };
+
+            if !wait_for_activation(10) {
+                log_warn!("{} did not activate -- skipping", scx_name);
+                stop_scheduler(&mut scx_proc);
+                if !wait_for_deactivation(5) {
+                    log_warn!("sched_ext stuck after failed {}", scx_name);
+                }
+                continue;
+            }
+            std::thread::sleep(Duration::from_secs(5));
+
+            if !is_scx_active() {
+                log_warn!("{} crashed during settlement -- skipping", scx_name);
+                drop(scx_proc);
+                continue;
+            }
+
+            log_info!(
+                "Phase: {} ({}s)  Stressing: {} CPUs {:?}",
+                scx_name, DURATION_SECS, stress_cpus.len(), stress_cpus
+            );
+
+            let result = run_scale_phase(&probe_exe, &stress_cpus, DURATION_SECS);
+            let alive = is_scx_active();
+            if !alive {
+                log_warn!("{} crashed during measurement", scx_name);
+            }
+
+            drop(scx_proc);
+            if !wait_for_deactivation(5) {
+                log_warn!("sched_ext stuck after {} -- continuing anyway", scx_name);
+            }
+            unsafe { libc::sync(); }
+            std::thread::sleep(Duration::from_secs(2));
+
+            match result {
+                Ok((samples, med, p99, worst)) => {
+                    log_info!(
+                        "  Samples: {}  Median: {:.0}us  P99: {:.0}us  Worst: {:.0}us{}",
+                        samples, med, p99, worst,
+                        if alive { "" } else { "  [TAINTED]" }
+                    );
+                    ext_results.push(ExternalResult {
+                        name: scx_name.clone(),
+                        samples,
+                        median: med,
+                        p99,
+                        worst,
+                    });
+                }
+                Err(e) => {
+                    log_error!("{} phase failed: {}", scx_name, e);
+                }
+            }
+        }
+
+        // --- EEVDF BASELINE (LAST -- CLEANUP SLOP DOESN'T MATTER) ---
         log_info!(
             "Phase 3: EEVDF ({}s)  Stressing: {} CPUs {:?}",
             DURATION_SECS, stress_cpus.len(), stress_cpus
@@ -667,7 +812,6 @@ fn scaling_benchmark() {
 
         results.push(ScaleResult {
             cores: n,
-            workers: worker_count,
             eevdf_samples: e_samples,
             eevdf_median: e_med,
             eevdf_p99: e_p99,
@@ -682,96 +826,99 @@ fn scaling_benchmark() {
             full_p99: f_p99,
             full_worst: f_worst,
             full_sched_output: full_output,
+            externals: ext_results,
         });
     }
 
     assert!(!results.is_empty(), "NO SCALE POINTS COMPLETED");
 
+    // COLLECT EXTERNAL SCHEDULER NAMES (USE FIRST RESULT AS CANONICAL LIST)
+    let scx_names: Vec<String> = if !results.is_empty() {
+        results[0].externals.iter().map(|e| e.name.clone()).collect()
+    } else {
+        Vec::new()
+    };
+
     // REPORT
-    let sep = "=".repeat(60);
     let mut report = Vec::new();
-    report.push(sep.clone());
-    report.push("PANDEMONIUM SCALING BENCHMARK (A/B/C)".to_string());
-    report.push(sep.clone());
+    report.push("PANDEMONIUM SCALING BENCHMARK".to_string());
     report.push(format!(
-        "WORKLOAD: N STRESS WORKERS + INTERACTIVE PROBE ({}s PER PHASE, {} CPUs MAX)",
+        "WORKLOAD: STRESS WORKERS + INTERACTIVE PROBE ({}s PER PHASE, {} CPUs MAX)",
         DURATION_SECS, max_cpus
     ));
     report.push(String::new());
 
+    // PER CORE COUNT: COMBINED TABLE WITH ALL SCHEDULERS
     let table_header = format!(
-        "{:>5} {:>8} {:>8} {:>8} {:>8} {:>8}",
-        "CORES", "WORKERS", "SAMPLES", "MEDIAN", "P99", "WORST"
+        "{:<24} {:>8} {:>9} {:>9} {:>9}",
+        "SCHEDULER", "SAMPLES", "MEDIAN", "P99", "WORST"
     );
-    let table_sep = format!(
-        "{} {} {} {} {} {}",
-        "-".repeat(5), "-".repeat(8), "-".repeat(8),
-        "-".repeat(8), "-".repeat(8), "-".repeat(8),
-    );
-    let delta_header = format!(
+    for r in &results {
+        report.push(format!(
+            "[LATENCY: {} CORE{}]",
+            r.cores, if r.cores == 1 { "" } else { "S" }
+        ));
+        report.push(table_header.clone());
+        report.push(format!(
+            "{:<24} {:>8} {:>8.0}us {:>8.0}us {:>8.0}us",
+            "EEVDF", r.eevdf_samples, r.eevdf_median, r.eevdf_p99, r.eevdf_worst,
+        ));
+        report.push(format!(
+            "{:<24} {:>8} {:>8.0}us {:>8.0}us {:>8.0}us",
+            "PANDEMONIUM (BPF)", r.bpf_samples, r.bpf_median, r.bpf_p99, r.bpf_worst,
+        ));
+        report.push(format!(
+            "{:<24} {:>8} {:>8.0}us {:>8.0}us {:>8.0}us",
+            "PANDEMONIUM (FULL)", r.full_samples, r.full_median, r.full_p99, r.full_worst,
+        ));
+        for ext in &r.externals {
+            report.push(format!(
+                "{:<24} {:>8} {:>8.0}us {:>8.0}us {:>8.0}us",
+                ext.name, ext.samples, ext.median, ext.p99, ext.worst,
+            ));
+        }
+        report.push(String::new());
+    }
+
+    // SUMMARY: MEDIAN VS EEVDF ACROSS CORE COUNTS
+    report.push("[SUMMARY: MEDIAN vs EEVDF (NEGATIVE = FASTER)]".to_string());
+    let mut header = format!("{:<24}", "SCHEDULER");
+    for r in &results {
+        header.push_str(&format!(" {:>8}", format!("{}C", r.cores)));
+    }
+    report.push(header);
+
+    let mut row = format!("{:<24}", "PANDEMONIUM (BPF)");
+    for r in &results {
+        row.push_str(&format!(" {:>+7.0}us", r.bpf_median - r.eevdf_median));
+    }
+    report.push(row);
+
+    let mut row = format!("{:<24}", "PANDEMONIUM (FULL)");
+    for r in &results {
+        row.push_str(&format!(" {:>+7.0}us", r.full_median - r.eevdf_median));
+    }
+    report.push(row);
+
+    for name in &scx_names {
+        let mut row = format!("{:<24}", name);
+        for r in &results {
+            if let Some(ext) = r.externals.iter().find(|e| &e.name == name) {
+                row.push_str(&format!(" {:>+7.0}us", ext.median - r.eevdf_median));
+            } else {
+                row.push_str(&format!(" {:>8}", "N/A"));
+            }
+        }
+        report.push(row);
+    }
+    report.push(String::new());
+
+    // DELTA: ADAPTIVE GAIN (FULL VS BPF-ONLY)
+    report.push("[DELTA: ADAPTIVE GAIN (FULL vs BPF-ONLY, NEGATIVE = ADAPTIVE HELPS)]".to_string());
+    report.push(format!(
         "{:>5} {:>10} {:>10} {:>10}",
         "CORES", "MEDIAN", "P99", "WORST"
-    );
-    let delta_sep = format!(
-        "{} {} {} {}",
-        "-".repeat(5), "-".repeat(10), "-".repeat(10), "-".repeat(10),
-    );
-
-    // EEVDF TABLE
-    report.push("EEVDF (DEFAULT SCHEDULER)".to_string());
-    report.push(table_header.clone());
-    report.push(table_sep.clone());
-    for r in &results {
-        report.push(format!(
-            "{:>5} {:>8} {:>8} {:>7.0}us {:>7.0}us {:>7.0}us",
-            r.cores, r.workers, r.eevdf_samples, r.eevdf_median, r.eevdf_p99, r.eevdf_worst,
-        ));
-    }
-    report.push(String::new());
-
-    // PANDEMONIUM BPF-ONLY TABLE
-    report.push("PANDEMONIUM (BPF ONLY)".to_string());
-    report.push(table_header.clone());
-    report.push(table_sep.clone());
-    for r in &results {
-        report.push(format!(
-            "{:>5} {:>8} {:>8} {:>7.0}us {:>7.0}us {:>7.0}us",
-            r.cores, r.workers, r.bpf_samples, r.bpf_median, r.bpf_p99, r.bpf_worst,
-        ));
-    }
-    report.push(String::new());
-
-    // PANDEMONIUM FULL TABLE
-    report.push("PANDEMONIUM (BPF + ADAPTIVE)".to_string());
-    report.push(table_header.clone());
-    report.push(table_sep.clone());
-    for r in &results {
-        report.push(format!(
-            "{:>5} {:>8} {:>8} {:>7.0}us {:>7.0}us {:>7.0}us",
-            r.cores, r.workers, r.full_samples, r.full_median, r.full_p99, r.full_worst,
-        ));
-    }
-    report.push(String::new());
-
-    // DELTA: BPF-ONLY VS EEVDF
-    report.push("DELTA: BPF vs EEVDF (NEGATIVE = PANDEMONIUM IS BETTER)".to_string());
-    report.push(delta_header.clone());
-    report.push(delta_sep.clone());
-    for r in &results {
-        report.push(format!(
-            "{:>5} {:>+9.0}us {:>+9.0}us {:>+9.0}us",
-            r.cores,
-            r.bpf_median - r.eevdf_median,
-            r.bpf_p99 - r.eevdf_p99,
-            r.bpf_worst - r.eevdf_worst,
-        ));
-    }
-    report.push(String::new());
-
-    // DELTA: FULL VS BPF-ONLY (ADAPTIVE GAIN)
-    report.push("DELTA: ADAPTIVE GAIN (FULL vs BPF-ONLY, NEGATIVE = ADAPTIVE HELPS)".to_string());
-    report.push(delta_header.clone());
-    report.push(delta_sep.clone());
+    ));
     for r in &results {
         report.push(format!(
             "{:>5} {:>+9.0}us {:>+9.0}us {:>+9.0}us",
@@ -781,11 +928,12 @@ fn scaling_benchmark() {
             r.full_worst - r.bpf_worst,
         ));
     }
-    // SCHEDULER TELEMETRY PER PHASE
-    report.push("SCHEDULER TELEMETRY (MONITOR OUTPUT)".to_string());
-    report.push("-".repeat(60).to_string());
+    report.push(String::new());
+
+    // SCHEDULER TELEMETRY
+    report.push("[SCHEDULER TELEMETRY]".to_string());
     for r in &results {
-        report.push(format!("--- {} CORE{}: BPF-ONLY ---",
+        report.push(format!("{} CORE{}: BPF-ONLY",
             r.cores, if r.cores == 1 { "" } else { "S" }));
         for line in r.bpf_sched_output.lines() {
             let line = line.trim();
@@ -793,7 +941,7 @@ fn scaling_benchmark() {
                 report.push(format!("  {}", line));
             }
         }
-        report.push(format!("--- {} CORE{}: BPF+ADAPTIVE ---",
+        report.push(format!("{} CORE{}: BPF+ADAPTIVE",
             r.cores, if r.cores == 1 { "" } else { "S" }));
         for line in r.full_sched_output.lines() {
             let line = line.trim();
@@ -803,11 +951,10 @@ fn scaling_benchmark() {
         }
         report.push(String::new());
     }
-    report.push(sep.clone());
 
     let report_text = report.join("\n") + "\n";
 
-    // PRINT REPORT TO TERMINAL WITH TIMESTAMPS
+    // PRINT TO TERMINAL
     println!();
     log_info!("BENCHMARK RESULTS");
     for line in &report {

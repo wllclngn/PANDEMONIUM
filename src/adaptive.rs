@@ -1,4 +1,4 @@
-// PANDEMONIUM v1.0 ADAPTIVE CONTROL LOOP
+// PANDEMONIUM v0.9.9 ADAPTIVE CONTROL LOOP
 // EVENT-DRIVEN CLOSED-LOOP TUNING SYSTEM
 //
 // TWO THREADS, ZERO MUTEXES:
@@ -17,41 +17,67 @@ use std::time::Duration;
 use anyhow::Result;
 use libbpf_rs::MapCore;
 
+use crate::procdb::ProcessDb;
 use crate::scheduler::{PandemoniumStats, Scheduler, TuningKnobs};
 
-// --- REGIME THRESHOLDS ---
+// --- REGIME THRESHOLDS (SCHMITT TRIGGER) ---
+// DIRECTIONAL HYSTERESIS PREVENTS OSCILLATION AT REGIME BOUNDARIES.
+// WIDE DEAD ZONES: MUST CLEARLY ENTER A REGIME AND CLEARLY LEAVE IT.
+// ENTER/EXIT SEPARATION ELIMINATES THE POSITIVE FEEDBACK LOOP THAT
+// CAUSED HEAVY<->MIXED THRASHING AT 12+ CORES.
 
-const LIGHT_IDLE_PCT: u64 = 40;
-const HEAVY_IDLE_PCT: u64 = 15;
+const HEAVY_ENTER_PCT: u64 = 10;   // ENTER HEAVY: IDLE < 10%
+const HEAVY_EXIT_PCT: u64  = 25;   // LEAVE HEAVY: IDLE > 25%
+const LIGHT_ENTER_PCT: u64 = 50;   // ENTER LIGHT: IDLE > 50%
+const LIGHT_EXIT_PCT: u64  = 30;   // LEAVE LIGHT: IDLE < 30%
 
 // --- REGIME PROFILES ---
+// BPF TIMER ALWAYS ON AT 1MS. SCANS FOR BATCH TASKS BLOCKING INTERACTIVE.
+// PREEMPT_THRESH CONTROLS WHEN TIMER PREEMPTS (ONLY IF TASKS WAITING IN DSQ).
+// BATCH_SLICE_NS CONTROLS MAX UNINTERRUPTED BATCH RUN WHEN NO INTERACTIVE WAITING.
+// RESULT: INTERACTIVE LATENCY CAPPED AT ~1MS (TIMER PERIOD) REGARDLESS OF BATCH SLICE.
 
-const LIGHT_SLICE_NS: u64     = 500_000;
-const LIGHT_PREEMPT_NS: u64   = 1_000_000;
+const LIGHT_SLICE_NS: u64     = 2_000_000;   // 2MS: TIMER PREEMPTS BATCH AFTER 2MS IF INTERACTIVE WAITING
+const LIGHT_PREEMPT_NS: u64   = 1_000_000;   // 1MS: AGGRESSIVE -- IDLE CPUs AVAILABLE, LOW OVERHEAD
 const LIGHT_LAG_SCALE: u64    = 6;
-const LIGHT_P99_CEIL_NS: u64  = 250_000;
+const LIGHT_P99_CEIL_NS: u64  = 3_000_000;   // 3MS: TIGHT BUT REALISTIC FOR LIGHT LOAD
+const LIGHT_BATCH_NS: u64     = 20_000_000;  // 20MS: NO CONTENTION, LET BATCH RIP
+const LIGHT_TIMER_NS: u64     = 2_000_000;   // 2MS: IDLE CPUs HANDLE DISPATCH, TIMER IS SAFETY NET
 
-const MIXED_SLICE_NS: u64     = 1_000_000;
-const MIXED_PREEMPT_NS: u64   = 1_000_000;
+const MIXED_SLICE_NS: u64     = 1_000_000;   // 1MS: TIGHT INTERACTIVE CONTROL UNDER CONTENTION
+const MIXED_PREEMPT_NS: u64   = 1_000_000;   // 1MS: MATCH TIMER FOR CLEAN ENFORCEMENT
 const MIXED_LAG_SCALE: u64    = 4;
-const MIXED_P99_CEIL_NS: u64  = 1_000_000;
+const MIXED_P99_CEIL_NS: u64  = 5_000_000;   // 5MS: BELOW 16MS FRAME BUDGET
+const MIXED_BATCH_NS: u64     = 16_000_000;  // 16MS: WIDER -- BPF KICK HANDLES INTERACTIVE LATENCY DIRECTLY
+const MIXED_TIMER_NS: u64     = 1_000_000;   // 1MS: MIXED NEEDS FAST RESPONSE
 
-const HEAVY_SLICE_NS: u64     = 1_000_000;
-const HEAVY_PREEMPT_NS: u64   = 1_000_000;
+const HEAVY_SLICE_NS: u64     = 4_000_000;   // 4MS: WIDER UNDER SATURATION FOR THROUGHPUT
+const HEAVY_PREEMPT_NS: u64   = 2_000_000;   // 2MS: SLIGHTLY RELAXED -- EVERYTHING IS CONTENDING
 const HEAVY_LAG_SCALE: u64    = 2;
-const HEAVY_P99_CEIL_NS: u64  = 2_000_000;
+const HEAVY_P99_CEIL_NS: u64  = 10_000_000;  // 10MS: HEAVY LOAD, REALISTIC CEILING
+const HEAVY_BATCH_NS: u64     = 20_000_000;  // 20MS: BPF KICK + TIMER OWN LATENCY, LET BATCH RIP
+const HEAVY_TIMER_NS: u64     = 2_000_000;   // 2MS: HALVES TIMER OVERHEAD UNDER SATURATION
 
 // --- REFLEX PARAMETERS ---
 
 const SAMPLES_PER_CHECK: u64 = 64;
 const COOLDOWN_CHECKS: u32   = 2;
-const MIN_SLICE_NS: u64      = 500_000;
+const MIN_SLICE_NS: u64      = 500_000;   // 500US FLOOR -- ALLOWS 5 TIGHTEN STEPS FROM 2MS BASELINE
 
-// GRADUATED RELAX (ONLY CHANGE FROM WORKING VERSION)
-const RELAX_STEP_NS: u64    = 100_000;  // RELAX BY 100US PER TICK
-const RELAX_HOLD_TICKS: u32 = 3;       // WAIT 3S OF GOOD P99 BEFORE STEPPING
+// GRADUATED RELAX: STEP TOWARD BASELINE AFTER P99 NORMALIZES
+const RELAX_STEP_NS: u64    = 500_000;   // RELAX BY 500US PER TICK
+const RELAX_HOLD_TICKS: u32 = 2;         // WAIT 2S OF GOOD P99 BEFORE STEPPING
 
 // --- LOCK-FREE LATENCY HISTOGRAM ---
+
+// SLEEP PATTERN BUCKETS: CLASSIFY IO-WAIT VS IDLE WORKLOADS
+const SLEEP_BUCKETS: usize = 4;
+const SLEEP_EDGES_NS: [u64; SLEEP_BUCKETS] = [
+    1_000_000,      // 1ms: IO-WAIT (FAST DISK/NETWORK/PIPE)
+    10_000_000,     // 10ms: SHORT IO (TYPICAL DISK READ)
+    100_000_000,    // 100ms: MODERATE (NETWORK, USER INPUT)
+    u64::MAX,       // +INF: IDLE (LONG SLEEP, TIMER, POLLING)
+];
 
 const HIST_BUCKETS: usize = 12;
 const HIST_EDGES_NS: [u64; HIST_BUCKETS] = [
@@ -73,10 +99,12 @@ const HIST_EDGES_NS: [u64; HIST_BUCKETS] = [
 
 #[repr(C)]
 struct WakeLatSample {
-    lat_ns: u64,
-    pid:    u32,
-    path:   u8,     // 0=IDLE, 1=HARD_KICK, 2=SOFT_KICK
-    _pad:   [u8; 3],
+    lat_ns:   u64,
+    sleep_ns: u64,    // HOW LONG TASK SLEPT BEFORE THIS WAKEUP
+    pid:      u32,
+    path:     u8,     // 0=IDLE, 1=HARD_KICK, 2=SOFT_KICK
+    tier:     u8,     // TASK TIER AT WAKEUP TIME
+    _pad:     [u8; 2],
 }
 
 #[repr(u8)]
@@ -119,16 +147,22 @@ fn regime_knobs(r: Regime) -> TuningKnobs {
             slice_ns: LIGHT_SLICE_NS,
             preempt_thresh_ns: LIGHT_PREEMPT_NS,
             lag_scale: LIGHT_LAG_SCALE,
+            batch_slice_ns: LIGHT_BATCH_NS,
+            timer_interval_ns: LIGHT_TIMER_NS,
         },
         Regime::Mixed => TuningKnobs {
             slice_ns: MIXED_SLICE_NS,
             preempt_thresh_ns: MIXED_PREEMPT_NS,
             lag_scale: MIXED_LAG_SCALE,
+            batch_slice_ns: MIXED_BATCH_NS,
+            timer_interval_ns: MIXED_TIMER_NS,
         },
         Regime::Heavy => TuningKnobs {
             slice_ns: HEAVY_SLICE_NS,
             preempt_thresh_ns: HEAVY_PREEMPT_NS,
             lag_scale: HEAVY_LAG_SCALE,
+            batch_slice_ns: HEAVY_BATCH_NS,
+            timer_interval_ns: HEAVY_TIMER_NS,
         },
     }
 }
@@ -142,6 +176,9 @@ pub struct SharedState {
     regime: AtomicU8,
     sample_count: AtomicU64,
     histogram: [AtomicU64; HIST_BUCKETS],
+    sleep_histogram: [AtomicU64; SLEEP_BUCKETS],
+    sleep_count: AtomicU64,
+    pub reflex_events: AtomicU64,
 }
 
 impl SharedState {
@@ -151,6 +188,9 @@ impl SharedState {
             regime: AtomicU8::new(Regime::Mixed as u8),
             sample_count: AtomicU64::new(0),
             histogram: [ATOMIC_ZERO; HIST_BUCKETS],
+            sleep_histogram: [ATOMIC_ZERO; SLEEP_BUCKETS],
+            sleep_count: AtomicU64::new(0),
+            reflex_events: AtomicU64::new(0),
         }
     }
 
@@ -195,6 +235,34 @@ impl SharedState {
         p99
     }
 
+    fn record_sleep(&self, sleep_ns: u64) {
+        let bucket = SLEEP_EDGES_NS.iter()
+            .position(|&edge| sleep_ns <= edge)
+            .unwrap_or(SLEEP_BUCKETS - 1);
+        self.sleep_histogram[bucket].fetch_add(1, Ordering::Relaxed);
+        self.sleep_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // DRAIN SLEEP HISTOGRAM. RETURNS (IO_WAIT_PCT, IDLE_PCT).
+    // IO_WAIT = SLEEPS < 10MS, IDLE = SLEEPS > 100MS.
+    fn compute_and_reset_sleep(&self) -> (u64, u64) {
+        let mut counts = [0u64; SLEEP_BUCKETS];
+        let mut total = 0u64;
+        for i in 0..SLEEP_BUCKETS {
+            counts[i] = self.sleep_histogram[i].swap(0, Ordering::Relaxed);
+            total += counts[i];
+        }
+        self.sleep_count.store(0, Ordering::Relaxed);
+
+        if total == 0 {
+            return (0, 0);
+        }
+
+        let io_count = counts[0] + counts[1]; // <10MS
+        let idle_count = counts[3]; // >100MS
+        (io_count * 100 / total, idle_count * 100 / total)
+    }
+
     fn current_regime(&self) -> Regime {
         Regime::from_u8(self.regime.load(Ordering::Relaxed))
     }
@@ -219,6 +287,9 @@ pub fn build_ring_buffer(
                 std::ptr::read_unaligned(data.as_ptr() as *const WakeLatSample)
             };
             shared.record_sample(sample.lat_ns);
+            if sample.sleep_ns > 0 {
+                shared.record_sleep(sample.sleep_ns);
+            }
         }
         0
     })
@@ -255,13 +326,21 @@ pub fn reflex_thread(
             continue;
         }
 
-        let ceiling = shared.current_regime().p99_ceiling();
+        let current_regime = shared.current_regime();
+        let ceiling = current_regime.p99_ceiling();
         if p99 > ceiling {
             spike_count += 1;
             // REQUIRE 2 CONSECUTIVE ABOVE-CEILING CHECKS BEFORE TIGHTENING.
             // FILTERS TRANSIENT NOISE THAT CAUSES FALSE TRIGGERS AT LOW CORE COUNTS.
             if spike_count >= 2 {
-                tighten_knobs(&knobs_handle);
+                // ONLY TIGHTEN IN MIXED. LIGHT HAS NO CONTENTION
+                // (POINTLESS). HEAVY IS FULLY SATURATED (MORE PREEMPTION
+                // JUST ADDS OVERHEAD). MIXED IS THE ONLY REGIME WHERE
+                // SHORTER SLICES COULD PLAUSIBLY HELP INTERACTIVE TASKS.
+                if current_regime == Regime::Mixed {
+                    tighten_knobs(&knobs_handle);
+                    shared.reflex_events.fetch_add(1, Ordering::Relaxed);
+                }
                 cooldown = COOLDOWN_CHECKS;
                 spike_count = 0;
             }
@@ -281,10 +360,14 @@ fn tighten_knobs(handle: &libbpf_rs::MapHandle) {
     };
 
     let new_slice = (current.slice_ns * 3 / 4).max(MIN_SLICE_NS);
+    // ONLY TIGHTEN SLICE + PREEMPT. BATCH_SLICE_NS STAYS WIDE FOR THROUGHPUT.
+    // THE BPF TIMER HANDLES INTERACTIVE PREEMPTION VIA preempt_thresh_ns.
     let knobs = TuningKnobs {
         slice_ns: new_slice,
-        preempt_thresh_ns: (new_slice * 2).min(1_000_000),
+        preempt_thresh_ns: new_slice,
         lag_scale: current.lag_scale,
+        batch_slice_ns: current.batch_slice_ns,
+        timer_interval_ns: current.timer_interval_ns,
     };
 
     let value = unsafe {
@@ -312,6 +395,17 @@ pub fn monitor_loop(
     let mut tightened = false;
     let mut pending_regime = regime;
     let mut regime_hold: u32 = 0;
+    let mut light_ticks: u64 = 0;
+    let mut mixed_ticks: u64 = 0;
+    let mut heavy_ticks: u64 = 0;
+
+    let mut procdb = match ProcessDb::new() {
+        Ok(db) => Some(db),
+        Err(e) => {
+            log_warn!("PROCDB INIT FAILED: {}", e);
+            None
+        }
+    };
 
     // APPLY INITIAL REGIME
     shared.set_regime(regime);
@@ -348,6 +442,9 @@ pub fn monitor_loop(
         let lat_idle_us = if d_idle_cnt > 0 { d_idle_sum / d_idle_cnt / 1000 } else { 0 };
         let lat_kick_us = if d_kick_cnt > 0 { d_kick_sum / d_kick_cnt / 1000 } else { 0 };
         let delta_guard = stats.nr_guard_clamps.wrapping_sub(prev.nr_guard_clamps);
+        let delta_affin = stats.nr_affinity_hits.wrapping_sub(prev.nr_affinity_hits);
+        // DIAGNOSTIC: delta_zero commented out -- ~0.03% rate, not throughput issue
+        // let delta_zero = stats.nr_zero_slice.wrapping_sub(prev.nr_zero_slice);
 
         let idle_pct = if delta_d > 0 {
             delta_idle * 100 / delta_d
@@ -355,13 +452,33 @@ pub fn monitor_loop(
             0
         };
 
-        // DETECT REGIME (WITH HYSTERESIS: 2 CONSECUTIVE TICKS TO CONFIRM SWITCH)
-        let detected = if idle_pct > LIGHT_IDLE_PCT {
-            Regime::Light
-        } else if idle_pct < HEAVY_IDLE_PCT {
-            Regime::Heavy
-        } else {
-            Regime::Mixed
+        // DETECT REGIME (SCHMITT TRIGGER + 2-TICK HOLD)
+        // DIRECTION-AWARE: CURRENT REGIME DETERMINES WHICH THRESHOLDS APPLY.
+        // DEAD ZONES PREVENT THE OSCILLATION THAT SINGLE-BOUNDARY DETECTION CAUSED.
+        let detected = match regime {
+            Regime::Light => {
+                if idle_pct < LIGHT_EXIT_PCT {
+                    Regime::Mixed
+                } else {
+                    Regime::Light
+                }
+            }
+            Regime::Mixed => {
+                if idle_pct > LIGHT_ENTER_PCT {
+                    Regime::Light
+                } else if idle_pct < HEAVY_ENTER_PCT {
+                    Regime::Heavy
+                } else {
+                    Regime::Mixed
+                }
+            }
+            Regime::Heavy => {
+                if idle_pct > HEAVY_EXIT_PCT {
+                    Regime::Mixed
+                } else {
+                    Regime::Heavy
+                }
+            }
         };
 
         let p99_ns = shared.p99_ns.load(Ordering::Relaxed);
@@ -386,9 +503,7 @@ pub fn monitor_loop(
         }
 
         if tightened {
-            // GRADUATED RELAX: STEP TOWARD BASELINE BY RELAX_STEP_NS
-            // (THIS IS THE ONLY CHANGE FROM THE WORKING VERSION --
-            //  PREVIOUSLY THIS WAS A FULL SNAP-TO-BASELINE)
+            // GRADUATED RELAX: STEP SLICE TOWARD BASELINE (BATCH UNTOUCHED)
             let ceiling = regime.p99_ceiling();
             let baseline = regime_knobs(regime);
             if p99_ns <= ceiling {
@@ -400,8 +515,11 @@ pub fn monitor_loop(
                             .min(baseline.slice_ns);
                         let knobs = TuningKnobs {
                             slice_ns: new_slice,
-                            preempt_thresh_ns: (new_slice * 2).min(1_000_000),
+                            preempt_thresh_ns: baseline.preempt_thresh_ns
+                                .min(new_slice),
                             lag_scale: baseline.lag_scale,
+                            batch_slice_ns: baseline.batch_slice_ns,
+                            timer_interval_ns: baseline.timer_interval_ns,
                         };
                         sched.write_tuning_knobs(&knobs)?;
                         if new_slice >= baseline.slice_ns {
@@ -427,15 +545,29 @@ pub fn monitor_loop(
             }
         }
 
+        // PROCESS CLASSIFICATION DATABASE: INGEST, PREDICT, EVICT
+        let (db_total, db_confident) = if let Some(ref mut db) = procdb {
+            db.ingest();
+            db.flush_predictions();
+            db.tick();
+            db.summary()
+        } else {
+            (0, 0)
+        };
+
+        // SLEEP PATTERN ANALYSIS: IO-WAIT VS IDLE CLASSIFICATION
+        let (io_pct, _idle_sleep_pct) = shared.compute_and_reset_sleep();
+
         let p99_us = p99_ns / 1000;
         let knobs = sched.read_tuning_knobs();
 
         println!(
-            "d/s: {:<8} idle: {}% shared: {:<6} preempt: {:<4} keep: {:<4} kick: H={:<4} S={:<4} enq: W={:<4} R={:<4} wake: {}us p99: {}us lat_idle: {}us lat_kick: {}us slice: {}us guard: {} [{}]",
+            "d/s: {:<8} idle: {}% shared: {:<6} preempt: {:<4} keep: {:<4} kick: H={:<4} S={:<4} enq: W={:<4} R={:<4} wake: {}us p99: {}us lat_idle: {}us lat_kick: {}us affin: {} procdb: {}/{} sleep: io={}% slice: {}us guard: {} [{}]",
             delta_d, idle_pct, delta_shared, delta_preempt, delta_keep,
             delta_hard, delta_soft, delta_enq_wake, delta_enq_requeue,
             wake_avg_us, p99_us, lat_idle_us, lat_kick_us,
-            knobs.slice_ns / 1000, delta_guard, regime.label(),
+            delta_affin, db_total, db_confident,
+            io_pct, knobs.slice_ns / 1000, delta_guard, regime.label(),
         );
 
         sched.log.snapshot(
@@ -444,8 +576,25 @@ pub fn monitor_loop(
             delta_hard, delta_soft, lat_idle_us, lat_kick_us,
         );
 
+        match regime {
+            Regime::Light => light_ticks += 1,
+            Regime::Mixed => mixed_ticks += 1,
+            Regime::Heavy => heavy_ticks += 1,
+        }
+
         prev = stats;
     }
+
+    // KNOBS SUMMARY: CAPTURED BY TEST HARNESS FOR ARCHIVE
+    let final_knobs = sched.read_tuning_knobs();
+    let reflex_count = shared.reflex_events.load(Ordering::Relaxed);
+    println!(
+        "[KNOBS] regime={} slice_ns={} batch_ns={} preempt_ns={} timer_ns={} lag={} tightened={} reflex={} ticks=L:{}/M:{}/H:{}",
+        regime.label(), final_knobs.slice_ns, final_knobs.batch_slice_ns,
+        final_knobs.preempt_thresh_ns, final_knobs.timer_interval_ns,
+        final_knobs.lag_scale, tightened, reflex_count,
+        light_ticks, mixed_ticks, heavy_ticks,
+    );
 
     // READ UEI EXIT REASON
     let should_restart = sched.read_exit_info();

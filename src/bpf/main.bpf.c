@@ -1,11 +1,11 @@
-// PANDEMONIUM v1.0 -- SCHED_EXT KERNEL SCHEDULER
+// PANDEMONIUM v0.9.9 -- SCHED_EXT KERNEL SCHEDULER
 // ADAPTIVE DESKTOP SCHEDULING FOR LINUX
 //
 // BPF: BEHAVIORAL CLASSIFICATION + MULTI-TIER DISPATCH
 // RUST: ADAPTIVE CONTROL LOOP + REAL-TIME TELEMETRY
 //
 // ARCHITECTURE:
-//   SELECT_CPU IDLE FAST PATH -> SCX_DSQ_LOCAL (ZERO CONTENTION)
+//   SELECT_CPU IDLE FAST PATH -> PER-CPU DSQ (ZERO CONTENTION)
 //   ENQUEUE IDLE FOUND -> PER-CPU DSQ DIRECT PLACEMENT (ZERO CONTENTION)
 //   ENQUEUE INTERACTIVE PREEMPT -> PER-CPU DSQ + HARD KICK
 //   ENQUEUE FALLBACK -> PER-NODE OVERFLOW DSQ (VTIME-ORDERED)
@@ -52,6 +52,12 @@ const volatile bool ringbuf_active = false;
 
 #define SLICE_MIN_NS 100000     // 100US FLOOR
 
+// CPU-BOUND DEMOTION: TASKS RUNNING >= THIS ARE CPU-BOUND, NOT INTERACTIVE.
+// MATCHES v0.9.5 EFFECTIVE THRESHOLD (5MS DEFAULT SLICE / 2 = 2.5MS).
+// WITHOUT THIS, CPU-BOUND TASKS NEVER HIT runnable() AND STAY TIER_INTERACTIVE
+// FOREVER, CAUSING DISPATCH STORMS VIA TIER 2 PREEMPT KICKS.
+#define CPU_BOUND_THRESH_NS 2500000  // 2.5MS
+
 // --- GLOBALS ---
 
 static u32 nr_nodes;
@@ -88,12 +94,31 @@ struct {
 	__type(value, struct pandemonium_stats);
 } stats_map SEC(".maps");
 
+// CACHE DOMAIN MAP: l2_domain[cpu] = group_id
+// POPULATED BY RUST AT STARTUP FROM SYSFS TOPOLOGY
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(max_entries, 1);
+	__uint(max_entries, MAX_CPUS);
 	__type(key, u32);
-	__type(value, u64);
-} idle_bitmap SEC(".maps");
+	__type(value, u32);
+} cache_domain SEC(".maps");
+
+// PROCESS CLASSIFICATION DATABASE: BPF OBSERVES, RUST LEARNS, BPF APPLIES
+// OBSERVE: BPF WRITES MATURE TASK CLASSIFICATION, RUST DRAINS EVERY SECOND
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 512);
+	__type(key, char[16]);
+	__type(value, struct task_class_entry);
+} task_class_observe SEC(".maps");
+
+// INIT: RUST WRITES PREDICTIONS, BPF READS IN enable() FOR NEW TASKS
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 512);
+	__type(key, char[16]);
+	__type(value, struct task_class_entry);
+} task_class_init SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -119,12 +144,15 @@ struct task_ctx {
 	u64 wakeup_freq;
 	u64 last_woke_at;
 	u64 avg_runtime;
+	u64 runtime_dev;     // EWMA OF |RUNTIME - AVG_RUNTIME| (VARIANCE SIGNAL)
 	u64 cached_weight;
 	u64 prev_nvcsw;
 	u64 csw_rate;
 	u64 lat_cri;
+	u64 sleep_start_ns;  // SET IN quiescent(), USED IN running()
 	u32 tier;
 	u32 ewma_age;
+	s32 last_cpu;        // LAST CPU THIS TASK RAN ON (FOR CACHE AFFINITY)
 	u8  dispatch_path;   // 0=IDLE, 1=HARD_KICK, 2=SOFT_KICK
 	u8  _pad[3];
 };
@@ -184,9 +212,11 @@ static __always_inline u64 update_freq(u64 freq, u64 interval_ns, u32 age)
 
 // LAT_CRI SCORE: HIGH WAKEUP FREQ + HIGH CSW RATE + SHORT RUNTIME = CRITICAL
 static __always_inline u64 compute_lat_cri(u64 wakeup_freq, u64 csw_rate,
-					    u64 avg_runtime_ns)
+					    u64 avg_runtime_ns,
+					    u64 runtime_dev_ns)
 {
-	u64 avg_runtime_ms = avg_runtime_ns >> 20;
+	u64 effective_runtime_ns = avg_runtime_ns + (runtime_dev_ns >> 1);
+	u64 avg_runtime_ms = effective_runtime_ns >> 20;
 	if (avg_runtime_ms == 0)
 		avg_runtime_ms = 1;
 	u64 score = (wakeup_freq * csw_rate) / avg_runtime_ms;
@@ -340,21 +370,30 @@ static __always_inline u64 task_slice(const struct task_ctx *tctx,
 		return base;
 	}
 
-	// BATCH: FULL KNOB SLICE, CLAMPED DURING INTERACTIVE GUARD WINDOW
-	if (base_slice < SLICE_MIN_NS)
-		base_slice = SLICE_MIN_NS;
+	// BATCH: DEDICATED CEILING FROM RUST ADAPTIVE LAYER.
+	// WEIGHT-SCALED: HIGHER BEHAVIORAL WEIGHT = LONGER SLICE.
+	// GUARD WINDOW: CLAMP DURING INTERACTIVE CONTENTION.
+	u64 batch_ceil = knobs ? knobs->batch_slice_ns : 20000000;
+	if (batch_ceil < SLICE_MIN_NS)
+		batch_ceil = SLICE_MIN_NS;
+
+	base = batch_ceil * tctx->cached_weight >> 7;
+	if (base > batch_ceil)
+		base = batch_ceil;
+	if (base < SLICE_MIN_NS)
+		base = SLICE_MIN_NS;
 
 	if (bpf_ktime_get_ns() < guard_until_ns) {
 		u64 guard_slice = SLICE_MIN_NS << 1; // 200US
-		if (base_slice > guard_slice) {
-			base_slice = guard_slice;
+		if (base > guard_slice) {
+			base = guard_slice;
 			struct pandemonium_stats *s = get_stats();
 			if (s)
 				__sync_fetch_and_add(&s->nr_guard_clamps, 1);
 		}
 	}
 
-	return base_slice;
+	return base;
 }
 
 // --- BPF TIMER: PREEMPTION ENFORCEMENT ---
@@ -364,9 +403,14 @@ static __always_inline u64 task_slice(const struct task_ctx *tctx,
 static int preempt_timerfn(void *map, int *key, struct bpf_timer *timer)
 {
 	struct tuning_knobs *knobs = get_knobs();
+	u64 timer_ns = knobs ? knobs->timer_interval_ns : 1000000;
 	u64 thresh = knobs ? knobs->preempt_thresh_ns : 1000000;
 	u64 now = bpf_ktime_get_ns();
 
+	// PREEMPTION SCAN: ALWAYS ON AT 1MS.
+	// CHECKS ALL DSQs: PER-CPU, NODE OVERFLOW, AND SCX_DSQ_LOCAL.
+	// SELECT_CPU DISPATCHES TO PER-CPU DSQ (NOT SCX_DSQ_LOCAL), SO
+	// TASKS ARE ALWAYS VISIBLE HERE AS A SAFETY NET.
 	bpf_rcu_read_lock();
 
 	int cpu = 0;
@@ -378,7 +422,6 @@ static int preempt_timerfn(void *map, int *key, struct bpf_timer *timer)
 		if (!p || p->flags & PF_IDLE)
 			continue;
 
-		// ONLY PREEMPT IF QUEUED WORK EXISTS
 		s32 node = __COMPAT_scx_bpf_cpu_node(cpu);
 		if (!scx_bpf_dsq_nr_queued(nr_cpu_ids + (u64)node) &&
 		    !scx_bpf_dsq_nr_queued((u64)cpu))
@@ -388,36 +431,24 @@ static int preempt_timerfn(void *map, int *key, struct bpf_timer *timer)
 		if (!tctx || !tctx->last_run_at)
 			continue;
 
-		u64 running = now > tctx->last_run_at ? now - tctx->last_run_at : 0;
+		u64 running = now > tctx->last_run_at ?
+			      now - tctx->last_run_at : 0;
 		if (running > thresh) {
 			p->scx.slice = 0;
 			scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
 			struct pandemonium_stats *s = get_stats();
 			if (s)
-				__sync_fetch_and_add(&s->nr_preempt, 1);
+				__sync_fetch_and_add(
+					&s->nr_preempt, 1);
 		}
 	}
 
 	bpf_rcu_read_unlock();
 
-	// IDLE BITMAP SNAPSHOT
-	u64 idle_mask = 0;
-	u32 idle_key = 0;
-	for (u32 n = 0; n < nr_nodes && n < MAX_NODES; n++) {
-		const struct cpumask *idle = __COMPAT_scx_bpf_get_idle_cpumask_node(n);
-		int i = 0;
-		bpf_for(i, 0, IDLE_BITMAP_CPUS) {
-			if (bpf_cpumask_test_cpu(i, idle))
-				idle_mask |= 1ULL << i;
-		}
-		scx_bpf_put_idle_cpumask(idle);
-	}
-	bpf_map_update_elem(&idle_bitmap, &idle_key, &idle_mask, 0);
-
-	// RESTART TIMER
-	u64 interval = knobs ? knobs->slice_ns : 1000000;
-	if (interval < 500000)
-		interval = 500000;
+	// RESTART TIMER: 1MS DEFAULT, NEVER SLOWER THAN 1MS
+	u64 interval = timer_ns > 0 ? timer_ns : 1000000;
+	if (interval < 1000000)
+		interval = 1000000;
 	bpf_timer_start(timer, interval, 0);
 
 	return 0;
@@ -426,6 +457,11 @@ static int preempt_timerfn(void *map, int *key, struct bpf_timer *timer)
 // --- SCHEDULING CALLBACKS ---
 
 // SELECT_CPU: FAST-PATH IDLE CPU DISPATCH
+// DISPATCHES TO PER-CPU DSQ (NOT SCX_DSQ_LOCAL).
+// PER-CPU DSQ IS CONSUMED BY OUR dispatch() CALLBACK AND VISIBLE TO
+// THE BPF TIMER. SCX_DSQ_LOCAL IS INVISIBLE TO BOTH, CAUSING 6-7MS
+// LATENCY AT LOW CORE COUNTS WHERE THE TIMER CANNOT PREEMPT BATCH
+// TASKS BLOCKING AN SCX_DSQ_LOCAL TASK FROM BEING PICKED UP.
 s32 BPF_STRUCT_OPS(pandemonium_select_cpu, struct task_struct *p,
 		   s32 prev_cpu, u64 wake_flags)
 {
@@ -436,7 +472,21 @@ s32 BPF_STRUCT_OPS(pandemonium_select_cpu, struct task_struct *p,
 		struct task_ctx *tctx = lookup_task_ctx(p);
 		struct tuning_knobs *knobs = get_knobs();
 		u64 sl = tctx ? task_slice(tctx, knobs) : 1000000;
-		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, sl, 0);
+
+		// PER-CPU DSQ: VISIBLE TO TIMER AND dispatch() CALLBACK.
+		// ON AN IDLE CPU THE PER-CPU DSQ IS EMPTY, SO THIS TASK
+		// IS THE ONLY ENTRY AND GETS PICKED UP IMMEDIATELY.
+		s32 node = __COMPAT_scx_bpf_cpu_node(cpu);
+		u64 node_dsq = nr_cpu_ids + (u64)node;
+		u64 dl = tctx ? task_deadline(p, tctx, node_dsq, knobs)
+			      : vtime_now;
+		scx_bpf_dsq_insert_vtime(p, (u64)cpu, sl, dl, 0);
+
+		// KICK: WAKE HALTED IDLE CPU TO PROCESS PER-CPU DSQ.
+		// PREEMPT FOR NON-BATCH (IMMEDIATE IPI), IDLE FOR BATCH.
+		u64 kick = (tctx && tctx->tier != TIER_BATCH)
+			 ? SCX_KICK_PREEMPT : SCX_KICK_IDLE;
+		scx_bpf_kick_cpu(cpu, kick);
 
 		if (tctx)
 			tctx->dispatch_path = 0;
@@ -470,12 +520,23 @@ void BPF_STRUCT_OPS(pandemonium_enqueue, struct task_struct *p,
 	bool is_wakeup = tctx && tctx->awake_vtime == 0;
 
 	// TIER 1: IDLE CPU -> DIRECT PER-CPU DSQ
+	// GUARD: CPU MUST BE < nr_cpu_ids SO ITS PER-CPU DSQ EXISTS.
+	// pick_idle_cpu_node() CAN RETURN OFFLINE CPUs (THEY'RE "IDLE").
 	s32 cpu = __COMPAT_scx_bpf_pick_idle_cpu_node(p->cpus_ptr, node, 0);
-	if (cpu >= 0) {
+	if (cpu >= 0 && (u64)cpu < nr_cpu_ids) {
 		dl = tctx ? task_deadline(p, tctx, node_dsq, knobs)
 			  : vtime_now;
 		scx_bpf_dsq_insert_vtime(p, (u64)cpu, sl, dl, enq_flags);
-		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+
+		// NON-BATCH: USE PREEMPT KICK TO GUARANTEE IMMEDIATE PICKUP.
+		// SCX_KICK_IDLE IS A NO-OP ON BUSY CPUs -- IF THE "IDLE" CPU
+		// BECAME BUSY BETWEEN pick_idle AND kick, THE TASK SITS IN
+		// THE PER-CPU DSQ FOR UP TO batch_slice_ns (20MS). PREEMPT
+		// SENDS AN IPI THAT FORCES IMMEDIATE RESCHEDULE.
+		// BATCH TASKS CAN WAIT -- THEY'RE NOT LATENCY-SENSITIVE.
+		u64 kick_flag = (tctx && tctx->tier != TIER_BATCH)
+			      ? SCX_KICK_PREEMPT : SCX_KICK_IDLE;
+		scx_bpf_kick_cpu(cpu, kick_flag);
 
 		if (tctx)
 			tctx->dispatch_path = 0;
@@ -492,9 +553,18 @@ void BPF_STRUCT_OPS(pandemonium_enqueue, struct task_struct *p,
 		return;
 	}
 
-	// TIER 2: INTERACTIVE PREEMPTION -- DIRECT PER-CPU DSQ + HARD KICK
+	// TIER 2: INTERACTIVE PREEMPTION -- PER-CPU DSQ + SELECTIVE KICK
 	// LAT_CRITICAL ALWAYS GETS PREEMPTION.
 	// INTERACTIVE GETS IT IF FREQ > THRESHOLD OR SHORT RUNTIME.
+	// ONLINE GUARD: pick_any_cpu_node() CAN RETURN OFFLINE CPUs DURING
+	// HOTPLUG. OFFLINE CPUs HAVE NO CURRENT TASK (cpu_curr == NULL).
+	// IF OFFLINE, FALL THROUGH TO TIER 3 (OVERFLOW DSQ + TIMER RESCUE).
+	// KICK POLICY: WAKEUPS GET SCX_KICK_PREEMPT (IMMEDIATE IPI FOR
+	// INTERACTIVE RESPONSIVENESS). REQUEUES GET SCX_KICK_IDLE (NO IPI
+	// ON BUSY CPUs). WITHOUT THIS, PHASE TRANSITIONS GENERATE 13000+
+	// HARD KICKS/SEC ON 2 CPUs, CREATING IPI STORMS THAT CAUSE 14-30MS
+	// WORST-CASE OUTLIERS. REQUEUED TASKS WERE JUST RUNNING AND CAN
+	// WAIT FOR dispatch() OR THE TIMER (1-2MS WORST CASE).
 	if (tctx &&
 	    (tctx->tier == TIER_LAT_CRITICAL ||
 	     (tctx->tier == TIER_INTERACTIVE &&
@@ -502,11 +572,14 @@ void BPF_STRUCT_OPS(pandemonium_enqueue, struct task_struct *p,
 	       tctx->avg_runtime < (knobs ? knobs->slice_ns : 1000000))))) {
 		cpu = __COMPAT_scx_bpf_pick_any_cpu_node(
 			p->cpus_ptr, node, 0);
-		if (cpu >= 0) {
+		if (cpu >= 0 && (u64)cpu < nr_cpu_ids &&
+		    __COMPAT_scx_bpf_cpu_curr(cpu)) {
 			dl = task_deadline(p, tctx, node_dsq, knobs);
 			scx_bpf_dsq_insert_vtime(p, (u64)cpu, sl, dl,
 						  enq_flags);
-			scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
+			u64 kick_flag = is_wakeup
+				      ? SCX_KICK_PREEMPT : SCX_KICK_IDLE;
+			scx_bpf_kick_cpu(cpu, kick_flag);
 			tctx->dispatch_path = 1;
 
 			struct pandemonium_stats *s = get_stats();
@@ -554,9 +627,16 @@ void BPF_STRUCT_OPS(pandemonium_enqueue, struct task_struct *p,
 
 // DISPATCH: CPU IS IDLE AND NEEDS WORK
 // 1. OWN PER-CPU DSQ (DIRECT PLACEMENT FROM ENQUEUE -- ZERO CONTENTION)
-// 2. OWN NODE'S OVERFLOW DSQ (NUMA-LOCAL)
+// 2. NODE OVERFLOW DSQ (VTIME-ORDERED, RESPECTS BEHAVIORAL PRIORITY)
 // 3. CROSS-NODE STEAL (LAST RESORT)
 // 4. KEEP_RUNNING IF PREV STILL WANTS CPU AND NOTHING QUEUED
+//
+// NOTE: CACHE AFFINITY IN DISPATCH WAS REMOVED IN v0.9.9 BECAUSE
+// DSQ ITERATION TO FIND AFFINITY MATCHES CAUSES PRIORITY INVERSION:
+// HIGH-PRIORITY KWORKERS GET SKIPPED IN FAVOR OF LOW-PRIORITY BATCH
+// TASKS WITH BETTER AFFINITY, CAUSING 30+ SECOND RUNNABLE STALLS.
+// AFFINITY IS STILL TRACKED (last_cpu IN task_ctx, cache_domain MAP)
+// FOR FUTURE USE IN ENQUEUE-SIDE PLACEMENT.
 void BPF_STRUCT_OPS(pandemonium_dispatch, s32 cpu, struct task_struct *prev)
 {
 	s32 node = __COMPAT_scx_bpf_cpu_node(cpu);
@@ -570,12 +650,15 @@ void BPF_STRUCT_OPS(pandemonium_dispatch, s32 cpu, struct task_struct *prev)
 		return;
 	}
 
-	// NODE OVERFLOW DSQ
-	if (scx_bpf_dsq_move_to_local(nr_cpu_ids + (u64)node)) {
-		s = get_stats();
-		if (s)
-			s->nr_dispatches += 1;
-		return;
+	// NODE OVERFLOW DSQ: VTIME-ORDERED CONSUME
+	{
+		u64 node_dsq = nr_cpu_ids + (u64)node;
+		if (scx_bpf_dsq_move_to_local(node_dsq)) {
+			s = get_stats();
+			if (s)
+				s->nr_dispatches += 1;
+			return;
+		}
 	}
 
 	// CROSS-NODE STEAL
@@ -651,7 +734,7 @@ void BPF_STRUCT_OPS(pandemonium_runnable, struct task_struct *p,
 
 	// BEHAVIORAL CLASSIFICATION
 	tctx->lat_cri = compute_lat_cri(tctx->wakeup_freq, tctx->csw_rate,
-					 tctx->avg_runtime);
+					 tctx->avg_runtime, tctx->runtime_dev);
 	u32 new_tier = classify_tier(tctx->lat_cri);
 
 	// COMPOSITOR BOOST: ALWAYS LAT_CRITICAL
@@ -664,6 +747,15 @@ void BPF_STRUCT_OPS(pandemonium_runnable, struct task_struct *p,
 // RUNNING: TASK STARTS EXECUTING -- ADVANCE VTIME, RECORD WAKE LATENCY
 void BPF_STRUCT_OPS(pandemonium_running, struct task_struct *p)
 {
+	// DIAGNOSTIC: ZERO-SLICE COUNTER (COMMENTED OUT)
+	// RESULT: ~0.03% OF DISPATCHES -- NOT THE THROUGHPUT ISSUE.
+	// UNCOMMENT TO RE-ENABLE: READS nr_zero_slice IN TELEMETRY AS "zero: N"
+	// if (p->scx.slice == 0) {
+	// 	struct pandemonium_stats *s = get_stats();
+	// 	if (s)
+	// 		__sync_fetch_and_add(&s->nr_zero_slice, 1);
+	// }
+
 	if (time_before(vtime_now, p->scx.dsq_vtime))
 		vtime_now = p->scx.dsq_vtime;
 
@@ -682,6 +774,15 @@ void BPF_STRUCT_OPS(pandemonium_running, struct task_struct *p)
 	if (tctx->last_woke_at && now > tctx->last_woke_at) {
 		u64 wake_lat = now - tctx->last_woke_at;
 		u8 path = tctx->dispatch_path;
+
+		// SLEEP DURATION: TIME BETWEEN quiescent() AND runnable()
+		u64 sleep_dur = 0;
+		if (tctx->sleep_start_ns > 0 &&
+		    tctx->last_woke_at > tctx->sleep_start_ns) {
+			sleep_dur = tctx->last_woke_at - tctx->sleep_start_ns;
+			tctx->sleep_start_ns = 0;
+		}
+
 		tctx->last_woke_at = 0;
 
 		struct pandemonium_stats *s = get_stats();
@@ -707,8 +808,10 @@ void BPF_STRUCT_OPS(pandemonium_running, struct task_struct *p)
 						    sizeof(*sample), 0);
 			if (sample) {
 				sample->lat_ns = wake_lat;
+				sample->sleep_ns = sleep_dur;
 				sample->pid = p->pid;
 				sample->path = path;
+				sample->tier = (u8)tctx->tier;
 				__builtin_memset(sample->_pad, 0,
 						 sizeof(sample->_pad));
 				bpf_ringbuf_submit(sample, 0);
@@ -729,11 +832,36 @@ void BPF_STRUCT_OPS(pandemonium_stopping, struct task_struct *p,
 		return;
 
 	tctx->cached_weight = effective_weight(p, tctx);
+	tctx->last_cpu = bpf_get_smp_processor_id();
 	u64 weight = tctx->cached_weight;
 
 	u64 now = bpf_ktime_get_ns();
 	u64 slice = now > tctx->last_run_at ? now - tctx->last_run_at : 0;
-	tctx->avg_runtime = calc_avg(tctx->avg_runtime, slice, tctx->ewma_age);
+	{
+		u64 avg = tctx->avg_runtime;
+		u64 diff = slice > avg ? slice - avg : avg - slice;
+		tctx->avg_runtime = calc_avg(avg, slice, tctx->ewma_age);
+		tctx->runtime_dev = calc_avg(tctx->runtime_dev, diff,
+					      tctx->ewma_age);
+	}
+
+	// CPU-BOUND DEMOTION: INTERACTIVE -> BATCH IF AVG RUNTIME EXCEEDS THRESHOLD
+	if (tctx->tier == TIER_INTERACTIVE &&
+	    tctx->avg_runtime >= CPU_BOUND_THRESH_NS) {
+		tctx->tier = TIER_BATCH;
+		tctx->cached_weight = effective_weight(p, tctx);
+		weight = tctx->cached_weight;
+	}
+
+	// PROCDB: PUBLISH MATURE TASK CLASSIFICATION FOR USERSPACE
+	if (tctx->ewma_age == EWMA_AGE_MATURE) {
+		struct task_class_entry obs = {};
+		obs.tier = (u8)tctx->tier;
+		obs.avg_runtime = tctx->avg_runtime;
+		char key[16];
+		__builtin_memcpy(key, p->comm, 16);
+		bpf_map_update_elem(&task_class_observe, key, &obs, BPF_ANY);
+	}
 
 	u64 delta_vtime;
 	if (weight > 0)
@@ -745,8 +873,8 @@ void BPF_STRUCT_OPS(pandemonium_stopping, struct task_struct *p,
 	tctx->awake_vtime += delta_vtime;
 }
 
-// TICK: PREEMPT BATCH TASKS WHEN INTERACTIVE WORK IS WAITING
-// COMPLEMENTS THE BPF TIMER. FIRES ON KERNEL TICK FOR THE RUNNING TASK.
+// TICK: BATCH PREEMPTION SAFETY NET
+// COMPLEMENTS BPF TIMER FOR INTERACTIVE RESPONSIVENESS.
 void BPF_STRUCT_OPS(pandemonium_tick, struct task_struct *p)
 {
 	if (!interactive_waiting)
@@ -784,6 +912,20 @@ void BPF_STRUCT_OPS(pandemonium_enable, struct task_struct *p)
 		tctx->tier = TIER_INTERACTIVE;
 		tctx->ewma_age = 0;
 		tctx->dispatch_path = 0;
+
+		// PROCDB: APPLY LEARNED CLASSIFICATION FROM PRIOR RUNS
+		char key[16];
+		__builtin_memcpy(key, p->comm, 16);
+		struct task_class_entry *init_entry =
+		    bpf_map_lookup_elem(&task_class_init, key);
+		if (init_entry) {
+			tctx->tier = (u32)init_entry->tier;
+			tctx->avg_runtime = init_entry->avg_runtime;
+			tctx->cached_weight = effective_weight(p, tctx);
+			struct pandemonium_stats *s = get_stats();
+			if (s)
+				s->nr_procdb_hits += 1;
+		}
 	}
 }
 
@@ -819,6 +961,8 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(pandemonium_init)
 		knobs->slice_ns = 1000000;
 		knobs->preempt_thresh_ns = 1000000;
 		knobs->lag_scale = 4;
+		knobs->batch_slice_ns = 20000000;   // 20MS FLAT DEFAULT
+		knobs->timer_interval_ns = 1000000; // 1MS: ALWAYS ON FROM BOOT
 	}
 
 	// START BPF TIMER FOR PREEMPTION ENFORCEMENT
@@ -838,6 +982,19 @@ void BPF_STRUCT_OPS(pandemonium_exit, struct scx_exit_info *ei)
 	UEI_RECORD(uei, ei);
 }
 
+// QUIESCENT: TASK GOES TO SLEEP -- RECORD TIMESTAMP FOR SLEEP ANALYSIS
+void BPF_STRUCT_OPS(pandemonium_quiescent, struct task_struct *p,
+		    u64 deq_flags)
+{
+	struct task_ctx *tctx = lookup_task_ctx(p);
+	if (tctx)
+		tctx->sleep_start_ns = bpf_ktime_get_ns();
+}
+
+// CPU HOTPLUG CALLBACKS
+void BPF_STRUCT_OPS(pandemonium_cpu_online, s32 cpu) {}
+void BPF_STRUCT_OPS(pandemonium_cpu_offline, s32 cpu) {}
+
 SCX_OPS_DEFINE(pandemonium_ops,
 	       .select_cpu   = (void *)pandemonium_select_cpu,
 	       .enqueue      = (void *)pandemonium_enqueue,
@@ -847,6 +1004,9 @@ SCX_OPS_DEFINE(pandemonium_ops,
 	       .stopping     = (void *)pandemonium_stopping,
 	       .tick         = (void *)pandemonium_tick,
 	       .enable       = (void *)pandemonium_enable,
+	       .quiescent    = (void *)pandemonium_quiescent,
+	       .cpu_online   = (void *)pandemonium_cpu_online,
+	       .cpu_offline  = (void *)pandemonium_cpu_offline,
 	       .init         = (void *)pandemonium_init,
 	       .exit         = (void *)pandemonium_exit,
 	       .flags        = SCX_OPS_BUILTIN_IDLE_PER_NODE,

@@ -9,7 +9,7 @@ use anyhow::{bail, Result};
 use super::{binary_path, LOG_DIR, TARGET_DIR};
 
 fn build_scheduler() -> Result<()> {
-    println!("BUILDING PANDEMONIUM (RELEASE)...");
+    log_info!("Building PANDEMONIUM (release)...");
 
     let project_root = env!("CARGO_MANIFEST_DIR");
     let output = Command::new("cargo")
@@ -29,8 +29,7 @@ fn build_scheduler() -> Result<()> {
     let size = std::fs::metadata(&bin)
         .map(|m| m.len() / 1024)
         .unwrap_or(0);
-    println!("BUILD COMPLETE. BINARY: {} ({} KB)", bin, size);
-    println!();
+    log_info!("Build complete: {} ({} KB)", bin, size);
     Ok(())
 }
 
@@ -143,7 +142,7 @@ pub fn run_start(observe: bool, sched_args: &[String]) -> Result<()> {
         bail!("BINARY NOT FOUND AT {}", bin);
     }
 
-    let mut cmd_args = vec!["run".to_string()];
+    let mut cmd_args = Vec::new();
     if observe {
         cmd_args.push("--verbose".to_string());
         cmd_args.push("--dump-log".to_string());
@@ -151,9 +150,7 @@ pub fn run_start(observe: bool, sched_args: &[String]) -> Result<()> {
     cmd_args.extend(sched_args.iter().cloned());
 
     let full_cmd = format!("sudo {} {}", bin, cmd_args.join(" "));
-    println!("RUNNING: {}", full_cmd);
-    println!("{}", "=".repeat(60));
-    println!();
+    log_info!("Running: {}", full_cmd);
 
     let cursor = capture_dmesg_cursor();
 
@@ -184,9 +181,7 @@ pub fn run_start(observe: bool, sched_args: &[String]) -> Result<()> {
     let scheduler_output = output_lines.join("\n");
     let returncode = status.code().unwrap_or(-1);
 
-    println!();
-    println!("{}", "=".repeat(60));
-    println!("PANDEMONIUM EXITED WITH CODE {}", returncode);
+    log_info!("PANDEMONIUM exited with code {}", returncode);
 
     // BRIEF PAUSE FOR KERNEL LOG FLUSH
     std::thread::sleep(Duration::from_millis(200));
@@ -196,33 +191,26 @@ pub fn run_start(observe: bool, sched_args: &[String]) -> Result<()> {
     let (sched_path, dmesg_path, report_path) = save_logs(&scheduler_output, &dmesg, returncode)?;
 
     // PRINT DMESG
-    println!();
-    println!("{}", "=".repeat(60));
-    println!("KERNEL LOG (DMESG)");
-    println!("{}", "=".repeat(60));
     if dmesg.is_empty() {
-        println!("  (NO RELEVANT KERNEL MESSAGES)");
+        log_info!("Kernel log: no relevant sched_ext messages");
     } else {
+        log_info!("Kernel log ({} lines):", dmesg.lines().count());
         for line in dmesg.lines() {
             println!("  {}", line);
         }
     }
 
-    // STATUS
-    println!();
     match returncode {
-        0 => println!("STATUS: CLEAN EXIT"),
-        130 => println!("STATUS: USER INTERRUPTED (CTRL+C)"),
-        _ => println!("STATUS: EXIT CODE {}", returncode),
+        0 => log_info!("Status: clean exit"),
+        130 => log_info!("Status: user interrupted (CTRL+C)"),
+        _ => log_warn!("Status: exit code {}", returncode),
     }
 
-    // LOG LOCATIONS
-    println!();
-    println!("LOGS SAVED TO {}/", LOG_DIR);
-    println!("  SCHEDULER: {}", sched_path);
-    println!("  DMESG:     {}", dmesg_path);
-    println!("  COMBINED:  {}", report_path);
-    println!("  LATEST:    {}/latest.log", LOG_DIR);
+    log_info!("Logs saved to {}/", LOG_DIR);
+    log_info!("  scheduler: {}", sched_path);
+    log_info!("  dmesg:     {}", dmesg_path);
+    log_info!("  combined:  {}", report_path);
+    log_info!("  latest:    {}/latest.log", LOG_DIR);
 
     Ok(())
 }
@@ -250,7 +238,7 @@ pub fn run_dmesg() -> Result<()> {
     }
 
     if !found {
-        println!("(NO RECENT SCHED_EXT/PANDEMONIUM KERNEL MESSAGES)");
+        log_info!("No recent sched_ext/PANDEMONIUM kernel messages");
     }
 
     Ok(())

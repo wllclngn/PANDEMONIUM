@@ -1,4 +1,4 @@
-// PANDEMONIUM v1.0 SCHEDULER
+// PANDEMONIUM v0.9.9 SCHEDULER
 // WRAPS THE BPF SKELETON: OPEN, CONFIGURE, LOAD, ATTACH, SHUTDOWN
 // MONITORING AND ADAPTIVE CONTROL LIVE IN adaptive.rs
 
@@ -40,6 +40,9 @@ pub struct PandemoniumStats {
     pub wake_lat_kick_sum: u64,
     pub wake_lat_kick_cnt: u64,
     pub nr_guard_clamps: u64,
+    pub nr_affinity_hits: u64,
+    pub nr_procdb_hits: u64,
+    pub nr_zero_slice: u64,
 }
 
 // MATCHES struct tuning_knobs IN BPF (intf.h)
@@ -49,6 +52,8 @@ pub struct TuningKnobs {
     pub slice_ns: u64,
     pub preempt_thresh_ns: u64,
     pub lag_scale: u64,
+    pub batch_slice_ns: u64,
+    pub timer_interval_ns: u64,
 }
 
 impl Default for TuningKnobs {
@@ -57,6 +62,8 @@ impl Default for TuningKnobs {
             slice_ns: 1_000_000,
             preempt_thresh_ns: 1_000_000,
             lag_scale: 4,
+            batch_slice_ns: 20_000_000,
+            timer_interval_ns: 0,
         }
     }
 }
@@ -110,16 +117,24 @@ impl<'a> Scheduler<'a> {
         let pin_dir = "/sys/fs/bpf/pandemonium";
         std::fs::create_dir_all(pin_dir).ok();
 
-        let idle_pin = "/sys/fs/bpf/pandemonium/idle_cpus";
-        std::fs::remove_file(idle_pin).ok();
-        skel.maps.idle_bitmap.pin(idle_pin)?;
-
         let rb_pin = "/sys/fs/bpf/pandemonium/wake_lat_rb";
         std::fs::remove_file(rb_pin).ok();
         skel.maps.wake_lat_rb.pin(rb_pin)?;
 
         std::fs::remove_file(KNOBS_PIN).ok();
         skel.maps.tuning_knobs_map.pin(KNOBS_PIN)?;
+
+        let cache_pin = "/sys/fs/bpf/pandemonium/cache_domain";
+        std::fs::remove_file(cache_pin).ok();
+        skel.maps.cache_domain.pin(cache_pin)?;
+
+        let observe_pin = "/sys/fs/bpf/pandemonium/task_class_observe";
+        std::fs::remove_file(observe_pin).ok();
+        skel.maps.task_class_observe.pin(observe_pin)?;
+
+        let init_pin = "/sys/fs/bpf/pandemonium/task_class_init";
+        std::fs::remove_file(init_pin).ok();
+        skel.maps.task_class_init.pin(init_pin)?;
 
         Ok(Self {
             skel,
@@ -162,6 +177,9 @@ impl<'a> Scheduler<'a> {
                 total.wake_lat_kick_sum += stats.wake_lat_kick_sum;
                 total.wake_lat_kick_cnt += stats.wake_lat_kick_cnt;
                 total.nr_guard_clamps += stats.nr_guard_clamps;
+                total.nr_affinity_hits += stats.nr_affinity_hits;
+                total.nr_procdb_hits += stats.nr_procdb_hits;
+                total.nr_zero_slice += stats.nr_zero_slice;
             }
         }
 
@@ -211,6 +229,14 @@ impl<'a> Scheduler<'a> {
         libbpf_rs::MapHandle::from_pinned_path(KNOBS_PIN).map_err(Into::into)
     }
 
+    // POPULATE CACHE DOMAIN MAP FROM TOPOLOGY DATA AT STARTUP
+    pub fn write_cache_domain(&self, cpu: u32, l2_group: u32) -> Result<()> {
+        let key = cpu.to_ne_bytes();
+        let val = l2_group.to_ne_bytes();
+        self.skel.maps.cache_domain.update(&key, &val, libbpf_rs::MapFlags::ANY)?;
+        Ok(())
+    }
+
     // READ UEI EXIT INFO. RETURNS (should_restart).
     pub fn read_exit_info(&self) -> bool {
         let data = self.skel.maps.data_data.as_ref().unwrap();
@@ -232,12 +258,12 @@ impl<'a> Scheduler<'a> {
                 .unwrap_or("")
                 .trim_end_matches('\0');
 
-            println!("EXIT KIND: {}  CODE: {}", kind, exit_code);
+            log_warn!("BPF exit: kind={} code={}", kind, exit_code);
             if !reason.is_empty() {
-                println!("REASON: {}", reason);
+                log_warn!("BPF exit reason: {}", reason);
             }
             if !msg.is_empty() {
-                println!("MSG: {}", msg);
+                log_warn!("BPF exit msg: {}", msg);
             }
         }
 
@@ -251,9 +277,11 @@ impl<'a> Scheduler<'a> {
 
 impl Drop for Scheduler<'_> {
     fn drop(&mut self) {
-        let _ = self.skel.maps.idle_bitmap.unpin("/sys/fs/bpf/pandemonium/idle_cpus");
         let _ = self.skel.maps.wake_lat_rb.unpin("/sys/fs/bpf/pandemonium/wake_lat_rb");
         let _ = self.skel.maps.tuning_knobs_map.unpin(KNOBS_PIN);
+        let _ = self.skel.maps.cache_domain.unpin("/sys/fs/bpf/pandemonium/cache_domain");
+        let _ = self.skel.maps.task_class_observe.unpin("/sys/fs/bpf/pandemonium/task_class_observe");
+        let _ = self.skel.maps.task_class_init.unpin("/sys/fs/bpf/pandemonium/task_class_init");
         let _ = std::fs::remove_dir("/sys/fs/bpf/pandemonium");
     }
 }

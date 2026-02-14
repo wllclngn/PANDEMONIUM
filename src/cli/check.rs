@@ -16,71 +16,67 @@ fn check_kernel_config() -> bool {
     let file = match std::fs::File::open("/proc/config.gz") {
         Ok(f) => f,
         Err(_) => {
-            println!("  /proc/config.gz       NOT FOUND (SKIPPED)");
+            log_warn!("/proc/config.gz not found (skipped)");
             return true;
         }
     };
     let mut decoder = flate2::read::GzDecoder::new(file);
     let mut config = String::new();
     if decoder.read_to_string(&mut config).is_err() {
-        println!("  /proc/config.gz       UNREADABLE (SKIPPED)");
+        log_warn!("/proc/config.gz unreadable (skipped)");
         return true;
     }
     let found = config.contains("CONFIG_SCHED_CLASS_EXT=y");
     if found {
-        println!("  CONFIG_SCHED_CLASS_EXT OK");
+        log_info!("CONFIG_SCHED_CLASS_EXT=y found");
     } else {
-        println!("  CONFIG_SCHED_CLASS_EXT NOT FOUND -- sched_ext may not be available");
+        log_error!("CONFIG_SCHED_CLASS_EXT not found -- sched_ext may not be available");
     }
     found
 }
 
 pub fn run_check() -> Result<()> {
-    println!("PANDEMONIUM DEPENDENCY CHECK");
-    println!();
+    log_info!("PANDEMONIUM dependency check");
 
     let mut ok = true;
     let tools = ["cargo", "rustc", "clang", "bpftool", "sudo"];
     for tool in &tools {
         if check_tool(tool) {
-            println!("  {:<24}OK", tool);
+            log_info!("  {:<24}OK", tool);
         } else {
-            println!("  {:<24}MISSING", tool);
+            log_error!("  {:<24}MISSING", tool);
             ok = false;
         }
     }
-    println!();
 
-    println!("KERNEL CONFIG:");
+    log_info!("Kernel config:");
     if !check_kernel_config() {
         ok = false;
     }
-    println!();
 
     let scx_path = Path::new("/sys/kernel/sched_ext/root/ops");
     if scx_path.exists() {
         let active = std::fs::read_to_string(scx_path).unwrap_or_default();
         let active = active.trim();
         if active.is_empty() {
-            println!("  sched_ext             AVAILABLE (no scheduler active)");
+            log_info!("sched_ext available (no scheduler active)");
         } else {
-            println!("  sched_ext             ACTIVE ({})", active);
+            log_info!("sched_ext active ({})", active);
         }
     } else {
-        println!("  sched_ext             NOT AVAILABLE (sysfs path missing)");
+        log_error!("sched_ext not available (sysfs path missing)");
         ok = false;
     }
-    println!();
 
     if ok {
-        println!("ALL CHECKS PASSED");
+        log_info!("All checks passed");
     } else {
-        println!("SOME CHECKS FAILED");
+        log_error!("Some checks failed");
         if !check_tool("cargo") || !check_tool("rustc") {
-            println!("  Install Rust: https://rustup.rs");
+            log_info!("  Install Rust: https://rustup.rs");
         }
         if !check_tool("clang") {
-            println!("  Install clang: pacman -S clang");
+            log_info!("  Install clang: pacman -S clang");
         }
         std::process::exit(1);
     }

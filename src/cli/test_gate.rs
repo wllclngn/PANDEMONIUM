@@ -7,12 +7,10 @@ use super::TARGET_DIR;
 pub fn run_test_gate() -> Result<()> {
     let project_root = env!("CARGO_MANIFEST_DIR");
 
-    println!();
-    println!("PANDEMONIUM TEST GATE (RUST)");
-    println!("{}", "=".repeat(60));
+    log_info!("PANDEMONIUM test gate");
 
     // LAYER 1: UNIT TESTS (NO ROOT)
-    println!("LAYER 1: RUST UNIT TESTS");
+    log_info!("Layer 1: Rust unit tests");
     let l1 = Command::new("cargo")
         .args(["test", "--release"])
         .env("CARGO_TARGET_DIR", TARGET_DIR)
@@ -22,10 +20,9 @@ pub fn run_test_gate() -> Result<()> {
     if !l1.success() {
         bail!("LAYER 1 FAILED -- SKIPPING REMAINING LAYERS");
     }
-    println!();
 
     // LAYERS 2-5: INTEGRATION TESTS (REQUIRES ROOT)
-    println!("LAYERS 2-5: INTEGRATION (REQUIRES ROOT)");
+    log_info!("Layers 2-5: integration (requires root)");
     let l2 = Command::new("sudo")
         .args([
             "-E",
@@ -54,15 +51,12 @@ pub fn run_test_gate() -> Result<()> {
 pub fn run_test_scale() -> Result<()> {
     let project_root = env!("CARGO_MANIFEST_DIR");
 
-    println!();
-    println!("PANDEMONIUM SCALING BENCHMARK (A/B VS EEVDF)");
-    println!("REQUIRES ROOT (CPU HOTPLUG + BPF)");
-    println!("{}", "=".repeat(60));
-    println!();
+    log_info!("PANDEMONIUM scaling benchmark (A/B vs EEVDF)");
+    log_info!("Requires root (CPU hotplug + BPF)");
 
     // NUKE STALE FINGERPRINTS (sudo cargo test CREATES ROOT-OWNED FILES
     // THAT PREVENT NON-ROOT cargo build FROM RECOMPILING)
-    println!("CLEANING STALE FINGERPRINTS...");
+    log_info!("Cleaning stale fingerprints...");
     let fp_dir = format!("{}/release/.fingerprint", TARGET_DIR);
     if let Ok(entries) = std::fs::read_dir(&fp_dir) {
         for entry in entries.flatten() {
@@ -78,7 +72,7 @@ pub fn run_test_scale() -> Result<()> {
         .current_dir(project_root)
         .status();
 
-    println!("BUILDING (RELEASE)...");
+    log_info!("Building (release)...");
     let build = Command::new("cargo")
         .args(["build", "--release"])
         .env("CARGO_TARGET_DIR", TARGET_DIR)
@@ -88,7 +82,6 @@ pub fn run_test_scale() -> Result<()> {
     if !build.success() {
         bail!("BUILD FAILED");
     }
-    println!();
 
     let status = Command::new("sudo")
         .args([

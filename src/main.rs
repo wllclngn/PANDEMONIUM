@@ -1,4 +1,4 @@
-// PANDEMONIUM v1.0 -- SCHED_EXT KERNEL SCHEDULER
+// PANDEMONIUM v0.9.9 -- SCHED_EXT KERNEL SCHEDULER
 // ADAPTIVE DESKTOP SCHEDULING FOR LINUX
 //
 // SCHEDULING DECISIONS HAPPEN IN BPF (ZERO KERNEL-USERSPACE ROUND TRIPS)
@@ -10,9 +10,13 @@
 #[allow(dead_code)]
 mod bpf_skel;
 
+#[macro_use]
+mod log;
 mod adaptive;
 mod cli;
+mod procdb;
 mod scheduler;
+mod topology;
 
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,13 +36,24 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 struct Cli {
     #[command(subcommand)]
     command: Option<SubCmd>,
+
+    #[arg(long)]
+    verbose: bool,
+
+    #[arg(long)]
+    dump_log: bool,
+
+    /// Override CPU count for scaling formulas (default: auto-detect)
+    #[arg(long)]
+    nr_cpus: Option<u64>,
+
+    /// Run BPF scheduler only, disable Rust adaptive control loop
+    #[arg(long)]
+    no_adaptive: bool,
 }
 
 #[derive(Subcommand)]
 enum SubCmd {
-    /// Run the scheduler (needs root + sched_ext kernel)
-    Run(RunArgs),
-
     /// Check dependencies and kernel config
     Check,
 
@@ -63,25 +78,6 @@ enum SubCmd {
     /// A/B scaling benchmark (EEVDF vs PANDEMONIUM across core counts)
     TestScale,
 
-    /// Print idle CPU bitmask (requires running PANDEMONIUM scheduler)
-    IdleCpus,
-}
-
-#[derive(Parser)]
-struct RunArgs {
-    #[arg(long)]
-    verbose: bool,
-
-    #[arg(long)]
-    dump_log: bool,
-
-    /// Override CPU count for scaling formulas (default: auto-detect)
-    #[arg(long)]
-    nr_cpus: Option<u64>,
-
-    /// Run BPF scheduler only, disable Rust adaptive control loop
-    #[arg(long)]
-    no_adaptive: bool,
 }
 
 #[derive(Parser)]
@@ -151,19 +147,13 @@ struct BenchRunArgs {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    let verbose = cli.verbose;
+    let dump_log = cli.dump_log;
+    let nr_cpus = cli.nr_cpus;
+    let no_adaptive = cli.no_adaptive;
+
     match cli.command {
-        None | Some(SubCmd::Run(_)) => {
-            let args = match cli.command {
-                Some(SubCmd::Run(a)) => a,
-                _ => RunArgs {
-                    verbose: false,
-                    dump_log: false,
-                    nr_cpus: None,
-                    no_adaptive: false,
-                },
-            };
-            run_scheduler(args)
-        }
+        None => run_scheduler(verbose, dump_log, nr_cpus, no_adaptive),
         Some(SubCmd::Check) => cli::check::run_check(),
         Some(SubCmd::Probe(args)) => {
             cli::probe::run_probe(args.death_pipe_fd);
@@ -189,16 +179,15 @@ fn main() -> Result<()> {
         ),
         Some(SubCmd::Test) => cli::test_gate::run_test_gate(),
         Some(SubCmd::TestScale) => cli::test_gate::run_test_scale(),
-        Some(SubCmd::IdleCpus) => cli::idle_cpus::run_idle_cpus(),
     }
 }
 
-fn run_scheduler(args: RunArgs) -> Result<()> {
+fn run_scheduler(verbose: bool, dump_log: bool, nr_cpus: Option<u64>, no_adaptive: bool) -> Result<()> {
     ctrlc::set_handler(move || {
         SHUTDOWN.store(true, Ordering::Relaxed);
     })?;
 
-    let nr_cpus = args.nr_cpus.unwrap_or_else(|| {
+    let nr_cpus_display = nr_cpus.unwrap_or_else(|| {
         libbpf_rs::num_possible_cpus().unwrap_or(1) as u64
     });
     let governor = std::fs::read_to_string(
@@ -208,30 +197,40 @@ fn run_scheduler(args: RunArgs) -> Result<()> {
     .trim()
     .to_string();
 
-    println!("PANDEMONIUM v1.0");
-    println!(
-        "CPUS:            {} (governor: {})",
-        nr_cpus,
+    log_info!("PANDEMONIUM v0.9.9");
+    log_info!(
+        "CPUS: {} (governor: {})",
+        nr_cpus_display,
         if governor.is_empty() { "unknown" } else { &governor }
     );
-    println!("VERBOSE:         {}", args.verbose);
-    println!();
+    log_info!("VERBOSE: {}", verbose);
 
     let mut open_object = MaybeUninit::uninit();
 
-    let adaptive = !args.no_adaptive;
+    let adaptive = !no_adaptive;
 
     loop {
         let mut sched = Scheduler::init(
             &mut open_object,
-            args.nr_cpus,
+            nr_cpus,
             adaptive,
         )?;
+
+        // POPULATE CACHE TOPOLOGY MAP AT STARTUP
+        match topology::CpuTopology::detect(nr_cpus_display as usize) {
+            Ok(topo) => {
+                topo.log_summary();
+                if let Err(e) = topo.populate_bpf_map(&sched) {
+                    log_warn!("CACHE TOPOLOGY MAP WRITE FAILED: {}", e);
+                }
+            }
+            Err(e) => log_warn!("CACHE TOPOLOGY DETECT FAILED: {}", e),
+        }
 
         let should_restart = if !adaptive {
             // BPF-ONLY MODE: SCHEDULER RUNS WITH DEFAULT KNOBS, NO RUST TUNING
             // STILL PRINTS STATS SO BENCHMARKS GET TELEMETRY FOR BOTH PHASES
-            println!("PANDEMONIUM IS ACTIVE (BPF ONLY, CTRL+C TO EXIT)");
+            log_info!("PANDEMONIUM IS ACTIVE (BPF ONLY, CTRL+C TO EXIT)");
             let mut prev = scheduler::PandemoniumStats::default();
             while !SHUTDOWN.load(Ordering::Relaxed) && !sched.exited() {
                 std::thread::sleep(Duration::from_secs(1));
@@ -262,14 +261,18 @@ fn run_scheduler(args: RunArgs) -> Result<()> {
                 let lat_idle_us = if d_idle_cnt > 0 { d_idle_sum / d_idle_cnt / 1000 } else { 0 };
                 let lat_kick_us = if d_kick_cnt > 0 { d_kick_sum / d_kick_cnt / 1000 } else { 0 };
                 let delta_guard = stats.nr_guard_clamps.wrapping_sub(prev.nr_guard_clamps);
+                let delta_affin = stats.nr_affinity_hits.wrapping_sub(prev.nr_affinity_hits);
+                let delta_procdb = stats.nr_procdb_hits.wrapping_sub(prev.nr_procdb_hits);
+                // DIAGNOSTIC: delta_zero commented out -- ~0.03% rate, not throughput issue
+                // let delta_zero = stats.nr_zero_slice.wrapping_sub(prev.nr_zero_slice);
 
                 let idle_pct = if delta_d > 0 { delta_idle * 100 / delta_d } else { 0 };
 
                 println!(
-                    "d/s: {:<8} idle: {}% shared: {:<6} preempt: {:<4} keep: {:<4} kick: H={:<4} S={:<4} enq: W={:<4} R={:<4} wake: {}us lat_idle: {}us lat_kick: {}us guard: {} [BPF]",
+                    "d/s: {:<8} idle: {}% shared: {:<6} preempt: {:<4} keep: {:<4} kick: H={:<4} S={:<4} enq: W={:<4} R={:<4} wake: {}us lat_idle: {}us lat_kick: {}us affin: {} procdb: {} guard: {} [BPF]",
                     delta_d, idle_pct, delta_shared, delta_preempt, delta_keep,
                     delta_hard, delta_soft, delta_enq_wake, delta_enq_requeue,
-                    wake_avg_us, lat_idle_us, lat_kick_us, delta_guard,
+                    wake_avg_us, lat_idle_us, lat_kick_us, delta_affin, delta_procdb, delta_guard,
                 );
 
                 sched.log.snapshot(
@@ -280,6 +283,16 @@ fn run_scheduler(args: RunArgs) -> Result<()> {
 
                 prev = stats;
             }
+
+            // KNOBS SUMMARY: CAPTURED BY TEST HARNESS FOR ARCHIVE
+            let knobs = sched.read_tuning_knobs();
+            println!(
+                "[KNOBS] regime=BPF slice_ns={} batch_ns={} preempt_ns={} timer_ns={} lag={}",
+                knobs.slice_ns, knobs.batch_slice_ns,
+                knobs.preempt_thresh_ns, knobs.timer_interval_ns,
+                knobs.lag_scale,
+            );
+
             sched.read_exit_info()
         } else {
             // FULL MODE: ADAPTIVE CONTROL LOOP WITH REFLEX + MONITOR
@@ -294,7 +307,7 @@ fn run_scheduler(args: RunArgs) -> Result<()> {
                     adaptive::reflex_thread(ring_buf, shared_reflex, knobs_handle, &SHUTDOWN);
                 })?;
 
-            println!("PANDEMONIUM IS ACTIVE (CTRL+C TO EXIT)");
+            log_info!("PANDEMONIUM IS ACTIVE (CTRL+C TO EXIT)");
             let restart = adaptive::monitor_loop(&mut sched, &shared, &SHUTDOWN)?;
             // SIGNAL REFLEX THREAD TO EXIT (MONITOR MAY RETURN FROM BPF EXIT,
             // NOT JUST CTRL+C -- WITHOUT THIS, reflex_handle.join() DEADLOCKS)
@@ -303,9 +316,9 @@ fn run_scheduler(args: RunArgs) -> Result<()> {
             restart
         };
 
-        println!("PANDEMONIUM IS SHUTTING DOWN");
+        log_info!("PANDEMONIUM IS SHUTTING DOWN");
 
-        if args.dump_log {
+        if dump_log {
             sched.log.dump();
         }
         sched.log.summary();
@@ -316,9 +329,9 @@ fn run_scheduler(args: RunArgs) -> Result<()> {
 
         // RESET SHUTDOWN FOR RESTART
         SHUTDOWN.store(false, Ordering::Relaxed);
-        println!("RESTARTING PANDEMONIUM...\n");
+        log_info!("RESTARTING PANDEMONIUM...");
     }
 
-    println!("PANDEMONIUM OUT.");
+    log_info!("Shutdown complete");
     Ok(())
 }

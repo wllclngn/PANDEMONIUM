@@ -79,13 +79,13 @@ pub fn run_bench_run(
         bail!("BENCH FAILED. SEE {}/bench.err", LOG_DIR);
     }
 
-    println!("BUILD LOGS: {}/build.out {}/build.err", LOG_DIR, LOG_DIR);
-    println!("BENCH LOGS: {}/bench.out {}/bench.err", LOG_DIR, LOG_DIR);
+    log_info!("Build logs: {}/build.out {}/build.err", LOG_DIR, LOG_DIR);
+    log_info!("Bench logs: {}/bench.out {}/bench.err", LOG_DIR, LOG_DIR);
     Ok(())
 }
 
 fn timed_run(cmd: &str) -> Option<f64> {
-    println!("  RUNNING: {}", cmd);
+    log_info!("Running: {}", cmd);
     let start = Instant::now();
     let result = Command::new("sh")
         .args(["-c", cmd])
@@ -95,20 +95,20 @@ fn timed_run(cmd: &str) -> Option<f64> {
     let elapsed = start.elapsed().as_secs_f64();
     match result {
         Ok(r) if r.status.success() => {
-            println!("  COMPLETED IN {:.2}s", elapsed);
+            log_info!("Completed in {:.2}s", elapsed);
             Some(elapsed)
         }
         Ok(r) => {
             let stderr = String::from_utf8_lossy(&r.stderr);
-            println!(
-                "  COMMAND FAILED (EXIT {}):",
-                r.status.code().unwrap_or(-1)
+            log_error!(
+                "Command failed (exit {}): {}",
+                r.status.code().unwrap_or(-1),
+                &stderr[..stderr.len().min(500)]
             );
-            println!("  {}", &stderr[..stderr.len().min(500)]);
             None
         }
         Err(e) => {
-            println!("  COMMAND FAILED: {}", e);
+            log_error!("Command failed: {}", e);
             None
         }
     }
@@ -116,7 +116,7 @@ fn timed_run(cmd: &str) -> Option<f64> {
 
 fn start_scheduler(sched_args: &[String]) -> Result<ChildGuard> {
     let bin = binary_path();
-    let mut args = vec!["run".to_string()];
+    let mut args = Vec::new();
     args.extend(sched_args.iter().cloned());
 
     let child = Command::new("sudo")
@@ -138,7 +138,7 @@ fn ensure_scheduler_started(sched_args: &[String]) -> Result<ChildGuard> {
     if !wait_for_activation(10) {
         bail!("PANDEMONIUM DID NOT ACTIVATE WITHIN 10S");
     }
-    println!("  PANDEMONIUM IS ACTIVE");
+    log_info!("PANDEMONIUM is active");
     std::thread::sleep(Duration::from_secs(2));
     Ok(guard)
 }
@@ -174,26 +174,22 @@ fn bench_general(
     sched_args: &[String],
 ) -> Result<()> {
     let sep = "=".repeat(60);
-    println!("{}", sep);
-    println!("PANDEMONIUM A/B BENCHMARK");
-    println!("{}", sep);
-    println!("COMMAND:    {}", cmd);
-    println!("ITERATIONS: {}", iterations);
+    log_info!("PANDEMONIUM A/B benchmark");
+    log_info!("Command: {}", cmd);
+    log_info!("Iterations: {}", iterations);
     if let Some(cc) = clean_cmd {
-        println!("CLEAN CMD:  {}", cc);
+        log_info!("Clean cmd: {}", cc);
     }
-    println!();
 
     if is_scx_active() {
         bail!("SCHED_EXT IS ALREADY ACTIVE. STOP IT BEFORE BENCHMARKING.");
     }
 
     // PHASE 1: EEVDF BASELINE
-    println!("PHASE 1: EEVDF BASELINE");
-    println!("{}", "-".repeat(40));
+    log_info!("Phase 1: EEVDF baseline");
     let mut eevdf_times = Vec::new();
     for i in 0..iterations {
-        println!("  ITERATION {}/{}", i + 1, iterations);
+        log_info!("Iteration {}/{}", i + 1, iterations);
         if let Some(cc) = clean_cmd {
             let _ = Command::new("sh")
                 .args(["-c", cc])
@@ -204,20 +200,16 @@ fn bench_general(
             None => bail!("ABORTING BENCHMARK: COMMAND FAILED"),
         }
     }
-    println!();
 
     // PHASE 2: START PANDEMONIUM
-    println!("PHASE 2: STARTING PANDEMONIUM");
-    println!("{}", "-".repeat(40));
+    log_info!("Phase 2: starting PANDEMONIUM");
     let mut pand_proc = ensure_scheduler_started(sched_args)?;
-    println!();
 
     // PHASE 3: PANDEMONIUM BENCHMARK
-    println!("PHASE 3: PANDEMONIUM BENCHMARK");
-    println!("{}", "-".repeat(40));
+    log_info!("Phase 3: PANDEMONIUM benchmark");
     let mut pand_times = Vec::new();
     for i in 0..iterations {
-        println!("  ITERATION {}/{}", i + 1, iterations);
+        log_info!("Iteration {}/{}", i + 1, iterations);
         if let Some(cc) = clean_cmd {
             let _ = Command::new("sh")
                 .args(["-c", cc])
@@ -231,13 +223,11 @@ fn bench_general(
             }
         }
     }
-    println!();
 
     // PHASE 4: STOP
-    println!("PHASE 4: STOPPING PANDEMONIUM");
+    log_info!("Phase 4: stopping PANDEMONIUM");
     stop_scheduler(&mut pand_proc);
-    println!("  PANDEMONIUM STOPPED");
-    println!();
+    log_info!("PANDEMONIUM stopped");
 
     // RESULTS
     let (eevdf_mean, eevdf_std) = mean_stdev(&eevdf_times);
@@ -349,21 +339,17 @@ fn pw_get_xruns() -> i64 {
 // MIXED BENCHMARK: COMPILE + AUDIO
 fn bench_mixed(sched_args: &[String]) -> Result<()> {
     let sep = "=".repeat(60);
-    println!("{}", sep);
-    println!("PANDEMONIUM MIXED WORKLOAD BENCHMARK");
-    println!("{}", sep);
-    println!();
+    log_info!("PANDEMONIUM mixed workload benchmark");
 
     if !pw_audio_playing() {
         bail!("NO AUDIO PLAYING. START AUDIO PLAYBACK FIRST.");
     }
 
     let entries = pw_top_snapshot();
-    println!("ACTIVE PIPEWIRE NODES:");
+    log_info!("Active PipeWire nodes:");
     for (name, err) in &entries {
-        println!("  {} (xruns: {})", name, err);
+        log_info!("  {} (xruns: {})", name, err);
     }
-    println!();
 
     if is_scx_active() {
         bail!("SCHED_EXT IS ALREADY ACTIVE. STOP IT BEFORE BENCHMARKING.");
@@ -375,32 +361,24 @@ fn bench_mixed(sched_args: &[String]) -> Result<()> {
     let sched_args = sched_args.to_vec();
 
     // PHASE 1: EEVDF
-    println!("PHASE 1: EEVDF (DEFAULT SCHEDULER)");
-    println!("{}", "-".repeat(40));
+    log_info!("Phase 1: EEVDF (default scheduler)");
     let _ = Command::new("sh").args(["-c", &clean_cmd]).output();
     let xruns_before = pw_get_xruns();
-    println!("  XRUNS BEFORE: {}", xruns_before);
+    log_info!("Xruns before: {}", xruns_before);
     let eevdf_time = timed_run(&build_cmd).ok_or_else(|| anyhow::anyhow!("BUILD FAILED"))?;
     let xruns_after = pw_get_xruns();
     let eevdf_xruns = xruns_after - xruns_before;
-    println!(
-        "  XRUNS AFTER:  {} (DELTA: {})",
-        xruns_after, eevdf_xruns
-    );
-    println!();
+    log_info!("Xruns after: {} (delta: {})", xruns_after, eevdf_xruns);
 
     // PHASE 2: START PANDEMONIUM
-    println!("PHASE 2: STARTING PANDEMONIUM");
-    println!("{}", "-".repeat(40));
+    log_info!("Phase 2: starting PANDEMONIUM");
     let mut pand_proc = ensure_scheduler_started(&sched_args)?;
-    println!();
 
     // PHASE 3: PANDEMONIUM
-    println!("PHASE 3: PANDEMONIUM");
-    println!("{}", "-".repeat(40));
+    log_info!("Phase 3: PANDEMONIUM");
     let _ = Command::new("sh").args(["-c", &clean_cmd]).output();
     let xruns_before = pw_get_xruns();
-    println!("  XRUNS BEFORE: {}", xruns_before);
+    log_info!("Xruns before: {}", xruns_before);
     let pand_time = match timed_run(&build_cmd) {
         Some(t) => t,
         None => {
@@ -410,17 +388,12 @@ fn bench_mixed(sched_args: &[String]) -> Result<()> {
     };
     let xruns_after = pw_get_xruns();
     let pand_xruns = xruns_after - xruns_before;
-    println!(
-        "  XRUNS AFTER:  {} (DELTA: {})",
-        xruns_after, pand_xruns
-    );
-    println!();
+    log_info!("Xruns after: {} (delta: {})", xruns_after, pand_xruns);
 
     // PHASE 4: STOP
-    println!("PHASE 4: STOPPING PANDEMONIUM");
+    log_info!("Phase 4: stopping PANDEMONIUM");
     stop_scheduler(&mut pand_proc);
-    println!("  PANDEMONIUM STOPPED");
-    println!();
+    log_info!("PANDEMONIUM stopped");
 
     // RESULTS
     let delta_pct = if eevdf_time > 0.0 {
@@ -479,11 +452,8 @@ fn bench_mixed(sched_args: &[String]) -> Result<()> {
 // CONTENTION BENCHMARK: COMPILE + INTERACTIVE PROBE
 fn bench_contention(sched_args: &[String]) -> Result<()> {
     let sep = "=".repeat(60);
-    println!("{}", sep);
-    println!("PANDEMONIUM CONTENTION BENCHMARK");
-    println!("{}", sep);
-    println!("WORKLOAD: CARGO BUILD --RELEASE + INTERACTIVE PROBE (10MS SLEEP/WAKE)");
-    println!();
+    log_info!("PANDEMONIUM contention benchmark");
+    log_info!("Workload: cargo build --release + interactive probe (10ms sleep/wake)");
 
     if is_scx_active() {
         bail!("SCHED_EXT IS ALREADY ACTIVE. STOP IT BEFORE BENCHMARKING.");
@@ -517,8 +487,7 @@ fn bench_contention(sched_args: &[String]) -> Result<()> {
     let mut results = Vec::new();
 
     for (phase_name, use_scheduler) in &phases {
-        println!("PHASE: {}", phase_name);
-        println!("{}", "-".repeat(40));
+        log_info!("Phase: {}", phase_name);
 
         let mut pand_proc = if *use_scheduler {
             Some(ensure_scheduler_started(&sched_args)?)
@@ -552,7 +521,7 @@ fn bench_contention(sched_args: &[String]) -> Result<()> {
         let probe_guard = ChildGuard::new(probe_proc);
 
         // RUN BUILD
-        println!("  BUILDING...");
+        log_info!("Building...");
         let build_start = Instant::now();
         let build_result = Command::new("sh")
             .args(["-c", &build_cmd])
@@ -562,8 +531,8 @@ fn bench_contention(sched_args: &[String]) -> Result<()> {
         let build_time = build_start.elapsed().as_secs_f64();
 
         if !build_result.status.success() {
-            println!(
-                "  BUILD FAILED (EXIT {})",
+            log_error!(
+                "Build failed (exit {})",
                 build_result.status.code().unwrap_or(-1)
             );
             drop(probe_guard);
@@ -589,7 +558,7 @@ fn bench_contention(sched_args: &[String]) -> Result<()> {
         // STOP SCHEDULER IF RUNNING
         if let Some(ref mut p) = pand_proc {
             stop_scheduler(p);
-            println!("  PANDEMONIUM STOPPED");
+            log_info!("PANDEMONIUM stopped");
         }
 
         // PARSE PROBE OUTPUT
@@ -604,12 +573,11 @@ fn bench_contention(sched_args: &[String]) -> Result<()> {
         let p99 = percentile(&overshoots, 99.0);
         let worst = overshoots.last().copied().unwrap_or(0.0);
 
-        println!("  BUILD TIME:  {:.2}s", build_time);
-        println!("  PROBE SAMPLES: {}", n);
-        println!("  MEDIAN OVERSHOOT: {:.0}us", med);
-        println!("  P99 OVERSHOOT:    {:.0}us", p99);
-        println!("  WORST OVERSHOOT:  {:.0}us", worst);
-        println!();
+        log_info!("Build time: {:.2}s", build_time);
+        log_info!("Probe samples: {}", n);
+        log_info!("Median overshoot: {:.0}us", med);
+        log_info!("P99 overshoot: {:.0}us", p99);
+        log_info!("Worst overshoot: {:.0}us", worst);
 
         results.push(PhaseResult {
             name: phase_name.to_string(),
