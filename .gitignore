@@ -1,8 +1,19 @@
+# Rust
 /target/
-*.o
-*.png
 Cargo.lock
 
-# Project metadata
-COMMIT_MESSAGE.txt
+# C/BPF
+*.o
+*.d
+*.skel.rs
 
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Build artifacts
+*.png
+
+# Repo artifacts
+COMMIT_MESSAGE.txt

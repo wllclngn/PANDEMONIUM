@@ -1,4 +1,4 @@
-// PANDEMONIUM v0.9.9 -- SCHED_EXT KERNEL SCHEDULER
+// PANDEMONIUM v1.0.1 -- SCHED_EXT KERNEL SCHEDULER
 // ADAPTIVE DESKTOP SCHEDULING FOR LINUX
 //
 // SCHEDULING DECISIONS HAPPEN IN BPF (ZERO KERNEL-USERSPACE ROUND TRIPS)
@@ -197,7 +197,7 @@ fn run_scheduler(verbose: bool, dump_log: bool, nr_cpus: Option<u64>, no_adaptiv
     .trim()
     .to_string();
 
-    log_info!("PANDEMONIUM v0.9.9");
+    log_info!("PANDEMONIUM v1.0.1");
     log_info!(
         "CPUS: {} (governor: {})",
         nr_cpus_display,
