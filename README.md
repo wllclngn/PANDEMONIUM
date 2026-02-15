@@ -36,7 +36,7 @@ Benchmarked on 12 AMD Zen CPUs, kernel 6.18.9-arch1-2, clang 21.1.6. Numbers bel
 - **Direct Preemptive Placement**: LAT_CRITICAL tasks (any path) and INTERACTIVE wakeups placed directly onto busy CPU's per-CPU DSQ with `SCX_KICK_PREEMPT`. Requeued INTERACTIVE tasks fall to overflow DSQ to avoid unnecessary BPF helper calls
 - **NUMA-Scoped Overflow**: Per-node overflow DSQ with cross-node work stealing as final fallback
 - **Tick Safety Net**: `tick()` preempts batch tasks when interactive work is waiting in the overflow DSQ
-- **BPF Timer**: Independent 1ms preemption scan, reliable under NO_HZ_FULL
+- **BPF Timer**: Independent preemption scan (1-2ms, regime-dependent), reliable under NO_HZ_FULL
 
 ### Behavioral Classification
 - **Latency-Criticality Score**: `lat_cri = (wakeup_freq * csw_rate) / effective_runtime` where `effective_runtime = avg_runtime + (runtime_dev >> 1)`
@@ -60,12 +60,12 @@ Benchmarked on 12 AMD Zen CPUs, kernel 6.18.9-arch1-2, clang 21.1.6. Numbers bel
 - **Two Threads, Zero Mutexes**: Reflex thread (ring buffer consumer, sub-millisecond response) and monitor thread (1-second control loop, regime detection). Lock-free shared state via atomics
 - **Workload Regime Detection**: LIGHT (idle >50%), MIXED (10-50%), HEAVY (<10%) with Schmitt trigger hysteresis and 2-tick hold to prevent regime bouncing
 - **Regime Profiles**:
-  - LIGHT: slice 4ms, preempt 4ms, batch 20ms, timer off (no contention)
-  - MIXED: slice 4ms, preempt 2ms, batch 8ms, timer 10ms (balance)
-  - HEAVY: slice 8ms, preempt 4ms, batch 4ms, timer 5ms (throughput)
-- **Reflex Tightening**: BPF emits per-wakeup latency via ring buffer. Reflex thread computes P99 from a lock-free histogram and tightens both slice_ns and batch_slice_ns by 25% when P99 exceeds the regime ceiling. Only fires in MIXED regime
-- **Graduated Relax**: After P99 normalizes, knobs step back toward baseline by 1ms per tick with a 2-second hold. Recovery from 1ms floor to 4ms baseline in 6 seconds
-- **P99 Ceilings**: LIGHT 5ms, MIXED 10ms, HEAVY 20ms
+  - LIGHT: slice 2ms, preempt 1ms, batch 20ms, timer 2ms (low contention)
+  - MIXED: slice 1ms, preempt 1ms, batch 16ms, timer 1ms (tight response)
+  - HEAVY: slice 4ms, preempt 2ms, batch 20ms, timer 2ms (throughput)
+- **Reflex Tightening**: BPF emits per-wakeup latency via ring buffer. Reflex thread computes P99 from a lock-free histogram and tightens slice_ns and preempt_thresh_ns by 25% when P99 exceeds the regime ceiling. batch_slice_ns stays wide for throughput. Only fires in MIXED regime
+- **Graduated Relax**: After P99 normalizes, knobs step back toward baseline by 500us per tick with a 2-second hold. Floor is 500us (MIN_SLICE_NS)
+- **P99 Ceilings**: LIGHT 3ms, MIXED 5ms, HEAVY 10ms
 - **BPF Guard Window**: When interactive wakeup hits overflow DSQ, batch slices are clamped to 200us for 1ms. Self-expiring
 
 ### Core-Count Scaling
@@ -159,19 +159,19 @@ task_class_observe  -------->  ingest()  -------->  task_class_init
 
 | Knob | Default | Purpose |
 |------|---------|---------|
-| `slice_ns` | 4ms | Interactive/lat_cri slice ceiling, Tier 2 threshold |
-| `preempt_thresh_ns` | 2ms | BPF timer preemption threshold |
+| `slice_ns` | 1ms | Interactive/lat_cri slice ceiling |
+| `preempt_thresh_ns` | 1ms | BPF timer preemption threshold |
 | `lag_scale` | 4 | Deadline lag multiplier (higher = more vtime credit) |
 | `batch_slice_ns` | 20ms | Batch task slice ceiling |
-| `timer_interval_ns` | 0/10ms | BPF timer interval (0 = scan disabled) |
+| `timer_interval_ns` | 1ms | BPF timer interval (regime-adjusted) |
 
 ## Requirements
 
 - Linux kernel 6.12+ with `CONFIG_SCHED_CLASS_EXT=y`
 - Rust toolchain
 - clang (BPF compilation)
-- bpftool (vmlinux.h generation from running kernel BTF)
 - system libbpf
+- bpftool (first build only -- generates vmlinux.h, can be uninstalled after)
 - Root privileges (`CAP_SYS_ADMIN`)
 
 ```bash
@@ -192,7 +192,7 @@ pacman -S clang libbpf bpf rust
 CARGO_TARGET_DIR=/tmp/pandemonium-build cargo build --release
 ```
 
-vmlinux.h is generated at build time from `/sys/kernel/btf/vmlinux` via bpftool and cached at `/tmp/pandemonium-vmlinux.h`. A generic vmlinux.h will not work -- sched_ext types only exist in kernels with `CONFIG_SCHED_CLASS_EXT=y`.
+vmlinux.h is generated from the running kernel's BTF via bpftool on first build and cached at `/tmp/pandemonium-vmlinux.h`. Subsequent builds use the cache -- bpftool is not needed after the first build.
 
 Note: the source directory path contains spaces, so `CARGO_TARGET_DIR=/tmp/pandemonium-build` is required for the vendored libbpf Makefile.
 
@@ -290,7 +290,7 @@ pandemonium test
 ## Attribution
 
 - `include/scx/*` headers from the [sched_ext](https://github.com/sched-ext/scx) project (GPL-2.0)
-- vmlinux.h generated at build time from the running kernel's BTF via bpftool
+- vmlinux.h generated from the running kernel's BTF (cached after first build)
 
 ## License
 
