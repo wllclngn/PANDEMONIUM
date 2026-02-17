@@ -1,32 +1,32 @@
 # PANDEMONIUM
 
-Built in Rust and C23, PANDEMONIUM is a Linux kernel scheduler built for sched_ext. Utilizing BPF patterns, PANDEMONIUM classifies every task by its behavior--wakeup frequency, context switch rate, runtime, sleep patterns--and adapts scheduling decisions in real time. Two-thread adaptive control loop (zero mutexes), three-tier behavioral dispatch and a process database that learns task classifications across lifetimes.
+Built in Rust and C23, PANDEMONIUM is a Linux kernel scheduler built for sched_ext. Utilizing BPF patterns, PANDEMONIUM classifies every task by its behavior--wakeup frequency, context switch rate, runtime, sleep patterns--and adapts scheduling decisions in real time. Two-thread adaptive control loop (zero mutexes), three-tier behavioral dispatch, and a persistent process database that learns task classifications across lifetimes and skips redundant work on confident predictions.
 
 ## Performance
 
-Benchmarked on 12 AMD Zen CPUs, kernel 6.18.9-arch1-2, clang 21.1.6. Numbers below are representative ranges across multiple single-iteration bench-scale runs under real desktop load.
+Benchmarked on 12 AMD Zen CPUs, kernel 6.18.9-arch1-2, clang 21.1.6. Numbers below are from bench-scales run with warm procdb (v2.0.0, persistent classification database).
 
 ### Throughput (kernel build, vs EEVDF baseline)
 
 | Cores | PANDEMONIUM | scx_bpfland |
 |-------|-------------|-------------|
-| 2     | +3.3-5.7%   | +0.3-2.4%   |
-| 4     | +2.8-6.0%   | +0.5-1.4%   |
-| 8     | +3.1-4.8%   | +3.1-6.6%   |
-| 12    | +1.8-3.5%   | +0.7-3.9%   |
+| 2     | +3.7%       | +1.8%       |
+| 4     | +0.9%       | +0.4%       |
+| 8     | +4.8%       | +4.6%       |
+| 12    | +1.8%       | +1.7%       |
 
-3-4% overhead at low core counts is inherent per-dispatch cost from 5 BPF callbacks per scheduling cycle -- amortized at higher core counts. At 12 cores, overhead is 2-3.5% in exchange for 8-19x better tail latency.
+v2.0.0's persistent procdb and BPF fast-path cut 2-core overhead from 5-12% (cold start) to 3.7% (warm). At 4 cores, overhead drops to sub-1% -- matching scx_bpfland. Remaining overhead at 8 cores is shared equally with scx_bpfland (inherent sched_ext dispatch cost). At 12 cores, 1.8% overhead in exchange for 6-14x better tail latency.
 
 ### P99 Wakeup Latency (interactive probe under CPU saturation)
 
-| Cores | EEVDF     | PANDEMONIUM | scx_bpfland | vs EEVDF    |
-|-------|-----------|-------------|-------------|-------------|
-| 2     | 830-995us | 85-119us    | 1034-1932us | **8-10x**   |
-| 4     | 827-884us | 78-101us    | 1009-1756us | **8-10x**   |
-| 8     | 822-1596us| 67-83us     | 1003-1194us | **12-19x**  |
-| 12    | 941-1632us| 68-95us     | 1001-1007us | **10-17x**  |
+| Cores | EEVDF  | PANDEMONIUM | scx_bpfland | vs EEVDF   |
+|-------|--------|-------------|-------------|------------|
+| 2     | 735us  | 229us       | 1521us      | **3.2x**   |
+| 4     | 777us  | 96us        | 1002us      | **8.1x**   |
+| 8     | 835us  | 140us       | 1002us      | **6.0x**   |
+| 12    | 939us  | 148us       | 1002us      | **6.3x**   |
 
-8-19x better tail latency than the kernel default scheduler. Sub-120us P99 across all core counts under full CPU saturation.
+3-8x better tail latency than the kernel default scheduler. Sub-250us P99 across all core counts under full CPU saturation.
 
 ## Key Features
 
@@ -41,7 +41,7 @@ Benchmarked on 12 AMD Zen CPUs, kernel 6.18.9-arch1-2, clang 21.1.6. Numbers bel
 ### Behavioral Classification
 - **Latency-Criticality Score**: `lat_cri = (wakeup_freq * csw_rate) / effective_runtime` where `effective_runtime = avg_runtime + (runtime_dev >> 1)`
 - **Three Tiers**: LAT_CRITICAL (1.5x avg_runtime slices, preemptive kicks), INTERACTIVE (2x avg_runtime), BATCH (configurable ceiling via adaptive layer)
-- **CPU-Bound Demotion**: Tasks with avg_runtime >= 2.5ms are demoted from INTERACTIVE to BATCH in `stopping()`. Reversed automatically when the task sleeps and `runnable()` reclassifies from fresh behavioral signals
+- **CPU-Bound Demotion**: Tasks with avg_runtime >= 2.5ms are demoted from INTERACTIVE to BATCH in `stopping()`, unless procdb-confident. Reversed automatically when the task sleeps and `runnable()` reclassifies from fresh behavioral signals
 - **Compositor Boosting**: Compositors (kwin, sway, Hyprland, gnome-shell, picom, weston) are always LAT_CRITICAL
 - **Runtime Variance Tracking**: EWMA of |runtime - avg_runtime| penalizes jittery tasks in the lat_cri formula
 
@@ -49,6 +49,9 @@ Benchmarked on 12 AMD Zen CPUs, kernel 6.18.9-arch1-2, clang 21.1.6. Numbers bel
 - **Cross-Lifecycle Learning**: BPF publishes mature task profiles (tier + avg_runtime) keyed by `comm[16]` to an observation map
 - **Confidence Scoring**: Rust ingests observations, tracks EWMA convergence stability, and promotes profiles to "confident" when avg_runtime stabilizes
 - **Prediction on Spawn**: `enable()` applies learned classification from prior runs -- `make -j12` forks start as BATCH from the first fork instead of 100 fresh INTERACTIVE classifications
+- **Persistent Memory**: Confident profiles are saved to `~/.cache/pandemonium/procdb.bin` on shutdown (atomic write via .tmp + rename). On startup, warm profiles are loaded and pushed to BPF immediately -- zero cold-start penalty after the first run
+- **BPF Fast-Path**: Tasks with a confident procdb classification skip full behavioral reclassification in `runnable()` and CPU-bound demotion in `stopping()`. Observations still publish so the Rust side detects drift
+- **Deterministic Eviction**: When the profile cache is full, eviction sorts by (staleness, observations, comm) -- identical workloads produce identical procdb state
 - **Telemetry**: `procdb: total/confident` per tick shows learning progress
 
 ### Sleep-Aware Scheduling
@@ -83,7 +86,7 @@ src/
   main.rs              Entry point, CLI, scheduler loop, telemetry
   scheduler.rs         BPF skeleton lifecycle, tuning knobs I/O
   adaptive.rs          Adaptive control loop (reflex + monitor threads)
-  procdb.rs            Process classification database (observe -> learn -> predict)
+  procdb.rs            Process classification database (observe -> learn -> predict -> persist)
   topology.rs          CPU topology detection (sysfs -> cache_domain BPF map)
   event.rs             Pre-allocated ring buffer for stats time series
   log.rs               Logging macros
@@ -151,8 +154,15 @@ BPF stopping()                    Rust monitor                    BPF enable()
   v                                v                                v
 task_class_observe  -------->  ingest()  -------->  task_class_init
 (comm -> tier, avg_runtime)    confidence scoring   (comm -> tier, avg_runtime)
-                               EWMA convergence
+                               EWMA convergence     confident flag -> fast-path
                                detection
+
+~/.cache/pandemonium/procdb.bin
+  ^                    |
+  |  save() on         |  load() on startup
+  |  shutdown          |  -> flush_predictions()
+  |  (atomic write)    v
+  +--- Rust monitor ---+
 ```
 
 ### Tuning Knobs (BPF map)
@@ -265,6 +275,7 @@ Results are archived to `~/.cache/pandemonium/{version}-{timestamp}.json` for cr
 ```bash
 # Unit tests (no root required)
 cargo test --release --test event
+cargo test --release --test procdb
 
 # Full test gate (requires root + sched_ext kernel)
 pandemonium test
@@ -277,6 +288,7 @@ pandemonium test
 
 | Layer | Name | What it tests |
 |-------|------|---------------|
+| 0 | procdb | Profile confidence, eviction, persistence (save/load round-trip), determinism (22 tests) |
 | 1 | Unit tests | Ring buffer, snapshot recording, summary/dump |
 | 2 | Load/Classify/Unload | BPF lifecycle, dispatch stats, classification |
 | 3 | Latency gate | cyclictest under scheduler (avg latency threshold) |

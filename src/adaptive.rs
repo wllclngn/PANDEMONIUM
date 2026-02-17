@@ -1,4 +1,4 @@
-// PANDEMONIUM v1.0.1 ADAPTIVE CONTROL LOOP
+// PANDEMONIUM v2.0.0 ADAPTIVE CONTROL LOOP
 // EVENT-DRIVEN CLOSED-LOOP TUNING SYSTEM
 //
 // TWO THREADS, ZERO MUTEXES:
@@ -583,6 +583,18 @@ pub fn monitor_loop(
         }
 
         prev = stats;
+    }
+
+    // PROCDB: SAVE LEARNED CLASSIFICATIONS TO DISK
+    if let Some(ref db) = procdb {
+        let path = ProcessDb::default_path();
+        match db.save(&path) {
+            Ok(()) => {
+                let (total, confident) = db.summary();
+                log_info!("PROCDB: SAVED {}/{} PROFILES TO {}", confident, total, path.display());
+            }
+            Err(e) => log_warn!("PROCDB SAVE FAILED: {}", e),
+        }
     }
 
     // KNOBS SUMMARY: CAPTURED BY TEST HARNESS FOR ARCHIVE

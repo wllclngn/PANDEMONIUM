@@ -1,4 +1,4 @@
-// PANDEMONIUM v1.0.1 -- SCHED_EXT KERNEL SCHEDULER
+// PANDEMONIUM v2.0.0 -- SCHED_EXT KERNEL SCHEDULER
 // ADAPTIVE DESKTOP SCHEDULING FOR LINUX
 //
 // BPF: BEHAVIORAL CLASSIFICATION + MULTI-TIER DISPATCH
@@ -154,7 +154,8 @@ struct task_ctx {
 	u32 ewma_age;
 	s32 last_cpu;        // LAST CPU THIS TASK RAN ON (FOR CACHE AFFINITY)
 	u8  dispatch_path;   // 0=IDLE, 1=HARD_KICK, 2=SOFT_KICK
-	u8  _pad[3];
+	u8  confident;       // 1 = PROCDB CONFIDENT, SKIP RECLASSIFICATION
+	u8  _pad[2];
 };
 
 struct {
@@ -706,6 +707,15 @@ void BPF_STRUCT_OPS(pandemonium_runnable, struct task_struct *p,
 		return;
 	}
 
+	// PROCDB FAST-PATH: SKIP CLASSIFICATION FOR CONFIDENT TASKS
+	if (tctx->confident) {
+		tctx->last_woke_at = now;
+		tctx->prev_nvcsw = p->nvcsw;
+		if (tctx->ewma_age < EWMA_AGE_CAP)
+			tctx->ewma_age += 1;
+		return;
+	}
+
 	// WAKEUP FREQUENCY
 	u64 delta_t = now > tctx->last_woke_at ? now - tctx->last_woke_at : 1;
 	tctx->wakeup_freq = update_freq(tctx->wakeup_freq, delta_t,
@@ -846,7 +856,9 @@ void BPF_STRUCT_OPS(pandemonium_stopping, struct task_struct *p,
 	}
 
 	// CPU-BOUND DEMOTION: INTERACTIVE -> BATCH IF AVG RUNTIME EXCEEDS THRESHOLD
-	if (tctx->tier == TIER_INTERACTIVE &&
+	// SKIP FOR CONFIDENT TASKS -- PROCDB TIER IS AUTHORITATIVE
+	if (!tctx->confident &&
+	    tctx->tier == TIER_INTERACTIVE &&
 	    tctx->avg_runtime >= CPU_BOUND_THRESH_NS) {
 		tctx->tier = TIER_BATCH;
 		tctx->cached_weight = effective_weight(p, tctx);
@@ -912,6 +924,7 @@ void BPF_STRUCT_OPS(pandemonium_enable, struct task_struct *p)
 		tctx->tier = TIER_INTERACTIVE;
 		tctx->ewma_age = 0;
 		tctx->dispatch_path = 0;
+		tctx->confident = 0;
 
 		// PROCDB: APPLY LEARNED CLASSIFICATION FROM PRIOR RUNS
 		char key[16];
@@ -922,6 +935,7 @@ void BPF_STRUCT_OPS(pandemonium_enable, struct task_struct *p)
 			tctx->tier = (u32)init_entry->tier;
 			tctx->avg_runtime = init_entry->avg_runtime;
 			tctx->cached_weight = effective_weight(p, tctx);
+			tctx->confident = 1;
 			struct pandemonium_stats *s = get_stats();
 			if (s)
 				s->nr_procdb_hits += 1;
