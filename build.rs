@@ -77,11 +77,39 @@ fn main() {
     println!("cargo:rerun-if-changed=include/scx");
 }
 
-// PATCH vmlinux.h FOR C23 COMPATIBILITY.
-// C23 MAKES true/false/bool KEYWORDS, BUT vmlinux.h DEFINES THEM AS
+// PATCH vmlinux.h FOR COMPATIBILITY.
+// C23: true/false/bool ARE KEYWORDS, BUT vmlinux.h DEFINES THEM AS
 // ENUM VALUES AND A TYPEDEF. RENAME THE CONFLICTS.
+// ANONYMOUS FIELDS: KERNEL PATCHES (e.g. BORE) ADD STRUCT FIELDS NAMED `_`,
+// WHICH IS VALID C BUT INVALID AS A RUST STRUCT FIELD. LIBBPF-CARGO GENERATES
+// `pub _: u8` IN THE SKELETON, CAUSING RUSTFMT TO REJECT IT.
+// FIX: RENAME `_` FIELDS TO `_anon_pad` IN THE C HEADER BEFORE SKELETON GEN.
 fn patch_vmlinux_c23(raw: &str) -> String {
-    raw.replace("typedef _Bool bool;", "/* C23: bool is a keyword */")
+    let mut out = raw
+        .replace("typedef _Bool bool;", "/* C23: bool is a keyword */")
         .replace("\tfalse = 0,", "\t/* C23: false */ _false = 0,")
-        .replace("\ttrue = 1,", "\t/* C23: true */ _true = 1,")
+        .replace("\ttrue = 1,", "\t/* C23: true */ _true = 1,");
+
+    // RENAME ANONYMOUS STRUCT FIELDS: `type _;` -> `type _anon_pad;`
+    // MATCHES ANY C TYPE FOLLOWED BY ` _;` AT A FIELD DECLARATION
+    let mut count = 0u32;
+    let mut result = String::with_capacity(out.len());
+    for line in out.lines() {
+        let trimmed = line.trim();
+        if trimmed.ends_with(" _;") || trimmed.ends_with("\t_;") {
+            let replaced = line.replacen(" _;", &format!(" _anon_pad_{};", count), 1);
+            result.push_str(&replaced);
+            count += 1;
+        } else {
+            result.push_str(line);
+        }
+        result.push('\n');
+    }
+
+    if count > 0 {
+        result
+    } else {
+        out.push('\n');
+        out
+    }
 }
