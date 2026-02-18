@@ -4,29 +4,30 @@ Built in Rust and C23, PANDEMONIUM is a Linux kernel scheduler built for sched_e
 
 ## Performance
 
-Benchmarked on 12 AMD Zen CPUs, kernel 6.18.9-arch1-2, clang 21.1.6. Numbers below are from bench-scales run with warm procdb (v2.0.0, persistent classification database).
+NOTE: These benchmarks are generated with a fresh PANDEMONIUM build. As detailed in the data, each subsequent run improves on performance given the adaptive Rust layer.
+
+Benchmarked on 12 AMD Zen CPUs, kernel 6.18.9-arch1-2, clang 21.1.6. Numbers below are from a 10-iteration bench-scale run with warm procdb (v2.0.0).
 
 ### Throughput (kernel build, vs EEVDF baseline)
 
-| Cores | PANDEMONIUM | scx_bpfland |
-|-------|-------------|-------------|
-| 2     | +3.7%       | +1.8%       |
-| 4     | +0.9%       | +0.4%       |
-| 8     | +4.8%       | +4.6%       |
-| 12    | +1.8%       | +1.7%       |
+| Cores | PANDEMONIUM | scx_bpfland | scx_lavd |
+|-------|-------------|-------------|----------|
+| 4     | +5.9%       | +2.4%       | -1.2%    |
+| 8     | +6.2%       | +3.6%       | +3.7%    |
+| 12    | +1.7%       | +0.5%       | -0.2%    |
 
-v2.0.0's persistent procdb and BPF fast-path cut 2-core overhead from 5-12% (cold start) to 3.7% (warm). At 4 cores, overhead drops to sub-1% -- matching scx_bpfland. Remaining overhead at 8 cores is shared equally with scx_bpfland (inherent sched_ext dispatch cost). At 12 cores, 1.8% overhead in exchange for 6-14x better tail latency.
+PANDEMONIUM trades throughput for latency. scx_lavd (Steam Deck scheduler) trades latency for throughput -- it beats EEVDF at 4 and 12 cores but pays 9-35x worse tail latency. At 12 cores, all three sched_ext schedulers converge to within 2% of EEVDF.
 
 ### P99 Wakeup Latency (interactive probe under CPU saturation)
 
-| Cores | EEVDF  | PANDEMONIUM | scx_bpfland | vs EEVDF   |
-|-------|--------|-------------|-------------|------------|
-| 2     | 735us  | 229us       | 1521us      | **3.2x**   |
-| 4     | 777us  | 96us        | 1002us      | **8.1x**   |
-| 8     | 835us  | 140us       | 1002us      | **6.0x**   |
-| 12    | 939us  | 148us       | 1002us      | **6.3x**   |
+| Cores | EEVDF   | PANDEMONIUM | scx_bpfland | scx_lavd | vs EEVDF    | vs lavd     |
+|-------|---------|-------------|-------------|----------|-------------|-------------|
+| 2     | 1607us  | 215us       | 2158us      | 5243us   | **7.5x**    | **24x**     |
+| 4     | 1478us  | 127us       | 1738us      | 4487us   | **11.6x**   | **35x**     |
+| 8     | 2979us  | 136us       | 1806us      | 2795us   | **21.9x**   | **21x**     |
+| 12    | 1877us  | 183us       | 1541us      | 1684us   | **10.3x**   | **9x**      |
 
-3-8x better tail latency than the kernel default scheduler. Sub-250us P99 across all core counts under full CPU saturation.
+7-22x better tail latency than EEVDF, 9-35x better than scx_lavd. Sub-220us P99 across all core counts under full CPU saturation. scx_lavd's P99 reaches 5.2ms at 2 cores -- frame-drop territory.
 
 ## Key Features
 
