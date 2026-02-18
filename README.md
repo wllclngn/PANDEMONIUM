@@ -1,33 +1,32 @@
 # PANDEMONIUM
 
-Built in Rust and C23, PANDEMONIUM is a Linux kernel scheduler built for sched_ext. Utilizing BPF patterns, PANDEMONIUM classifies every task by its behavior--wakeup frequency, context switch rate, runtime, sleep patterns--and adapts scheduling decisions in real time. Two-thread adaptive control loop (zero mutexes), three-tier behavioral dispatch, and a persistent process database that learns task classifications across lifetimes and skips redundant work on confident predictions.
+Built in Rust and C23, PANDEMONIUM is a Linux kernel scheduler built for sched_ext. Utilizing BPF patterns, PANDEMONIUM classifies every task by its behavior--wakeup frequency, context switch rate, runtime, sleep patterns--and adapts scheduling decisions in real time. Two-thread adaptive control loop (zero mutexes), three-tier behavioral dispatch, L2 cache affinity instrumentation, workload regime detection, and a persistent process database that learns task classifications across lifetimes.
 
 ## Performance
 
-NOTE: These benchmarks are generated with a fresh PANDEMONIUM build. As detailed in the data, each subsequent run improves on performance given the adaptive Rust layer.
-
-Benchmarked on 12 AMD Zen CPUs, kernel 6.18.9-arch1-2, clang 21.1.6. Numbers below are from a 10-iteration bench-scale run with warm procdb (v2.0.0).
+Benchmarked on 12 AMD Zen CPUs, kernel 6.18.9-arch1-2, clang 21.1.6. Numbers from bench-scale with warm procdb (v3.0.0).
 
 ### Throughput (kernel build, vs EEVDF baseline)
 
-| Cores | PANDEMONIUM | scx_bpfland | scx_lavd |
-|-------|-------------|-------------|----------|
-| 4     | +5.9%       | +2.4%       | -1.2%    |
-| 8     | +6.2%       | +3.6%       | +3.7%    |
-| 12    | +1.7%       | +0.5%       | -0.2%    |
+| Cores | PANDEMONIUM | scx_bpfland |
+|-------|-------------|-------------|
+| 2     | +18.3%      | +4.8%       |
+| 4     | +7.4%       | +5.4%       |
+| 8     | +4.5%       | +5.4%       |
+| 12    | +0.6%       | +0.1%       |
 
-PANDEMONIUM trades throughput for latency. scx_lavd (Steam Deck scheduler) trades latency for throughput -- it beats EEVDF at 4 and 12 cores but pays 9-35x worse tail latency. At 12 cores, all three sched_ext schedulers converge to within 2% of EEVDF.
+At 12 cores, PANDEMONIUM runs at near-parity with EEVDF (+0.6%, within measurement noise). At 8 cores, overhead matches scx_bpfland -- the remaining cost is inherent sched_ext dispatch overhead. Low core counts (2-4) carry more overhead proportionally: each extra context switch costs more when there are fewer cores to absorb it.
 
 ### P99 Wakeup Latency (interactive probe under CPU saturation)
 
-| Cores | EEVDF   | PANDEMONIUM | scx_bpfland | scx_lavd | vs EEVDF    | vs lavd     |
-|-------|---------|-------------|-------------|----------|-------------|-------------|
-| 2     | 1607us  | 215us       | 2158us      | 5243us   | **7.5x**    | **24x**     |
-| 4     | 1478us  | 127us       | 1738us      | 4487us   | **11.6x**   | **35x**     |
-| 8     | 2979us  | 136us       | 1806us      | 2795us   | **21.9x**   | **21x**     |
-| 12    | 1877us  | 183us       | 1541us      | 1684us   | **10.3x**   | **9x**      |
+| Cores | EEVDF    | PANDEMONIUM | scx_bpfland | vs EEVDF   |
+|-------|----------|-------------|-------------|------------|
+| 2     | 3,848us  | 155us       | 4,960us     | **25x**    |
+| 4     | 1,006us  | 146us       | 1,887us     | **7x**     |
+| 8     | 2,315us  | 182us       | 1,977us     | **13x**    |
+| 12    | 832us    | 199us       | 1,698us     | **4x**     |
 
-7-22x better tail latency than EEVDF, 9-35x better than scx_lavd. Sub-220us P99 across all core counts under full CPU saturation. scx_lavd's P99 reaches 5.2ms at 2 cores -- frame-drop territory.
+Sub-200us P99 across all core counts under full CPU saturation. PANDEMONIUM's worst-case latency at 12 cores (1,021us) is lower than scx_bpfland's P99 (1,698us). EEVDF worst-case at 12 cores: 48ms. PANDEMONIUM worst-case: 1ms. 47x tighter.
 
 ## Key Features
 
@@ -36,22 +35,29 @@ PANDEMONIUM trades throughput for latency. scx_lavd (Steam Deck scheduler) trade
 - **Node-Local Placement**: `enqueue()` finds idle CPUs within the NUMA node, dispatches to per-CPU DSQ with `SCX_KICK_PREEMPT` for non-batch tasks
 - **Direct Preemptive Placement**: LAT_CRITICAL tasks (any path) and INTERACTIVE wakeups placed directly onto busy CPU's per-CPU DSQ with `SCX_KICK_PREEMPT`. Requeued INTERACTIVE tasks fall to overflow DSQ to avoid unnecessary BPF helper calls
 - **NUMA-Scoped Overflow**: Per-node overflow DSQ with cross-node work stealing as final fallback
-- **Tick Safety Net**: `tick()` preempts batch tasks when interactive work is waiting in the overflow DSQ
-- **BPF Timer**: Independent preemption scan (1-2ms, regime-dependent), reliable under NO_HZ_FULL
+- **Event-Driven Preemption**: `tick()` checks `interactive_waiting` flag (set by enqueue when non-batch tasks hit overflow DSQ) and preempts batch tasks above `preempt_thresh_ns`. Zero polling -- no BPF timer
+- **Interactive Guard**: When non-batch tasks hit overflow DSQ, batch slices are clamped to 200us for a 2ms guard window. Self-expiring
 
 ### Behavioral Classification
 - **Latency-Criticality Score**: `lat_cri = (wakeup_freq * csw_rate) / effective_runtime` where `effective_runtime = avg_runtime + (runtime_dev >> 1)`
 - **Three Tiers**: LAT_CRITICAL (1.5x avg_runtime slices, preemptive kicks), INTERACTIVE (2x avg_runtime), BATCH (configurable ceiling via adaptive layer)
-- **CPU-Bound Demotion**: Tasks with avg_runtime >= 2.5ms are demoted from INTERACTIVE to BATCH in `stopping()`, unless procdb-confident. Reversed automatically when the task sleeps and `runnable()` reclassifies from fresh behavioral signals
-- **Compositor Boosting**: Compositors (kwin, sway, Hyprland, gnome-shell, picom, weston) are always LAT_CRITICAL
+- **EWMA Classification**: All tasks -- including procdb-confident tasks -- go through full EWMA classification in `runnable()`. Wakeup frequency, context switch rate, and runtime variance drive `lat_cri` scoring. BPF's natural reclassification validates procdb predictions against actual runtime behavior
+- **CPU-Bound Demotion**: Secondary safety net in `stopping()`. Tasks with avg_runtime above `cpu_bound_thresh_ns` (regime-dependent, written by Rust) are demoted from INTERACTIVE to BATCH. Reversed automatically when the task sleeps and `runnable()` reclassifies from fresh behavioral signals
+- **Compositor Boosting**: BPF hash map populated by Rust at startup. Default compositors (kwin, sway, Hyprland, gnome-shell, picom, weston) always LAT_CRITICAL. User-extensible via `--compositor` CLI flag
 - **Runtime Variance Tracking**: EWMA of |runtime - avg_runtime| penalizes jittery tasks in the lat_cri formula
+
+### L2 Cache Affinity Instrumentation
+- **Per-Dispatch Tracking**: Every dispatch through `select_cpu()` and `enqueue()` compares the selected CPU's L2 domain against the task's last CPU
+- **Per-Tier Hit/Miss Counters**: Separate L2 hit rates for BATCH, INTERACTIVE, and LAT_CRITICAL tiers
+- **Cache Domain Map**: Rust populates `cache_domain` BPF map from sysfs topology at startup
+- **Adaptive Feedback**: L2 hit rate feeds into batch slice adjustment (step up when L2 degrades below 55%, step down when L2 exceeds 70%)
 
 ### Process Classification Database (procdb)
 - **Cross-Lifecycle Learning**: BPF publishes mature task profiles (tier + avg_runtime) keyed by `comm[16]` to an observation map
 - **Confidence Scoring**: Rust ingests observations, tracks EWMA convergence stability, and promotes profiles to "confident" when avg_runtime stabilizes
-- **Prediction on Spawn**: `enable()` applies learned classification from prior runs -- `make -j12` forks start as BATCH from the first fork instead of 100 fresh INTERACTIVE classifications
+- **Warm-Start on Spawn**: `enable()` applies learned classification from prior runs -- `make -j12` forks start as BATCH from the first fork instead of 100 fresh INTERACTIVE classifications
+- **EWMA Validation**: Confident tasks still run through full behavioral classification in `runnable()`. ProcDb provides the initial state; EWMA validates and corrects it against actual runtime behavior. Observations still publish so the Rust side detects drift
 - **Persistent Memory**: Confident profiles are saved to `~/.cache/pandemonium/procdb.bin` on shutdown (atomic write via .tmp + rename). On startup, warm profiles are loaded and pushed to BPF immediately -- zero cold-start penalty after the first run
-- **BPF Fast-Path**: Tasks with a confident procdb classification skip full behavioral reclassification in `runnable()` and CPU-bound demotion in `stopping()`. Observations still publish so the Rust side detects drift
 - **Deterministic Eviction**: When the profile cache is full, eviction sorts by (staleness, observations, comm) -- identical workloads produce identical procdb state
 - **Telemetry**: `procdb: total/confident` per tick shows learning progress
 
@@ -64,13 +70,14 @@ PANDEMONIUM trades throughput for latency. scx_lavd (Steam Deck scheduler) trade
 - **Two Threads, Zero Mutexes**: Reflex thread (ring buffer consumer, sub-millisecond response) and monitor thread (1-second control loop, regime detection). Lock-free shared state via atomics
 - **Workload Regime Detection**: LIGHT (idle >50%), MIXED (10-50%), HEAVY (<10%) with Schmitt trigger hysteresis and 2-tick hold to prevent regime bouncing
 - **Regime Profiles**:
-  - LIGHT: slice 2ms, preempt 1ms, batch 20ms, timer 2ms (low contention)
-  - MIXED: slice 1ms, preempt 1ms, batch 16ms, timer 1ms (tight response)
-  - HEAVY: slice 4ms, preempt 2ms, batch 20ms, timer 2ms (throughput)
+  - LIGHT: slice 2ms, preempt 1ms, batch 20ms (low contention)
+  - MIXED: slice 1ms, preempt 1ms, batch 20ms (tight response)
+  - HEAVY: slice 4ms, preempt 2ms, batch 20ms (throughput)
 - **Reflex Tightening**: BPF emits per-wakeup latency via ring buffer. Reflex thread computes P99 from a lock-free histogram and tightens slice_ns and preempt_thresh_ns by 25% when P99 exceeds the regime ceiling. batch_slice_ns stays wide for throughput. Only fires in MIXED regime
 - **Graduated Relax**: After P99 normalizes, knobs step back toward baseline by 500us per tick with a 2-second hold. Floor is 500us (MIN_SLICE_NS)
+- **Stability Hibernation**: Tracks consecutive stable ticks (no regime changes, no guard clamps, no reflex events, P99 below ceiling). After 10 stable ticks, reflex thread polling rate drops to 4x base, telemetry output halves
+- **L2 Batch Slice Feedback**: Adjusts batch_slice_ns based on L2 cache hit rate. Steps up +2ms when L2 drops below 55% for 3 consecutive ticks, steps down -1ms when L2 exceeds 70%. Capped at 24ms ceiling, floored at regime baseline
 - **P99 Ceilings**: LIGHT 3ms, MIXED 5ms, HEAVY 10ms
-- **BPF Guard Window**: When interactive wakeup hits overflow DSQ, batch slices are clamped to 200us for 1ms. Self-expiring
 
 ### Core-Count Scaling
 - **Preempt Threshold**: `60 / (nr_cpu_ids + 2)`, clamped 3-20. Scales interactive kick aggressiveness with CPU count
@@ -87,13 +94,14 @@ src/
   main.rs              Entry point, CLI, scheduler loop, telemetry
   scheduler.rs         BPF skeleton lifecycle, tuning knobs I/O
   adaptive.rs          Adaptive control loop (reflex + monitor threads)
+  tuning.rs            Regime knobs, stability scoring, L2 feedback functions
   procdb.rs            Process classification database (observe -> learn -> predict -> persist)
   topology.rs          CPU topology detection (sysfs -> cache_domain BPF map)
   event.rs             Pre-allocated ring buffer for stats time series
   log.rs               Logging macros
   lib.rs               Library root
   bpf/
-    main.bpf.c         BPF scheduler (~1000 lines, GNU C23)
+    main.bpf.c         BPF scheduler (~960 lines, GNU C23)
     intf.h             Shared structs: tuning_knobs, pandemonium_stats, wake_lat_sample, task_class_entry
   cli/
     mod.rs             Shared constants, helpers
@@ -108,8 +116,10 @@ src/
 build.rs               vmlinux.h generation + C23 patching + BPF compilation
 tests/
   pandemonium-tests.py Test orchestrator (bench-scale, CPU hotplug, dmesg capture)
+  adaptive.rs          Adaptive layer tests (33 tests: regime, stability, L2 feedback)
   event.rs             Unit tests (ring buffer)
-  scale.rs             Latency scaling benchmark (stress + interactive probe)
+  procdb.rs            Process database tests (22 tests: confidence, eviction, persistence)
+  scale.rs             Latency scaling benchmark
 include/
   scx/                 Vendored sched_ext headers
 ```
@@ -128,6 +138,9 @@ enqueue()     ->  Node-local idle?  ->  Per-CPU DSQ + PREEMPT kick
                       |
                       v (no)
               ->  Per-node overflow DSQ  ->  dispatch() work stealing
+
+tick()        ->  interactive_waiting?  ->  Preempt batch if avg_runtime > thresh
+                  (event-driven, zero polling)
 ```
 
 ### Adaptive Layer (adaptive.rs)
@@ -138,11 +151,11 @@ BPF ring buffer              Reflex Thread              Monitor Thread
                               |                   |      idle% -> regime
                               v                   |      regime -> baseline knobs
                         P99 > ceiling? --------+  |      P99 ok? -> graduated relax
-                        (MIXED only)           |  |      procdb ingest + flush
-                              |                v  v
+                        (MIXED only)           |  |      L2 hit% -> batch slice adjust
+                              |                v  v      stability -> hibernate polling
                               v          BPF reads knobs on next dispatch
                         tighten slice
-                        + batch knobs
+                        + preempt knobs
 ```
 
 Two threads, zero mutexes. BPF produces events, Rust reacts. Rust writes knobs, BPF reads them on the very next scheduling decision.
@@ -155,7 +168,7 @@ BPF stopping()                    Rust monitor                    BPF enable()
   v                                v                                v
 task_class_observe  -------->  ingest()  -------->  task_class_init
 (comm -> tier, avg_runtime)    confidence scoring   (comm -> tier, avg_runtime)
-                               EWMA convergence     confident flag -> fast-path
+                               EWMA convergence     warm-start -> EWMA validates
                                detection
 
 ~/.cache/pandemonium/procdb.bin
@@ -171,10 +184,12 @@ task_class_observe  -------->  ingest()  -------->  task_class_init
 | Knob | Default | Purpose |
 |------|---------|---------|
 | `slice_ns` | 1ms | Interactive/lat_cri slice ceiling |
-| `preempt_thresh_ns` | 1ms | BPF timer preemption threshold |
+| `preempt_thresh_ns` | 1ms | Tick preemption threshold |
 | `lag_scale` | 4 | Deadline lag multiplier (higher = more vtime credit) |
-| `batch_slice_ns` | 20ms | Batch task slice ceiling |
-| `timer_interval_ns` | 1ms | BPF timer interval (regime-adjusted) |
+| `batch_slice_ns` | 20ms | Batch task slice ceiling (L2 feedback adjusts) |
+| `cpu_bound_thresh_ns` | 2.5ms | CPU-bound demotion threshold (regime-dependent) |
+| `lat_cri_thresh_high` | 32 | Classifier: LAT_CRITICAL threshold |
+| `lat_cri_thresh_low` | 8 | Classifier: INTERACTIVE threshold |
 
 ## Requirements
 
@@ -219,6 +234,9 @@ sudo pandemonium --no-adaptive
 # Override CPU count for scaling formulas
 sudo pandemonium --nr-cpus 4
 
+# Add custom compositor process names (boosted to LAT_CRITICAL)
+sudo pandemonium --compositor gamescope --compositor picom-next
+
 # Subcommands
 pandemonium check        # Verify dependencies and kernel config
 pandemonium start        # Build + sudo run + dmesg capture + log management
@@ -234,7 +252,7 @@ pandemonium dmesg        # Filtered kernel log for sched_ext/pandemonium
 Per-second telemetry (printed to stdout while running):
 
 ```
-d/s: 35402  idle: 3% shared: 32898  preempt: 5  keep: 0  kick: H=7061 S=25670 enq: W=7163 R=25735 wake: 8us p99: 100us lat_idle: 4us lat_kick: 9us affin: 0 procdb: 42/5 sleep: io=87% slice: 4000us guard: 0 [HEAVY]
+d/s: 251000  idle: 5% shared: 230000  preempt: 12  keep: 0  kick: H=8000 S=22000 enq: W=8000 R=22000 wake: 4us p99: 10us L2: B=67% I=72% LC=85% procdb: 42/5 sleep: io=87% guard: 0 [MIXED] stable: 10
 ```
 
 | Counter | Meaning |
@@ -242,18 +260,17 @@ d/s: 35402  idle: 3% shared: 32898  preempt: 5  keep: 0  kick: H=7061 S=25670 en
 | d/s | Total dispatches per second |
 | idle | Placed via select_cpu idle fast path (%) |
 | shared | Enqueue -> per-node DSQ |
-| preempt | BPF timer preemptions |
+| preempt | Tick preemptions (batch task yielded) |
 | kick H/S | Hard (PREEMPT) / Soft (nudge) kicks |
 | enq W/R | Wakeup / Re-enqueue counts |
 | wake | Average wakeup-to-run latency |
 | p99 | P99 wakeup latency (from histogram) |
-| lat_idle/kick | Per-path average latency |
-| affin | Cache-affinity dispatch hits |
+| L2: B/I/LC | L2 cache hit rate per tier (Batch/Interactive/Lat_Critical) |
 | procdb | Total profiles / confident predictions |
 | sleep: io | I/O-wait sleep pattern percentage |
-| slice | Current slice_ns knob value |
 | guard | Batch slices clamped by interactive guard |
-| [REGIME] | Current workload regime (MIXED/HEAVY) |
+| [REGIME] | Current workload regime (LIGHT/MIXED/HEAVY) |
+| stable | Consecutive stable ticks (hibernates at 10) |
 
 ## Benchmarking
 
@@ -275,8 +292,7 @@ Results are archived to `~/.cache/pandemonium/{version}-{timestamp}.json` for cr
 
 ```bash
 # Unit tests (no root required)
-cargo test --release --test event
-cargo test --release --test procdb
+CARGO_TARGET_DIR=/tmp/pandemonium-build cargo test --release
 
 # Full test gate (requires root + sched_ext kernel)
 pandemonium test
@@ -285,25 +301,21 @@ pandemonium test
 ./pandemonium.py bench-scale
 ```
 
-### Test Gate
+66 tests across 5 test files:
 
-| Layer | Name | What it tests |
-|-------|------|---------------|
-| 0 | procdb | Profile confidence, eviction, persistence (save/load round-trip), determinism (22 tests) |
-| 1 | Unit tests | Ring buffer, snapshot recording, summary/dump |
-| 2 | Load/Classify/Unload | BPF lifecycle, dispatch stats, classification |
-| 3 | Latency gate | cyclictest under scheduler (avg latency threshold) |
-| 4 | Interactive | Wakeup overshoot (median < 500us) |
-| 5 | Contention | Interactive latency under full CPU saturation |
-
-### Scaling Benchmark
-
-`tests/scale.rs`: A/B comparison at each core count [2, 4, 8, max] via CPU hotplug. Pins stress workers to CPUs via `sched_setaffinity`, reserves 1 core for interactive probe. 15-second phases per scheduler per core count. Reports median, P99, and worst wakeup latency with deltas and adaptive gain.
+| File | Tests | Coverage |
+|------|-------|----------|
+| tests/adaptive.rs | 33 | Regime detection, tuning knobs, stability scoring, L2 feedback, hibernate, telemetry gating |
+| tests/procdb.rs | 22 | Profile confidence, eviction, persistence, determinism |
+| tests/event.rs | 5 | Ring buffer, snapshot, summary |
+| src/main.rs | 6 | Topology parsing |
+| tests/gate.rs | 5 | BPF lifecycle, latency, contention (require root) |
 
 ## Attribution
 
 - `include/scx/*` headers from the [sched_ext](https://github.com/sched-ext/scx) project (GPL-2.0)
 - vmlinux.h generated from the running kernel's BTF (cached after first build)
+- Listed under "Other sched_ext Schedulers" in the [sched-ext/scx README](https://github.com/sched-ext/scx)
 
 ## License
 

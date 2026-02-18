@@ -1,4 +1,4 @@
-// PANDEMONIUM v2.0.0 SHARED INTERFACE
+// PANDEMONIUM v2.1.0 SHARED INTERFACE
 // CONSTANTS AND STRUCTURES SHARED BETWEEN BPF (C23) AND RUST
 
 #ifndef __INTF_H
@@ -12,10 +12,12 @@
 // SINGLE-ELEMENT BPF_MAP_TYPE_ARRAY, UPDATED EVERY 50-1000MS
 struct tuning_knobs {
 	u64 slice_ns;           // BASE TIME SLICE (DEFAULT 1MS)
-	u64 preempt_thresh_ns;  // BPF TIMER PREEMPTION THRESHOLD (DEFAULT 1MS)
+	u64 preempt_thresh_ns;  // TICK PREEMPTION THRESHOLD (DEFAULT 1MS)
 	u64 lag_scale;          // DEADLINE LAG MULTIPLIER (DEFAULT 4)
 	u64 batch_slice_ns;     // BATCH TASK SLICE CEILING (DEFAULT 20MS)
-	u64 timer_interval_ns;  // BPF TIMER INTERVAL (0 = PREEMPTION SCAN DISABLED)
+	u64 cpu_bound_thresh_ns; // CPU-BOUND DEMOTION THRESHOLD (REGIME-DEPENDENT)
+	u64 lat_cri_thresh_high; // CLASSIFIER: LAT_CRITICAL THRESHOLD (DEFAULT 32)
+	u64 lat_cri_thresh_low;  // CLASSIFIER: INTERACTIVE THRESHOLD (DEFAULT 8)
 };
 
 // PER-CPU STATISTICS (BPF_MAP_TYPE_PERCPU_ARRAY VALUE)
@@ -24,7 +26,7 @@ struct pandemonium_stats {
 	u64 nr_dispatches;      // TOTAL TASKS DISPATCHED (ALL PATHS)
 	u64 nr_idle_hits;       // SELECT_CPU FAST PATH -> SCX_DSQ_LOCAL
 	u64 nr_shared;          // ENQUEUE -> PER-NODE SHARED DSQ
-	u64 nr_preempt;         // BPF TIMER PREEMPTIONS (SLICE REDUCTION)
+	u64 nr_preempt;         // TICK PREEMPTIONS (BATCH TASK YIELDED)
 	u64 wake_lat_sum;       // SUM WAKEUP->RUN LATENCY (NS)
 	u64 wake_lat_max;       // MAX WAKEUP->RUN LATENCY (NS)
 	u64 wake_lat_samples;   // COUNT OF WAKEUP LATENCY SAMPLES
@@ -42,6 +44,14 @@ struct pandemonium_stats {
 	u64 nr_procdb_hits;     // ENABLE: PRE-LEARNED CLASSIFICATION APPLIED
 	// DIAGNOSTIC: TASK REACHED running() WITH slice==0 (CAUSES KERNEL WARNING)
 	u64 nr_zero_slice;
+	// L2 CACHE AFFINITY INSTRUMENTATION (PHASE 2: MEASURE)
+	// COUNTED IN select_cpu() IDLE PATH AND enqueue() TIER 1
+	u64 nr_l2_hit_batch;
+	u64 nr_l2_miss_batch;
+	u64 nr_l2_hit_interactive;
+	u64 nr_l2_miss_interactive;
+	u64 nr_l2_hit_lat_crit;
+	u64 nr_l2_miss_lat_crit;
 };
 
 // WAKEUP LATENCY SAMPLE -- PUSHED TO RING BUFFER FOR P99 CALCULATION

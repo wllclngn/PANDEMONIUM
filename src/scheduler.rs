@@ -1,4 +1,4 @@
-// PANDEMONIUM v2.0.0 SCHEDULER
+// PANDEMONIUM v2.1.0 SCHEDULER
 // WRAPS THE BPF SKELETON: OPEN, CONFIGURE, LOAD, ATTACH, SHUTDOWN
 // MONITORING AND ADAPTIVE CONTROL LIVE IN adaptive.rs
 
@@ -9,6 +9,7 @@ use libbpf_rs::MapCore;
 use libbpf_rs::skel::{OpenSkel, SkelBuilder};
 
 use crate::bpf_skel::*;
+use crate::tuning::TuningKnobs;
 use pandemonium::event::EventLog;
 
 // SCX EXIT CODES (FROM KERNEL)
@@ -43,30 +44,15 @@ pub struct PandemoniumStats {
     pub nr_affinity_hits: u64,
     pub nr_procdb_hits: u64,
     pub nr_zero_slice: u64,
+    pub nr_l2_hit_batch: u64,
+    pub nr_l2_miss_batch: u64,
+    pub nr_l2_hit_interactive: u64,
+    pub nr_l2_miss_interactive: u64,
+    pub nr_l2_hit_lat_crit: u64,
+    pub nr_l2_miss_lat_crit: u64,
 }
 
-// MATCHES struct tuning_knobs IN BPF (intf.h)
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct TuningKnobs {
-    pub slice_ns: u64,
-    pub preempt_thresh_ns: u64,
-    pub lag_scale: u64,
-    pub batch_slice_ns: u64,
-    pub timer_interval_ns: u64,
-}
-
-impl Default for TuningKnobs {
-    fn default() -> Self {
-        Self {
-            slice_ns: 1_000_000,
-            preempt_thresh_ns: 1_000_000,
-            lag_scale: 4,
-            batch_slice_ns: 20_000_000,
-            timer_interval_ns: 0,
-        }
-    }
-}
+// TuningKnobs lives in tuning.rs (zero BPF dependencies, testable offline)
 
 const KNOBS_PIN: &str = "/sys/fs/bpf/pandemonium/tuning_knobs";
 
@@ -136,6 +122,10 @@ impl<'a> Scheduler<'a> {
         std::fs::remove_file(init_pin).ok();
         skel.maps.task_class_init.pin(init_pin)?;
 
+        let compositor_pin = "/sys/fs/bpf/pandemonium/compositor_map";
+        std::fs::remove_file(compositor_pin).ok();
+        skel.maps.compositor_map.pin(compositor_pin)?;
+
         Ok(Self {
             skel,
             _link: link,
@@ -180,6 +170,12 @@ impl<'a> Scheduler<'a> {
                 total.nr_affinity_hits += stats.nr_affinity_hits;
                 total.nr_procdb_hits += stats.nr_procdb_hits;
                 total.nr_zero_slice += stats.nr_zero_slice;
+                total.nr_l2_hit_batch += stats.nr_l2_hit_batch;
+                total.nr_l2_miss_batch += stats.nr_l2_miss_batch;
+                total.nr_l2_hit_interactive += stats.nr_l2_hit_interactive;
+                total.nr_l2_miss_interactive += stats.nr_l2_miss_interactive;
+                total.nr_l2_hit_lat_crit += stats.nr_l2_hit_lat_crit;
+                total.nr_l2_miss_lat_crit += stats.nr_l2_miss_lat_crit;
             }
         }
 
@@ -237,6 +233,17 @@ impl<'a> Scheduler<'a> {
         Ok(())
     }
 
+    // POPULATE COMPOSITOR MAP ENTRY
+    pub fn write_compositor(&self, name: &str) -> Result<()> {
+        let mut key = [0u8; 16];
+        let bytes = name.as_bytes();
+        let len = bytes.len().min(15);
+        key[..len].copy_from_slice(&bytes[..len]);
+        let val = [1u8];
+        self.skel.maps.compositor_map.update(&key, &val, libbpf_rs::MapFlags::ANY)?;
+        Ok(())
+    }
+
     // READ UEI EXIT INFO. RETURNS (should_restart).
     pub fn read_exit_info(&self) -> bool {
         let data = self.skel.maps.data_data.as_ref().unwrap();
@@ -282,6 +289,7 @@ impl Drop for Scheduler<'_> {
         let _ = self.skel.maps.cache_domain.unpin("/sys/fs/bpf/pandemonium/cache_domain");
         let _ = self.skel.maps.task_class_observe.unpin("/sys/fs/bpf/pandemonium/task_class_observe");
         let _ = self.skel.maps.task_class_init.unpin("/sys/fs/bpf/pandemonium/task_class_init");
+        let _ = self.skel.maps.compositor_map.unpin("/sys/fs/bpf/pandemonium/compositor_map");
         let _ = std::fs::remove_dir("/sys/fs/bpf/pandemonium");
     }
 }

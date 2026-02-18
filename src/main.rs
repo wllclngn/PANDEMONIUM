@@ -17,6 +17,7 @@ mod cli;
 mod procdb;
 mod scheduler;
 mod topology;
+mod tuning;
 
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,6 +33,7 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 #[derive(Parser)]
 #[command(name = "pandemonium")]
+#[command(version)]
 #[command(about = "PANDEMONIUM -- ADAPTIVE LINUX SCHEDULER")]
 struct Cli {
     #[command(subcommand)]
@@ -50,6 +52,10 @@ struct Cli {
     /// Run BPF scheduler only, disable Rust adaptive control loop
     #[arg(long)]
     no_adaptive: bool,
+
+    /// Additional compositor process names to boost to LAT_CRITICAL
+    #[arg(long)]
+    compositor: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -151,9 +157,10 @@ fn main() -> Result<()> {
     let dump_log = cli.dump_log;
     let nr_cpus = cli.nr_cpus;
     let no_adaptive = cli.no_adaptive;
+    let extra_compositors = cli.compositor;
 
     match cli.command {
-        None => run_scheduler(verbose, dump_log, nr_cpus, no_adaptive),
+        None => run_scheduler(verbose, dump_log, nr_cpus, no_adaptive, &extra_compositors),
         Some(SubCmd::Check) => cli::check::run_check(),
         Some(SubCmd::Probe(args)) => {
             cli::probe::run_probe(args.death_pipe_fd);
@@ -182,7 +189,12 @@ fn main() -> Result<()> {
     }
 }
 
-fn run_scheduler(verbose: bool, dump_log: bool, nr_cpus: Option<u64>, no_adaptive: bool) -> Result<()> {
+// DEFAULT COMPOSITORS: BOOSTED TO LAT_CRITICAL VIA BPF MAP LOOKUP
+const DEFAULT_COMPOSITORS: &[&str] = &[
+    "kwin", "gnome-shell", "sway", "Hyprland", "picom", "weston",
+];
+
+fn run_scheduler(verbose: bool, dump_log: bool, nr_cpus: Option<u64>, no_adaptive: bool, extra_compositors: &[String]) -> Result<()> {
     ctrlc::set_handler(move || {
         SHUTDOWN.store(true, Ordering::Relaxed);
     })?;
@@ -197,7 +209,7 @@ fn run_scheduler(verbose: bool, dump_log: bool, nr_cpus: Option<u64>, no_adaptiv
     .trim()
     .to_string();
 
-    log_info!("PANDEMONIUM v2.0.0");
+    log_info!("PANDEMONIUM v2.1.0");
     log_info!(
         "CPUS: {} (governor: {})",
         nr_cpus_display,
@@ -225,6 +237,18 @@ fn run_scheduler(verbose: bool, dump_log: bool, nr_cpus: Option<u64>, no_adaptiv
                 }
             }
             Err(e) => log_warn!("CACHE TOPOLOGY DETECT FAILED: {}", e),
+        }
+
+        // POPULATE COMPOSITOR MAP: DEFAULT + USER-SUPPLIED NAMES
+        for name in DEFAULT_COMPOSITORS {
+            if let Err(e) = sched.write_compositor(name) {
+                log_warn!("COMPOSITOR MAP WRITE FAILED: {} ({})", name, e);
+            }
+        }
+        for name in extra_compositors {
+            if let Err(e) = sched.write_compositor(name) {
+                log_warn!("COMPOSITOR MAP WRITE FAILED: {} ({})", name, e);
+            }
         }
 
         let should_restart = if !adaptive {
@@ -263,16 +287,26 @@ fn run_scheduler(verbose: bool, dump_log: bool, nr_cpus: Option<u64>, no_adaptiv
                 let delta_guard = stats.nr_guard_clamps.wrapping_sub(prev.nr_guard_clamps);
                 let delta_affin = stats.nr_affinity_hits.wrapping_sub(prev.nr_affinity_hits);
                 let delta_procdb = stats.nr_procdb_hits.wrapping_sub(prev.nr_procdb_hits);
-                // DIAGNOSTIC: delta_zero commented out -- ~0.03% rate, not throughput issue
-                // let delta_zero = stats.nr_zero_slice.wrapping_sub(prev.nr_zero_slice);
+
+                // L2 CACHE AFFINITY DELTAS
+                let dl2_hb = stats.nr_l2_hit_batch.wrapping_sub(prev.nr_l2_hit_batch);
+                let dl2_mb = stats.nr_l2_miss_batch.wrapping_sub(prev.nr_l2_miss_batch);
+                let dl2_hi = stats.nr_l2_hit_interactive.wrapping_sub(prev.nr_l2_hit_interactive);
+                let dl2_mi = stats.nr_l2_miss_interactive.wrapping_sub(prev.nr_l2_miss_interactive);
+                let dl2_hl = stats.nr_l2_hit_lat_crit.wrapping_sub(prev.nr_l2_hit_lat_crit);
+                let dl2_ml = stats.nr_l2_miss_lat_crit.wrapping_sub(prev.nr_l2_miss_lat_crit);
+                let l2_pct_b = if dl2_hb + dl2_mb > 0 { dl2_hb * 100 / (dl2_hb + dl2_mb) } else { 0 };
+                let l2_pct_i = if dl2_hi + dl2_mi > 0 { dl2_hi * 100 / (dl2_hi + dl2_mi) } else { 0 };
+                let l2_pct_l = if dl2_hl + dl2_ml > 0 { dl2_hl * 100 / (dl2_hl + dl2_ml) } else { 0 };
 
                 let idle_pct = if delta_d > 0 { delta_idle * 100 / delta_d } else { 0 };
 
                 println!(
-                    "d/s: {:<8} idle: {}% shared: {:<6} preempt: {:<4} keep: {:<4} kick: H={:<4} S={:<4} enq: W={:<4} R={:<4} wake: {}us lat_idle: {}us lat_kick: {}us affin: {} procdb: {} guard: {} [BPF]",
+                    "d/s: {:<8} idle: {}% shared: {:<6} preempt: {:<4} keep: {:<4} kick: H={:<4} S={:<4} enq: W={:<4} R={:<4} wake: {}us lat_idle: {}us lat_kick: {}us affin: {} procdb: {} guard: {} l2: B={}% I={}% L={}% [BPF]",
                     delta_d, idle_pct, delta_shared, delta_preempt, delta_keep,
                     delta_hard, delta_soft, delta_enq_wake, delta_enq_requeue,
                     wake_avg_us, lat_idle_us, lat_kick_us, delta_affin, delta_procdb, delta_guard,
+                    l2_pct_b, l2_pct_i, l2_pct_l,
                 );
 
                 sched.log.snapshot(
@@ -286,11 +320,18 @@ fn run_scheduler(verbose: bool, dump_log: bool, nr_cpus: Option<u64>, no_adaptiv
 
             // KNOBS SUMMARY: CAPTURED BY TEST HARNESS FOR ARCHIVE
             let knobs = sched.read_tuning_knobs();
+            let final_stats = sched.read_stats();
+            let l2_total_b = final_stats.nr_l2_hit_batch + final_stats.nr_l2_miss_batch;
+            let l2_total_i = final_stats.nr_l2_hit_interactive + final_stats.nr_l2_miss_interactive;
+            let l2_total_l = final_stats.nr_l2_hit_lat_crit + final_stats.nr_l2_miss_lat_crit;
+            let l2_cum_b = if l2_total_b > 0 { final_stats.nr_l2_hit_batch * 100 / l2_total_b } else { 0 };
+            let l2_cum_i = if l2_total_i > 0 { final_stats.nr_l2_hit_interactive * 100 / l2_total_i } else { 0 };
+            let l2_cum_l = if l2_total_l > 0 { final_stats.nr_l2_hit_lat_crit * 100 / l2_total_l } else { 0 };
             println!(
-                "[KNOBS] regime=BPF slice_ns={} batch_ns={} preempt_ns={} timer_ns={} lag={}",
+                "[KNOBS] regime=BPF slice_ns={} batch_ns={} preempt_ns={} demotion_ns={} lag={} l2_hit=B:{}%/I:{}%/L:{}%",
                 knobs.slice_ns, knobs.batch_slice_ns,
-                knobs.preempt_thresh_ns, knobs.timer_interval_ns,
-                knobs.lag_scale,
+                knobs.preempt_thresh_ns, knobs.cpu_bound_thresh_ns,
+                knobs.lag_scale, l2_cum_b, l2_cum_i, l2_cum_l,
             );
 
             sched.read_exit_info()

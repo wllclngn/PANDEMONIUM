@@ -1,4 +1,4 @@
-// PANDEMONIUM v2.0.0 ADAPTIVE CONTROL LOOP
+// PANDEMONIUM v2.1.0 ADAPTIVE CONTROL LOOP
 // EVENT-DRIVEN CLOSED-LOOP TUNING SYSTEM
 //
 // TWO THREADS, ZERO MUTEXES:
@@ -10,7 +10,7 @@
 // BPF PRODUCES EVENTS, RUST REACTS. RUST WRITES KNOBS, BPF READS THEM
 // ON THE VERY NEXT SCHEDULING DECISION. ONE SYSTEM, NOT TWO.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,49 +18,14 @@ use anyhow::Result;
 use libbpf_rs::MapCore;
 
 use crate::procdb::ProcessDb;
-use crate::scheduler::{PandemoniumStats, Scheduler, TuningKnobs};
+use crate::scheduler::{PandemoniumStats, Scheduler};
+use crate::tuning::{self, Regime, TuningKnobs, regime_knobs, detect_regime};
 
-// --- REGIME THRESHOLDS (SCHMITT TRIGGER) ---
-// DIRECTIONAL HYSTERESIS PREVENTS OSCILLATION AT REGIME BOUNDARIES.
-// WIDE DEAD ZONES: MUST CLEARLY ENTER A REGIME AND CLEARLY LEAVE IT.
-// ENTER/EXIT SEPARATION ELIMINATES THE POSITIVE FEEDBACK LOOP THAT
-// CAUSED HEAVY<->MIXED THRASHING AT 12+ CORES.
-
-const HEAVY_ENTER_PCT: u64 = 10;   // ENTER HEAVY: IDLE < 10%
-const HEAVY_EXIT_PCT: u64  = 25;   // LEAVE HEAVY: IDLE > 25%
-const LIGHT_ENTER_PCT: u64 = 50;   // ENTER LIGHT: IDLE > 50%
-const LIGHT_EXIT_PCT: u64  = 30;   // LEAVE LIGHT: IDLE < 30%
-
-// --- REGIME PROFILES ---
-// BPF TIMER ALWAYS ON AT 1MS. SCANS FOR BATCH TASKS BLOCKING INTERACTIVE.
-// PREEMPT_THRESH CONTROLS WHEN TIMER PREEMPTS (ONLY IF TASKS WAITING IN DSQ).
-// BATCH_SLICE_NS CONTROLS MAX UNINTERRUPTED BATCH RUN WHEN NO INTERACTIVE WAITING.
-// RESULT: INTERACTIVE LATENCY CAPPED AT ~1MS (TIMER PERIOD) REGARDLESS OF BATCH SLICE.
-
-const LIGHT_SLICE_NS: u64     = 2_000_000;   // 2MS: TIMER PREEMPTS BATCH AFTER 2MS IF INTERACTIVE WAITING
-const LIGHT_PREEMPT_NS: u64   = 1_000_000;   // 1MS: AGGRESSIVE -- IDLE CPUs AVAILABLE, LOW OVERHEAD
-const LIGHT_LAG_SCALE: u64    = 6;
-const LIGHT_P99_CEIL_NS: u64  = 3_000_000;   // 3MS: TIGHT BUT REALISTIC FOR LIGHT LOAD
-const LIGHT_BATCH_NS: u64     = 20_000_000;  // 20MS: NO CONTENTION, LET BATCH RIP
-const LIGHT_TIMER_NS: u64     = 2_000_000;   // 2MS: IDLE CPUs HANDLE DISPATCH, TIMER IS SAFETY NET
-
-const MIXED_SLICE_NS: u64     = 1_000_000;   // 1MS: TIGHT INTERACTIVE CONTROL UNDER CONTENTION
-const MIXED_PREEMPT_NS: u64   = 1_000_000;   // 1MS: MATCH TIMER FOR CLEAN ENFORCEMENT
-const MIXED_LAG_SCALE: u64    = 4;
-const MIXED_P99_CEIL_NS: u64  = 5_000_000;   // 5MS: BELOW 16MS FRAME BUDGET
-const MIXED_BATCH_NS: u64     = 16_000_000;  // 16MS: WIDER -- BPF KICK HANDLES INTERACTIVE LATENCY DIRECTLY
-const MIXED_TIMER_NS: u64     = 1_000_000;   // 1MS: MIXED NEEDS FAST RESPONSE
-
-const HEAVY_SLICE_NS: u64     = 4_000_000;   // 4MS: WIDER UNDER SATURATION FOR THROUGHPUT
-const HEAVY_PREEMPT_NS: u64   = 2_000_000;   // 2MS: SLIGHTLY RELAXED -- EVERYTHING IS CONTENDING
-const HEAVY_LAG_SCALE: u64    = 2;
-const HEAVY_P99_CEIL_NS: u64  = 10_000_000;  // 10MS: HEAVY LOAD, REALISTIC CEILING
-const HEAVY_BATCH_NS: u64     = 20_000_000;  // 20MS: BPF KICK + TIMER OWN LATENCY, LET BATCH RIP
-const HEAVY_TIMER_NS: u64     = 2_000_000;   // 2MS: HALVES TIMER OVERHEAD UNDER SATURATION
+// REGIME THRESHOLDS, PROFILES, AND KNOB COMPUTATION LIVE IN tuning.rs
+// (ZERO BPF DEPENDENCIES, TESTABLE OFFLINE)
 
 // --- REFLEX PARAMETERS ---
 
-const SAMPLES_PER_CHECK: u64 = 64;
 const COOLDOWN_CHECKS: u32   = 2;
 const MIN_SLICE_NS: u64      = 500_000;   // 500US FLOOR -- ALLOWS 5 TIGHTEN STEPS FROM 2MS BASELINE
 
@@ -107,66 +72,6 @@ struct WakeLatSample {
     _pad:     [u8; 2],
 }
 
-#[repr(u8)]
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Regime {
-    Light = 0,
-    Mixed = 1,
-    Heavy = 2,
-}
-
-impl Regime {
-    fn from_u8(v: u8) -> Self {
-        match v {
-            0 => Self::Light,
-            1 => Self::Mixed,
-            _ => Self::Heavy,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Light => "LIGHT",
-            Self::Mixed => "MIXED",
-            Self::Heavy => "HEAVY",
-        }
-    }
-
-    fn p99_ceiling(self) -> u64 {
-        match self {
-            Self::Light => LIGHT_P99_CEIL_NS,
-            Self::Mixed => MIXED_P99_CEIL_NS,
-            Self::Heavy => HEAVY_P99_CEIL_NS,
-        }
-    }
-}
-
-fn regime_knobs(r: Regime) -> TuningKnobs {
-    match r {
-        Regime::Light => TuningKnobs {
-            slice_ns: LIGHT_SLICE_NS,
-            preempt_thresh_ns: LIGHT_PREEMPT_NS,
-            lag_scale: LIGHT_LAG_SCALE,
-            batch_slice_ns: LIGHT_BATCH_NS,
-            timer_interval_ns: LIGHT_TIMER_NS,
-        },
-        Regime::Mixed => TuningKnobs {
-            slice_ns: MIXED_SLICE_NS,
-            preempt_thresh_ns: MIXED_PREEMPT_NS,
-            lag_scale: MIXED_LAG_SCALE,
-            batch_slice_ns: MIXED_BATCH_NS,
-            timer_interval_ns: MIXED_TIMER_NS,
-        },
-        Regime::Heavy => TuningKnobs {
-            slice_ns: HEAVY_SLICE_NS,
-            preempt_thresh_ns: HEAVY_PREEMPT_NS,
-            lag_scale: HEAVY_LAG_SCALE,
-            batch_slice_ns: HEAVY_BATCH_NS,
-            timer_interval_ns: HEAVY_TIMER_NS,
-        },
-    }
-}
-
 // --- SHARED STATE (ATOMICS ONLY, NO MUTEX) ---
 
 const ATOMIC_ZERO: AtomicU64 = AtomicU64::new(0);
@@ -179,6 +84,7 @@ pub struct SharedState {
     sleep_histogram: [AtomicU64; SLEEP_BUCKETS],
     sleep_count: AtomicU64,
     pub reflex_events: AtomicU64,
+    pub samples_per_check: AtomicU32,
 }
 
 impl SharedState {
@@ -191,6 +97,7 @@ impl SharedState {
             sleep_histogram: [ATOMIC_ZERO; SLEEP_BUCKETS],
             sleep_count: AtomicU64::new(0),
             reflex_events: AtomicU64::new(0),
+            samples_per_check: AtomicU32::new(tuning::MIXED_SAMPLES_PER_CHECK),
         }
     }
 
@@ -315,7 +222,8 @@ pub fn reflex_thread(
 
         // CHECK IF ENOUGH SAMPLES ACCUMULATED FOR A P99 COMPUTATION
         let count = shared.sample_count.load(Ordering::Relaxed);
-        if count < SAMPLES_PER_CHECK {
+        let threshold = shared.samples_per_check.load(Ordering::Relaxed) as u64;
+        if count < threshold {
             continue;
         }
 
@@ -360,14 +268,11 @@ fn tighten_knobs(handle: &libbpf_rs::MapHandle) {
     };
 
     let new_slice = (current.slice_ns * 3 / 4).max(MIN_SLICE_NS);
-    // ONLY TIGHTEN SLICE + PREEMPT. BATCH_SLICE_NS STAYS WIDE FOR THROUGHPUT.
-    // THE BPF TIMER HANDLES INTERACTIVE PREEMPTION VIA preempt_thresh_ns.
+    // ONLY TIGHTEN SLICE + PREEMPT. ALL OTHER KNOBS PRESERVED.
     let knobs = TuningKnobs {
         slice_ns: new_slice,
         preempt_thresh_ns: new_slice,
-        lag_scale: current.lag_scale,
-        batch_slice_ns: current.batch_slice_ns,
-        timer_interval_ns: current.timer_interval_ns,
+        ..current
     };
 
     let value = unsafe {
@@ -398,6 +303,11 @@ pub fn monitor_loop(
     let mut light_ticks: u64 = 0;
     let mut mixed_ticks: u64 = 0;
     let mut heavy_ticks: u64 = 0;
+    let mut stability_score: u32 = 0;
+    let mut prev_reflex_events: u64 = 0;
+    let mut l2_low_ticks: u32 = 0;
+    let mut l2_high_ticks: u32 = 0;
+    let mut tick_counter: u64 = 0;
 
     let mut procdb = match ProcessDb::new() {
         Ok(db) => Some(db),
@@ -446,6 +356,17 @@ pub fn monitor_loop(
         // DIAGNOSTIC: delta_zero commented out -- ~0.03% rate, not throughput issue
         // let delta_zero = stats.nr_zero_slice.wrapping_sub(prev.nr_zero_slice);
 
+        // L2 CACHE AFFINITY DELTAS
+        let dl2_hb = stats.nr_l2_hit_batch.wrapping_sub(prev.nr_l2_hit_batch);
+        let dl2_mb = stats.nr_l2_miss_batch.wrapping_sub(prev.nr_l2_miss_batch);
+        let dl2_hi = stats.nr_l2_hit_interactive.wrapping_sub(prev.nr_l2_hit_interactive);
+        let dl2_mi = stats.nr_l2_miss_interactive.wrapping_sub(prev.nr_l2_miss_interactive);
+        let dl2_hl = stats.nr_l2_hit_lat_crit.wrapping_sub(prev.nr_l2_hit_lat_crit);
+        let dl2_ml = stats.nr_l2_miss_lat_crit.wrapping_sub(prev.nr_l2_miss_lat_crit);
+        let l2_pct_b = if dl2_hb + dl2_mb > 0 { dl2_hb * 100 / (dl2_hb + dl2_mb) } else { 0 };
+        let l2_pct_i = if dl2_hi + dl2_mi > 0 { dl2_hi * 100 / (dl2_hi + dl2_mi) } else { 0 };
+        let l2_pct_l = if dl2_hl + dl2_ml > 0 { dl2_hl * 100 / (dl2_hl + dl2_ml) } else { 0 };
+
         let idle_pct = if delta_d > 0 {
             delta_idle * 100 / delta_d
         } else {
@@ -453,36 +374,11 @@ pub fn monitor_loop(
         };
 
         // DETECT REGIME (SCHMITT TRIGGER + 2-TICK HOLD)
-        // DIRECTION-AWARE: CURRENT REGIME DETERMINES WHICH THRESHOLDS APPLY.
-        // DEAD ZONES PREVENT THE OSCILLATION THAT SINGLE-BOUNDARY DETECTION CAUSED.
-        let detected = match regime {
-            Regime::Light => {
-                if idle_pct < LIGHT_EXIT_PCT {
-                    Regime::Mixed
-                } else {
-                    Regime::Light
-                }
-            }
-            Regime::Mixed => {
-                if idle_pct > LIGHT_ENTER_PCT {
-                    Regime::Light
-                } else if idle_pct < HEAVY_ENTER_PCT {
-                    Regime::Heavy
-                } else {
-                    Regime::Mixed
-                }
-            }
-            Regime::Heavy => {
-                if idle_pct > HEAVY_EXIT_PCT {
-                    Regime::Mixed
-                } else {
-                    Regime::Heavy
-                }
-            }
-        };
+        let detected = detect_regime(regime, idle_pct);
 
         let p99_ns = shared.p99_ns.load(Ordering::Relaxed);
 
+        let mut regime_changed_this_tick = false;
         if detected != regime {
             if detected == pending_regime {
                 regime_hold += 1;
@@ -494,6 +390,9 @@ pub fn monitor_loop(
                 regime = detected;
                 shared.set_regime(regime);
                 sched.write_tuning_knobs(&regime_knobs(regime))?;
+                regime_changed_this_tick = true;
+                l2_low_ticks = 0;
+                l2_high_ticks = 0;
                 tightened = false;
                 relax_counter = 0;
             }
@@ -517,9 +416,8 @@ pub fn monitor_loop(
                             slice_ns: new_slice,
                             preempt_thresh_ns: baseline.preempt_thresh_ns
                                 .min(new_slice),
-                            lag_scale: baseline.lag_scale,
-                            batch_slice_ns: baseline.batch_slice_ns,
-                            timer_interval_ns: baseline.timer_interval_ns,
+                            batch_slice_ns: current.batch_slice_ns,
+                            ..baseline
                         };
                         sched.write_tuning_knobs(&knobs)?;
                         if new_slice >= baseline.slice_ns {
@@ -545,6 +443,41 @@ pub fn monitor_loop(
             }
         }
 
+        // L2 BATCH SLICE FEEDBACK: CLOSED-LOOP CONTROL ON L2 HIT RATE
+        let current_knobs = sched.read_tuning_knobs();
+        let baseline = regime_knobs(regime);
+        let (new_batch_ns, new_low, new_high) = tuning::adjust_batch_slice(
+            current_knobs.batch_slice_ns,
+            baseline.batch_slice_ns,
+            l2_pct_b,
+            l2_low_ticks,
+            l2_high_ticks,
+        );
+        l2_low_ticks = new_low;
+        l2_high_ticks = new_high;
+        if new_batch_ns != current_knobs.batch_slice_ns {
+            let knobs = TuningKnobs {
+                batch_slice_ns: new_batch_ns,
+                ..current_knobs
+            };
+            sched.write_tuning_knobs(&knobs)?;
+        }
+
+        // STABILITY TRACKING: HIBERNATE REFLEX THREAD WHEN STABLE
+        let reflex_now = shared.reflex_events.load(Ordering::Relaxed);
+        let reflex_delta = reflex_now.wrapping_sub(prev_reflex_events);
+        prev_reflex_events = reflex_now;
+        stability_score = tuning::compute_stability_score(
+            stability_score,
+            regime_changed_this_tick,
+            delta_guard,
+            reflex_delta,
+            p99_ns,
+            regime.p99_ceiling(),
+        );
+        let new_spc = tuning::hibernate_samples_per_check(regime, stability_score);
+        shared.samples_per_check.store(new_spc, Ordering::Relaxed);
+
         // PROCESS CLASSIFICATION DATABASE: INGEST, PREDICT, EVICT
         let (db_total, db_confident) = if let Some(ref mut db) = procdb {
             db.ingest();
@@ -561,14 +494,17 @@ pub fn monitor_loop(
         let p99_us = p99_ns / 1000;
         let knobs = sched.read_tuning_knobs();
 
-        println!(
-            "d/s: {:<8} idle: {}% shared: {:<6} preempt: {:<4} keep: {:<4} kick: H={:<4} S={:<4} enq: W={:<4} R={:<4} wake: {}us p99: {}us lat_idle: {}us lat_kick: {}us affin: {} procdb: {}/{} sleep: io={}% slice: {}us guard: {} [{}]",
-            delta_d, idle_pct, delta_shared, delta_preempt, delta_keep,
-            delta_hard, delta_soft, delta_enq_wake, delta_enq_requeue,
-            wake_avg_us, p99_us, lat_idle_us, lat_kick_us,
-            delta_affin, db_total, db_confident,
-            io_pct, knobs.slice_ns / 1000, delta_guard, regime.label(),
-        );
+        if tuning::should_print_telemetry(tick_counter, stability_score) {
+            println!(
+                "d/s: {:<8} idle: {}% shared: {:<6} preempt: {:<4} keep: {:<4} kick: H={:<4} S={:<4} enq: W={:<4} R={:<4} wake: {}us p99: {}us lat_idle: {}us lat_kick: {}us affin: {} procdb: {}/{} sleep: io={}% slice: {}us guard: {} l2: B={}% I={}% L={}% [{}]",
+                delta_d, idle_pct, delta_shared, delta_preempt, delta_keep,
+                delta_hard, delta_soft, delta_enq_wake, delta_enq_requeue,
+                wake_avg_us, p99_us, lat_idle_us, lat_kick_us,
+                delta_affin, db_total, db_confident,
+                io_pct, knobs.slice_ns / 1000, delta_guard,
+                l2_pct_b, l2_pct_i, l2_pct_l, regime.label(),
+            );
+        }
 
         sched.log.snapshot(
             delta_d, delta_idle, delta_shared,
@@ -582,6 +518,7 @@ pub fn monitor_loop(
             Regime::Heavy => heavy_ticks += 1,
         }
 
+        tick_counter += 1;
         prev = stats;
     }
 
@@ -600,12 +537,20 @@ pub fn monitor_loop(
     // KNOBS SUMMARY: CAPTURED BY TEST HARNESS FOR ARCHIVE
     let final_knobs = sched.read_tuning_knobs();
     let reflex_count = shared.reflex_events.load(Ordering::Relaxed);
+    let final_stats = sched.read_stats();
+    let l2_total_b = final_stats.nr_l2_hit_batch + final_stats.nr_l2_miss_batch;
+    let l2_total_i = final_stats.nr_l2_hit_interactive + final_stats.nr_l2_miss_interactive;
+    let l2_total_l = final_stats.nr_l2_hit_lat_crit + final_stats.nr_l2_miss_lat_crit;
+    let l2_cum_b = if l2_total_b > 0 { final_stats.nr_l2_hit_batch * 100 / l2_total_b } else { 0 };
+    let l2_cum_i = if l2_total_i > 0 { final_stats.nr_l2_hit_interactive * 100 / l2_total_i } else { 0 };
+    let l2_cum_l = if l2_total_l > 0 { final_stats.nr_l2_hit_lat_crit * 100 / l2_total_l } else { 0 };
     println!(
-        "[KNOBS] regime={} slice_ns={} batch_ns={} preempt_ns={} timer_ns={} lag={} tightened={} reflex={} ticks=L:{}/M:{}/H:{}",
+        "[KNOBS] regime={} slice_ns={} batch_ns={} preempt_ns={} demotion_ns={} lag={} tightened={} reflex={} ticks=L:{}/M:{}/H:{} l2_hit=B:{}%/I:{}%/L:{}%",
         regime.label(), final_knobs.slice_ns, final_knobs.batch_slice_ns,
-        final_knobs.preempt_thresh_ns, final_knobs.timer_interval_ns,
+        final_knobs.preempt_thresh_ns, final_knobs.cpu_bound_thresh_ns,
         final_knobs.lag_scale, tightened, reflex_count,
         light_ticks, mixed_ticks, heavy_ticks,
+        l2_cum_b, l2_cum_i, l2_cum_l,
     );
 
     // READ UEI EXIT REASON
