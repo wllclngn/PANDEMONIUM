@@ -2,7 +2,7 @@
 
 Built in Rust and C23, PANDEMONIUM is a Linux kernel scheduler built for sched_ext. Utilizing BPF patterns, PANDEMONIUM classifies every task by its behavior--wakeup frequency, context switch rate, runtime, sleep patterns--and adapts scheduling decisions in real time. Two-thread adaptive control loop (zero mutexes), three-tier behavioral dispatch, L2 cache affinity instrumentation, workload regime detection, and a persistent process database that learns task classifications across lifetimes.
 
-This project is made possible by contributions from the sched_ext and CachyOS communities within the Linux ecosystem.
+PANDEMONIUM is made possible by contributions from the sched_ext and CachyOS communities within the Linux ecosystem.
 
 ## Performance
 
