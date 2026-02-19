@@ -1,4 +1,4 @@
-// PANDEMONIUM v2.0.0 -- SCHED_EXT KERNEL SCHEDULER
+// PANDEMONIUM -- SCHED_EXT KERNEL SCHEDULER
 // ADAPTIVE DESKTOP SCHEDULING FOR LINUX
 //
 // SCHEDULING DECISIONS HAPPEN IN BPF (ZERO KERNEL-USERSPACE ROUND TRIPS)
@@ -209,7 +209,7 @@ fn run_scheduler(verbose: bool, dump_log: bool, nr_cpus: Option<u64>, no_adaptiv
     .trim()
     .to_string();
 
-    log_info!("PANDEMONIUM v2.1.0");
+    log_info!("PANDEMONIUM v{}", env!("CARGO_PKG_VERSION"));
     log_info!(
         "CPUS: {} (governor: {})",
         nr_cpus_display,
@@ -285,7 +285,6 @@ fn run_scheduler(verbose: bool, dump_log: bool, nr_cpus: Option<u64>, no_adaptiv
                 let lat_idle_us = if d_idle_cnt > 0 { d_idle_sum / d_idle_cnt / 1000 } else { 0 };
                 let lat_kick_us = if d_kick_cnt > 0 { d_kick_sum / d_kick_cnt / 1000 } else { 0 };
                 let delta_guard = stats.nr_guard_clamps.wrapping_sub(prev.nr_guard_clamps);
-                let delta_affin = stats.nr_affinity_hits.wrapping_sub(prev.nr_affinity_hits);
                 let delta_procdb = stats.nr_procdb_hits.wrapping_sub(prev.nr_procdb_hits);
 
                 // L2 CACHE AFFINITY DELTAS
@@ -302,10 +301,10 @@ fn run_scheduler(verbose: bool, dump_log: bool, nr_cpus: Option<u64>, no_adaptiv
                 let idle_pct = if delta_d > 0 { delta_idle * 100 / delta_d } else { 0 };
 
                 println!(
-                    "d/s: {:<8} idle: {}% shared: {:<6} preempt: {:<4} keep: {:<4} kick: H={:<4} S={:<4} enq: W={:<4} R={:<4} wake: {}us lat_idle: {}us lat_kick: {}us affin: {} procdb: {} guard: {} l2: B={}% I={}% L={}% [BPF]",
+                    "d/s: {:<8} idle: {}% shared: {:<6} preempt: {:<4} keep: {:<4} kick: H={:<4} S={:<4} enq: W={:<4} R={:<4} wake: {}us lat_idle: {}us lat_kick: {}us procdb: {} guard: {} l2: B={}% I={}% L={}% [BPF]",
                     delta_d, idle_pct, delta_shared, delta_preempt, delta_keep,
                     delta_hard, delta_soft, delta_enq_wake, delta_enq_requeue,
-                    wake_avg_us, lat_idle_us, lat_kick_us, delta_affin, delta_procdb, delta_guard,
+                    wake_avg_us, lat_idle_us, lat_kick_us, delta_procdb, delta_guard,
                     l2_pct_b, l2_pct_i, l2_pct_l,
                 );
 

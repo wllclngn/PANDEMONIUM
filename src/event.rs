@@ -98,8 +98,6 @@ impl EventLog {
         println!("\n{:<10} {:<12} {:<10} {:<10} {:<10} {:<10} {:<10} {:<8} {:<8} {:<10} {:<10}",
             "TIME_S", "DISPATCH/S", "IDLE/S", "SHARED/S", "PREEMPT", "KEEP_RUN", "WAKE_US",
             "KICK_H", "KICK_S", "LAT_IDLE", "LAT_KICK");
-        println!("{}", "-".repeat(108));
-
         println!("{:<10.1} {:<12} {:<10} {:<10} {:<10} {:<10} {:<10} {:<8} {:<8} {:<10} {:<10}",
             0.0, first.dispatches, first.idle_hits, first.shared,
             first.preempt, first.keep_run, first.wake_avg_us,
@@ -138,9 +136,7 @@ impl EventLog {
         let elapsed_ns = snapshots.last().unwrap().ts_ns - snapshots.first().unwrap().ts_ns;
         let elapsed_s = elapsed_ns as f64 / 1_000_000_000.0;
 
-        println!("\n{}", "=".repeat(50));
-        println!("PANDEMONIUM SUMMARY");
-        println!("{}", "=".repeat(50));
+        println!("\nPANDEMONIUM SUMMARY");
         println!("  TOTAL DISPATCHES:  {}", total_d);
         println!("  TOTAL IDLE HITS:   {}", total_idle);
         println!("  TOTAL SHARED:      {}", total_shared);

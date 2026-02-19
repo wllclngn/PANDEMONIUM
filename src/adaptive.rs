@@ -1,4 +1,4 @@
-// PANDEMONIUM v2.1.0 ADAPTIVE CONTROL LOOP
+// PANDEMONIUM ADAPTIVE CONTROL LOOP
 // EVENT-DRIVEN CLOSED-LOOP TUNING SYSTEM
 //
 // TWO THREADS, ZERO MUTEXES:
@@ -352,9 +352,6 @@ pub fn monitor_loop(
         let lat_idle_us = if d_idle_cnt > 0 { d_idle_sum / d_idle_cnt / 1000 } else { 0 };
         let lat_kick_us = if d_kick_cnt > 0 { d_kick_sum / d_kick_cnt / 1000 } else { 0 };
         let delta_guard = stats.nr_guard_clamps.wrapping_sub(prev.nr_guard_clamps);
-        let delta_affin = stats.nr_affinity_hits.wrapping_sub(prev.nr_affinity_hits);
-        // DIAGNOSTIC: delta_zero commented out -- ~0.03% rate, not throughput issue
-        // let delta_zero = stats.nr_zero_slice.wrapping_sub(prev.nr_zero_slice);
 
         // L2 CACHE AFFINITY DELTAS
         let dl2_hb = stats.nr_l2_hit_batch.wrapping_sub(prev.nr_l2_hit_batch);
@@ -496,11 +493,11 @@ pub fn monitor_loop(
 
         if tuning::should_print_telemetry(tick_counter, stability_score) {
             println!(
-                "d/s: {:<8} idle: {}% shared: {:<6} preempt: {:<4} keep: {:<4} kick: H={:<4} S={:<4} enq: W={:<4} R={:<4} wake: {}us p99: {}us lat_idle: {}us lat_kick: {}us affin: {} procdb: {}/{} sleep: io={}% slice: {}us guard: {} l2: B={}% I={}% L={}% [{}]",
+                "d/s: {:<8} idle: {}% shared: {:<6} preempt: {:<4} keep: {:<4} kick: H={:<4} S={:<4} enq: W={:<4} R={:<4} wake: {}us p99: {}us lat_idle: {}us lat_kick: {}us procdb: {}/{} sleep: io={}% slice: {}us guard: {} l2: B={}% I={}% L={}% [{}]",
                 delta_d, idle_pct, delta_shared, delta_preempt, delta_keep,
                 delta_hard, delta_soft, delta_enq_wake, delta_enq_requeue,
                 wake_avg_us, p99_us, lat_idle_us, lat_kick_us,
-                delta_affin, db_total, db_confident,
+                db_total, db_confident,
                 io_pct, knobs.slice_ns / 1000, delta_guard,
                 l2_pct_b, l2_pct_i, l2_pct_l, regime.label(),
             );

@@ -1,4 +1,4 @@
-// PANDEMONIUM v2.1.0 SCHEDULER
+// PANDEMONIUM SCHEDULER
 // WRAPS THE BPF SKELETON: OPEN, CONFIGURE, LOAD, ATTACH, SHUTDOWN
 // MONITORING AND ADAPTIVE CONTROL LIVE IN adaptive.rs
 
@@ -41,9 +41,7 @@ pub struct PandemoniumStats {
     pub wake_lat_kick_sum: u64,
     pub wake_lat_kick_cnt: u64,
     pub nr_guard_clamps: u64,
-    pub nr_affinity_hits: u64,
     pub nr_procdb_hits: u64,
-    pub nr_zero_slice: u64,
     pub nr_l2_hit_batch: u64,
     pub nr_l2_miss_batch: u64,
     pub nr_l2_hit_interactive: u64,
@@ -51,6 +49,10 @@ pub struct PandemoniumStats {
     pub nr_l2_hit_lat_crit: u64,
     pub nr_l2_miss_lat_crit: u64,
 }
+
+// COMPILE-TIME ABI SAFETY: MUST MATCH STRUCT LAYOUTS IN intf.h
+const _: () = assert!(std::mem::size_of::<PandemoniumStats>() == 192);
+const _: () = assert!(std::mem::size_of::<TuningKnobs>() == 56);
 
 // TuningKnobs lives in tuning.rs (zero BPF dependencies, testable offline)
 
@@ -167,9 +169,7 @@ impl<'a> Scheduler<'a> {
                 total.wake_lat_kick_sum += stats.wake_lat_kick_sum;
                 total.wake_lat_kick_cnt += stats.wake_lat_kick_cnt;
                 total.nr_guard_clamps += stats.nr_guard_clamps;
-                total.nr_affinity_hits += stats.nr_affinity_hits;
                 total.nr_procdb_hits += stats.nr_procdb_hits;
-                total.nr_zero_slice += stats.nr_zero_slice;
                 total.nr_l2_hit_batch += stats.nr_l2_hit_batch;
                 total.nr_l2_miss_batch += stats.nr_l2_miss_batch;
                 total.nr_l2_hit_interactive += stats.nr_l2_hit_interactive;

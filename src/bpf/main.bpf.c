@@ -1,4 +1,4 @@
-// PANDEMONIUM v2.1.0 -- SCHED_EXT KERNEL SCHEDULER
+// PANDEMONIUM -- SCHED_EXT KERNEL SCHEDULER
 // ADAPTIVE DESKTOP SCHEDULING FOR LINUX
 //
 // BPF: BEHAVIORAL CLASSIFICATION + MULTI-TIER DISPATCH
@@ -51,11 +51,6 @@ const volatile bool ringbuf_active = false;
 
 #define SLICE_MIN_NS 100000     // 100US FLOOR
 
-// CPU-BOUND DEMOTION: TASKS RUNNING >= THIS ARE CPU-BOUND, NOT INTERACTIVE.
-// MATCHES v0.9.5 EFFECTIVE THRESHOLD (5MS DEFAULT SLICE / 2 = 2.5MS).
-// WITHOUT THIS, CPU-BOUND TASKS NEVER HIT runnable() AND STAY TIER_INTERACTIVE
-// FOREVER, CAUSING DISPATCH STORMS VIA TIER 2 PREEMPT KICKS.
-#define CPU_BOUND_THRESH_NS 2500000  // 2.5MS
 
 // --- GLOBALS ---
 
@@ -151,8 +146,7 @@ struct task_ctx {
 	u32 ewma_age;
 	s32 last_cpu;        // LAST CPU THIS TASK RAN ON (FOR CACHE AFFINITY)
 	u8  dispatch_path;   // 0=IDLE, 1=HARD_KICK, 2=SOFT_KICK
-	u8  confident;       // 1 = PROCDB CONFIDENT, SKIP RECLASSIFICATION
-	u8  _pad[2];
+	u8  _pad[3];
 };
 
 struct {
@@ -685,15 +679,6 @@ void BPF_STRUCT_OPS(pandemonium_runnable, struct task_struct *p,
 // RUNNING: TASK STARTS EXECUTING -- ADVANCE VTIME, RECORD WAKE LATENCY
 void BPF_STRUCT_OPS(pandemonium_running, struct task_struct *p)
 {
-	// DIAGNOSTIC: ZERO-SLICE COUNTER (COMMENTED OUT)
-	// RESULT: ~0.03% OF DISPATCHES -- NOT THE THROUGHPUT ISSUE.
-	// UNCOMMENT TO RE-ENABLE: READS nr_zero_slice IN TELEMETRY AS "zero: N"
-	// if (p->scx.slice == 0) {
-	// 	struct pandemonium_stats *s = get_stats();
-	// 	if (s)
-	// 		__sync_fetch_and_add(&s->nr_zero_slice, 1);
-	// }
-
 	if (time_before(vtime_now, p->scx.dsq_vtime))
 		vtime_now = p->scx.dsq_vtime;
 
@@ -783,22 +768,11 @@ void BPF_STRUCT_OPS(pandemonium_stopping, struct task_struct *p,
 					      tctx->ewma_age);
 	}
 
-	// CPU-BOUND DEMOTION: INTERACTIVE -> BATCH IF AVG RUNTIME EXCEEDS THRESHOLD
-	// SKIP FOR CONFIDENT TASKS -- EWMA RECLASSIFICATION IN runnable() HANDLES
-	// TIER TRANSITIONS FOR ALL TASKS. DEMOTION IS A SECONDARY SAFETY NET.
-	// THRESHOLD IS REGIME-DEPENDENT (RUST WRITES cpu_bound_thresh_ns PER REGIME)
-	struct tuning_knobs *knobs = get_knobs();
-	u64 demotion_thresh = knobs ? knobs->cpu_bound_thresh_ns : CPU_BOUND_THRESH_NS;
-	if (!tctx->confident &&
-	    tctx->tier == TIER_INTERACTIVE &&
-	    tctx->avg_runtime >= demotion_thresh) {
-		tctx->tier = TIER_BATCH;
-		tctx->cached_weight = effective_weight(p, tctx);
-		weight = tctx->cached_weight;
-	}
-
-	// PROCDB: PUBLISH MATURE TASK CLASSIFICATION FOR USERSPACE
-	if (tctx->ewma_age == EWMA_AGE_MATURE) {
+	// PROCDB: PUBLISH TASK CLASSIFICATION FOR USERSPACE
+	// INITIAL AT EWMA MATURITY, THEN EVERY 64 SCHEDULING EVENTS
+	// RE-PUBLISHING KEEPS PROCDB FRESH FOR LONG-LIVED TASKS
+	if (tctx->ewma_age == EWMA_AGE_MATURE ||
+	    (tctx->ewma_age > EWMA_AGE_MATURE && tctx->ewma_age % 64 == 0)) {
 		struct task_class_entry obs = {};
 		obs.tier = (u8)tctx->tier;
 		obs.avg_runtime = tctx->avg_runtime;
@@ -861,7 +835,6 @@ void BPF_STRUCT_OPS(pandemonium_enable, struct task_struct *p)
 		tctx->tier = TIER_INTERACTIVE;
 		tctx->ewma_age = 0;
 		tctx->dispatch_path = 0;
-		tctx->confident = 0;
 
 		// PROCDB: APPLY LEARNED CLASSIFICATION FROM PRIOR RUNS
 		char key[16];
@@ -872,7 +845,6 @@ void BPF_STRUCT_OPS(pandemonium_enable, struct task_struct *p)
 			tctx->tier = (u32)init_entry->tier;
 			tctx->avg_runtime = init_entry->avg_runtime;
 			tctx->cached_weight = effective_weight(p, tctx);
-			tctx->confident = 1;
 			struct pandemonium_stats *s = get_stats();
 			if (s)
 				s->nr_procdb_hits += 1;
@@ -913,7 +885,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(pandemonium_init)
 		knobs->preempt_thresh_ns = 1000000;
 		knobs->lag_scale = 4;
 		knobs->batch_slice_ns = 20000000;        // 20MS FLAT DEFAULT
-		knobs->cpu_bound_thresh_ns = 2500000;    // 2.5MS: MATCHES CPU_BOUND_THRESH_NS
+		knobs->cpu_bound_thresh_ns = 2500000;    // 2.5MS (RESERVED FOR FUTURE USE)
 		knobs->lat_cri_thresh_high = LAT_CRI_THRESH_HIGH; // 32
 		knobs->lat_cri_thresh_low  = LAT_CRI_THRESH_LOW;  // 8
 	}

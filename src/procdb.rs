@@ -1,4 +1,4 @@
-// PANDEMONIUM v2.0.0 PROCESS CLASSIFICATION DATABASE
+// PANDEMONIUM PROCESS CLASSIFICATION DATABASE
 // BPF OBSERVES MATURE TASK BEHAVIOR, RUST LEARNS PATTERNS, BPF APPLIES
 //
 // PROBLEM: EVERY NEW TASK ENTERS AS TIER_INTERACTIVE IN BPF enable().
@@ -19,6 +19,23 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use libbpf_rs::MapCore;
+
+fn _timestamp() -> String {
+    unsafe {
+        let mut t: libc::time_t = 0;
+        libc::time(&mut t);
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&t, &mut tm);
+        format!("[{:02}:{:02}:{:02}]", tm.tm_hour, tm.tm_min, tm.tm_sec)
+    }
+}
+
+macro_rules! procdb_info {
+    ($($arg:tt)*) => { println!("{} [INFO]   {}", _timestamp(), format!($($arg)*)) };
+}
+macro_rules! procdb_warn {
+    ($($arg:tt)*) => { println!("{} [WARN]   {}", _timestamp(), format!($($arg)*)) };
+}
 
 const OBSERVE_PIN: &str = "/sys/fs/bpf/pandemonium/task_class_observe";
 const INIT_PIN: &str = "/sys/fs/bpf/pandemonium/task_class_init";
@@ -41,6 +58,9 @@ pub struct TaskClassEntry {
     pub _pad: [u8; 7],
     pub avg_runtime: u64,
 }
+
+// COMPILE-TIME ABI SAFETY: MUST MATCH struct task_class_entry IN intf.h
+const _: () = assert!(std::mem::size_of::<TaskClassEntry>() == 16);
 
 pub struct TaskProfile {
     pub tier_votes: [u32; 3],   // COUNT PER TIER: [BATCH, INTERACTIVE, LAT_CRITICAL]
@@ -89,12 +109,12 @@ impl ProcessDb {
         let profiles = match Self::load_from_disk(&db_path) {
             Ok(p) => {
                 if !p.is_empty() {
-                    eprintln!("[INFO]  PROCDB: LOADED {} PROFILES FROM {}", p.len(), db_path.display());
+                    procdb_info!("PROCDB: LOADED {} PROFILES FROM {}", p.len(), db_path.display());
                 }
                 p
             }
             Err(e) => {
-                eprintln!("[WARN]  PROCDB LOAD: {}", e);
+                procdb_warn!("PROCDB LOAD: {}", e);
                 HashMap::new()
             }
         };
@@ -270,20 +290,20 @@ impl ProcessDb {
         };
 
         if data.len() < 12 {
-            eprintln!("[WARN]  PROCDB: FILE TOO SHORT ({} BYTES)", data.len());
+            procdb_warn!("PROCDB: FILE TOO SHORT ({} BYTES)", data.len());
             return Ok(HashMap::new());
         }
 
         // VALIDATE MAGIC
         if &data[0..4] != PROCDB_MAGIC {
-            eprintln!("[WARN]  PROCDB: BAD MAGIC {:?}", &data[0..4]);
+            procdb_warn!("PROCDB: BAD MAGIC {:?}", &data[0..4]);
             return Ok(HashMap::new());
         }
 
         // VALIDATE VERSION
         let version = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
         if version != PROCDB_VERSION {
-            eprintln!("[WARN]  PROCDB: UNKNOWN VERSION {}", version);
+            procdb_warn!("PROCDB: UNKNOWN VERSION {}", version);
             return Ok(HashMap::new());
         }
 
@@ -291,7 +311,7 @@ impl ProcessDb {
         let count = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
         let expected_size = 12 + count * ENTRY_SIZE;
         if data.len() < expected_size {
-            eprintln!("[WARN]  PROCDB: TRUNCATED (EXPECTED {} BYTES, GOT {})", expected_size, data.len());
+            procdb_warn!("PROCDB: TRUNCATED (EXPECTED {} BYTES, GOT {})", expected_size, data.len());
             return Ok(HashMap::new());
         }
 
