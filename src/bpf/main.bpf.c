@@ -24,12 +24,12 @@
 
 char _license[] SEC("license") = "GPL";
 
-// --- CONFIGURATION (SET BY RUST VIA RODATA BEFORE LOAD) ---
+// CONFIGURATION (SET BY RUST VIA RODATA BEFORE LOAD)
 
 const volatile u64 nr_cpu_ids = 1;
 const volatile bool ringbuf_active = false;
 
-// --- BEHAVIORAL CONSTANTS ---
+// BEHAVIORAL CONSTANTS
 
 #define TIER_BATCH        0
 #define TIER_INTERACTIVE  1
@@ -52,7 +52,7 @@ const volatile bool ringbuf_active = false;
 #define SLICE_MIN_NS 100000     // 100US FLOOR
 
 
-// --- GLOBALS ---
+// GLOBALS
 
 static u32 nr_nodes;
 static u64 vtime_now;
@@ -68,11 +68,11 @@ static bool interactive_waiting;
 // CHECKED IN task_slice() TO CLAMP BATCH SLICES DURING GUARD WINDOW.
 static u64 guard_until_ns;
 
-// --- USER EXIT ---
+// USER EXIT
 
 UEI_DEFINE(uei);
 
-// --- MAPS ---
+// MAPS
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
@@ -128,7 +128,7 @@ struct {
 	__uint(max_entries, 256 * 1024);
 } wake_lat_rb SEC(".maps");
 
-// --- PER-TASK CONTEXT ---
+// PER-TASK CONTEXT
 
 struct task_ctx {
 	u64 awake_vtime;
@@ -156,7 +156,7 @@ struct {
 	__type(value, struct task_ctx);
 } task_ctx_stor SEC(".maps");
 
-// --- HELPERS ---
+// HELPERS
 
 static __always_inline struct pandemonium_stats *get_stats(void)
 {
@@ -183,7 +183,7 @@ static __always_inline struct task_ctx *ensure_task_ctx(struct task_struct *p)
 				    BPF_LOCAL_STORAGE_GET_F_CREATE);
 }
 
-// --- L2 CACHE AFFINITY INSTRUMENTATION ---
+// L2 CACHE AFFINITY INSTRUMENTATION
 // COMPARE SELECTED CPU'S L2 DOMAIN WITH TASK'S LAST_CPU DOMAIN.
 // INCREMENT PER-TIER HIT/MISS COUNTERS. CALLED FROM select_cpu() AND enqueue().
 
@@ -209,7 +209,7 @@ static __always_inline void count_l2_affinity(struct pandemonium_stats *s,
 	}
 }
 
-// --- EWMA ---
+// EWMA
 
 static __always_inline u64 calc_avg(u64 old_val, u64 new_val, u32 age)
 {
@@ -226,7 +226,7 @@ static __always_inline u64 update_freq(u64 freq, u64 interval_ns, u32 age)
 	return calc_avg(freq, new_freq, age);
 }
 
-// --- BEHAVIORAL CLASSIFICATION ---
+// BEHAVIORAL CLASSIFICATION
 
 // LAT_CRI SCORE: HIGH WAKEUP FREQ + HIGH CSW RATE + SHORT RUNTIME = CRITICAL
 static __always_inline u64 compute_lat_cri(u64 wakeup_freq, u64 csw_rate,
@@ -281,7 +281,7 @@ static __always_inline u64 effective_weight(const struct task_struct *p,
 	return weight * behavioral >> 7;
 }
 
-// --- SCHEDULING HELPERS ---
+// SCHEDULING HELPERS
 
 // DEADLINE = DSQ_VTIME + AWAKE_VTIME
 // PER-TASK LAG SCALING: INTERACTIVE TASKS GET MORE VTIME CREDIT
@@ -380,7 +380,7 @@ static __always_inline u64 task_slice(const struct task_ctx *tctx,
 	return base;
 }
 
-// --- SCHEDULING CALLBACKS ---
+// SCHEDULING CALLBACKS
 
 // SELECT_CPU: FAST-PATH IDLE CPU DISPATCH
 // DISPATCHES TO PER-CPU DSQ (NOT SCX_DSQ_LOCAL).
@@ -776,6 +776,9 @@ void BPF_STRUCT_OPS(pandemonium_stopping, struct task_struct *p,
 		struct task_class_entry obs = {};
 		obs.tier = (u8)tctx->tier;
 		obs.avg_runtime = tctx->avg_runtime;
+		obs.runtime_dev = tctx->runtime_dev;
+		obs.wakeup_freq = tctx->wakeup_freq;
+		obs.csw_rate = tctx->csw_rate;
 		char key[16];
 		__builtin_memcpy(key, p->comm, 16);
 		bpf_map_update_elem(&task_class_observe, key, &obs, BPF_ANY);
@@ -844,6 +847,9 @@ void BPF_STRUCT_OPS(pandemonium_enable, struct task_struct *p)
 		if (init_entry) {
 			tctx->tier = (u32)init_entry->tier;
 			tctx->avg_runtime = init_entry->avg_runtime;
+			tctx->runtime_dev = init_entry->runtime_dev;
+			tctx->wakeup_freq = init_entry->wakeup_freq;
+			tctx->csw_rate = init_entry->csw_rate;
 			tctx->cached_weight = effective_weight(p, tctx);
 			struct pandemonium_stats *s = get_stats();
 			if (s)

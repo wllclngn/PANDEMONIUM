@@ -46,9 +46,10 @@ pub const MAX_PROFILES: usize = 512;
 pub const STALE_TICKS: u64 = 60;
 
 const PROCDB_MAGIC: &[u8; 4] = b"PDDB";
-const PROCDB_VERSION: u32 = 1;
+const PROCDB_VERSION: u32 = 2;
 const PROCDB_PATH: &str = ".cache/pandemonium/procdb.bin";
-const ENTRY_SIZE: usize = 40;
+const ENTRY_SIZE: usize = 64;
+const V1_ENTRY_SIZE: usize = 40;
 
 // MATCHES struct task_class_entry IN intf.h
 #[repr(C)]
@@ -57,14 +58,21 @@ pub struct TaskClassEntry {
     pub tier: u8,
     pub _pad: [u8; 7],
     pub avg_runtime: u64,
+    pub runtime_dev: u64,
+    pub wakeup_freq: u64,
+    pub csw_rate: u64,
 }
 
 // COMPILE-TIME ABI SAFETY: MUST MATCH struct task_class_entry IN intf.h
-const _: () = assert!(std::mem::size_of::<TaskClassEntry>() == 16);
+const _: () = assert!(std::mem::size_of::<TaskClassEntry>() == 40);
 
+#[derive(Default)]
 pub struct TaskProfile {
     pub tier_votes: [u32; 3],   // COUNT PER TIER: [BATCH, INTERACTIVE, LAT_CRITICAL]
     pub avg_runtime_ns: u64,
+    pub runtime_dev_ns: u64,
+    pub wakeup_freq: u64,
+    pub csw_rate: u64,
     pub observations: u32,
     pub last_seen_tick: u64,
 }
@@ -85,6 +93,22 @@ impl TaskProfile {
             .max_by_key(|(_, c)| *c)
             .map(|(i, _)| i as u8)
             .unwrap_or(1) // INTERACTIVE DEFAULT
+    }
+
+    // MULTI-DIMENSIONAL CONFIDENCE: TIER AGREEMENT * BEHAVIORAL STABILITY
+    // HIGH RUNTIME VARIANCE REDUCES CONFIDENCE EVEN WITH STRONG TIER AGREEMENT
+    pub fn behavioral_confidence(&self) -> f64 {
+        if self.observations < MIN_OBSERVATIONS {
+            return 0.0;
+        }
+        let tier_conf = self.confidence();
+        let dev_ratio = if self.avg_runtime_ns > 0 {
+            self.runtime_dev_ns as f64 / self.avg_runtime_ns as f64
+        } else {
+            1.0
+        };
+        let stability = (1.0 - dev_ratio.min(1.0)).max(0.0);
+        tier_conf * (0.5 + 0.5 * stability)
     }
 }
 
@@ -150,20 +174,23 @@ impl ProcessDb {
                     comm[..copy_len].copy_from_slice(&key[..copy_len]);
 
                     let profile = self.profiles.entry(comm).or_insert(TaskProfile {
-                        tier_votes: [0; 3],
-                        avg_runtime_ns: 0,
-                        observations: 0,
-                        last_seen_tick: 0,
+                        ..Default::default()
                     });
 
                     let tier_idx = (entry.tier as usize).min(2);
                     profile.tier_votes[tier_idx] += 1;
-                    profile.avg_runtime_ns = if profile.observations == 0 {
-                        entry.avg_runtime
+                    if profile.observations == 0 {
+                        profile.avg_runtime_ns = entry.avg_runtime;
+                        profile.runtime_dev_ns = entry.runtime_dev;
+                        profile.wakeup_freq = entry.wakeup_freq;
+                        profile.csw_rate = entry.csw_rate;
                     } else {
                         // EWMA: 7/8 OLD + 1/8 NEW
-                        (profile.avg_runtime_ns * 7 + entry.avg_runtime) / 8
-                    };
+                        profile.avg_runtime_ns = (profile.avg_runtime_ns * 7 + entry.avg_runtime) / 8;
+                        profile.runtime_dev_ns = (profile.runtime_dev_ns * 7 + entry.runtime_dev) / 8;
+                        profile.wakeup_freq = (profile.wakeup_freq * 7 + entry.wakeup_freq) / 8;
+                        profile.csw_rate = (profile.csw_rate * 7 + entry.csw_rate) / 8;
+                    }
                     profile.observations += 1;
                     profile.last_seen_tick = self.tick;
                 }
@@ -179,13 +206,15 @@ impl ProcessDb {
             None => return,
         };
         for (comm, profile) in &self.profiles {
-            if profile.observations >= MIN_OBSERVATIONS
-                && profile.confidence() >= MIN_CONFIDENCE
+            if profile.behavioral_confidence() >= MIN_CONFIDENCE
             {
                 let entry = TaskClassEntry {
                     tier: profile.dominant_tier(),
                     _pad: [0; 7],
                     avg_runtime: profile.avg_runtime_ns,
+                    runtime_dev: profile.runtime_dev_ns,
+                    wakeup_freq: profile.wakeup_freq,
+                    csw_rate: profile.csw_rate,
                 };
 
                 let val = unsafe {
@@ -236,8 +265,7 @@ impl ProcessDb {
     pub fn summary(&self) -> (usize, usize) {
         let total = self.profiles.len();
         let confident = self.profiles.values()
-            .filter(|p| p.observations >= MIN_OBSERVATIONS
-                && p.confidence() >= MIN_CONFIDENCE)
+            .filter(|p| p.behavioral_confidence() >= MIN_CONFIDENCE)
             .count();
         (total, confident)
     }
@@ -245,8 +273,7 @@ impl ProcessDb {
     // SERIALIZE CONFIDENT PROFILES TO DISK (ATOMIC WRITE)
     pub fn save(&self, path: &Path) -> Result<()> {
         let entries: Vec<_> = self.profiles.iter()
-            .filter(|(_, p)| p.observations >= MIN_OBSERVATIONS
-                && p.confidence() >= MIN_CONFIDENCE)
+            .filter(|(_, p)| p.behavioral_confidence() >= MIN_CONFIDENCE)
             .collect();
 
         if let Some(parent) = path.parent() {
@@ -261,7 +288,7 @@ impl ProcessDb {
         f.write_all(&PROCDB_VERSION.to_le_bytes())?;
         f.write_all(&(entries.len() as u32).to_le_bytes())?;
 
-        // ENTRIES: 40 BYTES EACH
+        // ENTRIES: 64 BYTES EACH (V2)
         for (comm, profile) in &entries {
             let tier = profile.dominant_tier();
             let total_votes: u32 = profile.tier_votes.iter().sum();
@@ -269,8 +296,11 @@ impl ProcessDb {
             f.write_all(comm.as_slice())?;             // 16 bytes
             f.write_all(&[tier])?;                     // 1 byte
             f.write_all(&[0u8; 7])?;                   // 7 bytes pad
-            f.write_all(&profile.avg_runtime_ns.to_le_bytes())?; // 8 bytes
-            f.write_all(&profile.observations.to_le_bytes())?;   // 4 bytes
+            f.write_all(&profile.avg_runtime_ns.to_le_bytes())?;  // 8 bytes
+            f.write_all(&profile.runtime_dev_ns.to_le_bytes())?;  // 8 bytes
+            f.write_all(&profile.wakeup_freq.to_le_bytes())?;     // 8 bytes
+            f.write_all(&profile.csw_rate.to_le_bytes())?;        // 8 bytes
+            f.write_all(&profile.observations.to_le_bytes())?;    // 4 bytes
             f.write_all(&total_votes.to_le_bytes())?;  // 4 bytes
         }
 
@@ -302,14 +332,18 @@ impl ProcessDb {
 
         // VALIDATE VERSION
         let version = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-        if version != PROCDB_VERSION {
-            procdb_warn!("PROCDB: UNKNOWN VERSION {}", version);
-            return Ok(HashMap::new());
-        }
+        let entry_size = match version {
+            1 => V1_ENTRY_SIZE,
+            2 => ENTRY_SIZE,
+            _ => {
+                procdb_warn!("PROCDB: UNKNOWN VERSION {}", version);
+                return Ok(HashMap::new());
+            }
+        };
 
         // VALIDATE COUNT VS FILE SIZE
         let count = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
-        let expected_size = 12 + count * ENTRY_SIZE;
+        let expected_size = 12 + count * entry_size;
         if data.len() < expected_size {
             procdb_warn!("PROCDB: TRUNCATED (EXPECTED {} BYTES, GOT {})", expected_size, data.len());
             return Ok(HashMap::new());
@@ -331,6 +365,19 @@ impl ProcessDb {
             );
             offset += 8;
 
+            // V2: READ EXTRA BEHAVIORAL FIELDS
+            let (runtime_dev, wakeup_freq, csw_rate) = if version >= 2 {
+                let rd = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+                offset += 8;
+                let wf = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+                offset += 8;
+                let cr = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+                offset += 8;
+                (rd, wf, cr)
+            } else {
+                (0, 0, 0)
+            };
+
             let observations = u32::from_le_bytes(
                 data[offset..offset + 4].try_into().unwrap()
             );
@@ -348,6 +395,9 @@ impl ProcessDb {
             profiles.insert(comm, TaskProfile {
                 tier_votes,
                 avg_runtime_ns: avg_runtime,
+                runtime_dev_ns: runtime_dev,
+                wakeup_freq,
+                csw_rate,
                 observations,
                 last_seen_tick: 0,
             });

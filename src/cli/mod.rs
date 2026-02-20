@@ -3,6 +3,7 @@ pub mod probe;
 pub mod run;
 pub mod bench;
 pub mod report;
+pub mod stress;
 pub mod test_gate;
 pub mod child_guard;
 pub mod death_pipe;

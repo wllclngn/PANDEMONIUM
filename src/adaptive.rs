@@ -19,12 +19,12 @@ use libbpf_rs::MapCore;
 
 use crate::procdb::ProcessDb;
 use crate::scheduler::{PandemoniumStats, Scheduler};
-use crate::tuning::{self, Regime, TuningKnobs, regime_knobs, detect_regime};
+use crate::tuning::{self, Regime, TuningKnobs, regime_knobs, detect_regime, HIST_BUCKETS, HIST_EDGES_NS};
 
 // REGIME THRESHOLDS, PROFILES, AND KNOB COMPUTATION LIVE IN tuning.rs
 // (ZERO BPF DEPENDENCIES, TESTABLE OFFLINE)
 
-// --- REFLEX PARAMETERS ---
+// REFLEX PARAMETERS
 
 const COOLDOWN_CHECKS: u32   = 2;
 const MIN_SLICE_NS: u64      = 500_000;   // 500US FLOOR -- ALLOWS 5 TIGHTEN STEPS FROM 2MS BASELINE
@@ -33,7 +33,7 @@ const MIN_SLICE_NS: u64      = 500_000;   // 500US FLOOR -- ALLOWS 5 TIGHTEN STE
 const RELAX_STEP_NS: u64    = 500_000;   // RELAX BY 500US PER TICK
 const RELAX_HOLD_TICKS: u32 = 2;         // WAIT 2S OF GOOD P99 BEFORE STEPPING
 
-// --- LOCK-FREE LATENCY HISTOGRAM ---
+// LOCK-FREE LATENCY HISTOGRAM
 
 // SLEEP PATTERN BUCKETS: CLASSIFY IO-WAIT VS IDLE WORKLOADS
 const SLEEP_BUCKETS: usize = 4;
@@ -44,23 +44,7 @@ const SLEEP_EDGES_NS: [u64; SLEEP_BUCKETS] = [
     u64::MAX,       // +INF: IDLE (LONG SLEEP, TIMER, POLLING)
 ];
 
-const HIST_BUCKETS: usize = 12;
-const HIST_EDGES_NS: [u64; HIST_BUCKETS] = [
-    10_000,      // 10us
-    25_000,      // 25us
-    50_000,      // 50us
-    100_000,     // 100us
-    250_000,     // 250us
-    500_000,     // 500us
-    1_000_000,   // 1ms
-    2_000_000,   // 2ms
-    5_000_000,   // 5ms
-    10_000_000,  // 10ms
-    20_000_000,  // 20ms
-    u64::MAX,    // +inf
-];
-
-// --- TYPES ---
+// TYPES
 
 #[repr(C)]
 struct WakeLatSample {
@@ -72,7 +56,7 @@ struct WakeLatSample {
     _pad:     [u8; 2],
 }
 
-// --- SHARED STATE (ATOMICS ONLY, NO MUTEX) ---
+// SHARED STATE (ATOMICS ONLY, NO MUTEX)
 
 const ATOMIC_ZERO: AtomicU64 = AtomicU64::new(0);
 
@@ -81,6 +65,8 @@ pub struct SharedState {
     regime: AtomicU8,
     sample_count: AtomicU64,
     histogram: [AtomicU64; HIST_BUCKETS],
+    tier_histogram: [[AtomicU64; HIST_BUCKETS]; 3],
+    pub tier_p99_ns: [AtomicU64; 3],
     sleep_histogram: [AtomicU64; SLEEP_BUCKETS],
     sleep_count: AtomicU64,
     pub reflex_events: AtomicU64,
@@ -94,6 +80,12 @@ impl SharedState {
             regime: AtomicU8::new(Regime::Mixed as u8),
             sample_count: AtomicU64::new(0),
             histogram: [ATOMIC_ZERO; HIST_BUCKETS],
+            tier_histogram: [
+                [ATOMIC_ZERO; HIST_BUCKETS],
+                [ATOMIC_ZERO; HIST_BUCKETS],
+                [ATOMIC_ZERO; HIST_BUCKETS],
+            ],
+            tier_p99_ns: [ATOMIC_ZERO; 3],
             sleep_histogram: [ATOMIC_ZERO; SLEEP_BUCKETS],
             sleep_count: AtomicU64::new(0),
             reflex_events: AtomicU64::new(0),
@@ -101,45 +93,42 @@ impl SharedState {
         }
     }
 
-    fn record_sample(&self, lat_ns: u64) {
+    fn record_sample(&self, lat_ns: u64, tier: u8) {
         let bucket = HIST_EDGES_NS.iter()
             .position(|&edge| lat_ns <= edge)
             .unwrap_or(HIST_BUCKETS - 1);
         self.histogram[bucket].fetch_add(1, Ordering::Relaxed);
         self.sample_count.fetch_add(1, Ordering::Relaxed);
+        let tier_idx = (tier as usize).min(2);
+        self.tier_histogram[tier_idx][bucket].fetch_add(1, Ordering::Relaxed);
     }
 
     // DRAIN HISTOGRAM, COMPUTE P99, STORE IN ATOMIC. RETURNS P99 IN NANOSECONDS.
     fn compute_and_reset_p99(&self) -> u64 {
         let mut counts = [0u64; HIST_BUCKETS];
-        let mut total = 0u64;
         for i in 0..HIST_BUCKETS {
             counts[i] = self.histogram[i].swap(0, Ordering::Relaxed);
-            total += counts[i];
         }
         self.sample_count.store(0, Ordering::Relaxed);
-
-        if total == 0 {
-            return 0;
-        }
-
-        // 99TH PERCENTILE: FIND BUCKET WHERE CUMULATIVE REACHES ceil(total * 0.99)
-        let threshold = (total * 99 + 99) / 100;
-        let mut cumulative = 0u64;
-        for i in 0..HIST_BUCKETS {
-            cumulative += counts[i];
-            if cumulative >= threshold {
-                // CAP AT LAST REAL BUCKET EDGE -- +INF (u64::MAX) WOULD POISON
-                // EVERY COMPARISON AND TRIGGER INFINITE TIGHTENING
-                let p99 = HIST_EDGES_NS[i].min(HIST_EDGES_NS[HIST_BUCKETS - 2]);
-                self.p99_ns.store(p99, Ordering::Relaxed);
-                return p99;
-            }
-        }
-
-        let p99 = HIST_EDGES_NS[HIST_BUCKETS - 2];
+        let p99 = tuning::compute_p99_from_histogram(&counts);
         self.p99_ns.store(p99, Ordering::Relaxed);
         p99
+    }
+
+    // DRAIN PER-TIER HISTOGRAMS, COMPUTE P99 FOR EACH TIER.
+    // [0]=BATCH, [1]=INTERACTIVE, [2]=LAT_CRITICAL
+    fn compute_and_reset_tier_p99(&self) -> [u64; 3] {
+        let mut result = [0u64; 3];
+        for tier in 0..3 {
+            let mut counts = [0u64; HIST_BUCKETS];
+            for i in 0..HIST_BUCKETS {
+                counts[i] = self.tier_histogram[tier][i].swap(0, Ordering::Relaxed);
+            }
+            let p99 = tuning::compute_p99_from_histogram(&counts);
+            self.tier_p99_ns[tier].store(p99, Ordering::Relaxed);
+            result[tier] = p99;
+        }
+        result
     }
 
     fn record_sleep(&self, sleep_ns: u64) {
@@ -179,7 +168,7 @@ impl SharedState {
     }
 }
 
-// --- RING BUFFER BUILDER ---
+// RING BUFFER BUILDER
 
 // BUILD A RingBuffer FROM THE BPF WAKE LATENCY MAP.
 // THE CALLBACK RECORDS EVERY SAMPLE INTO THE SHARED HISTOGRAM.
@@ -193,7 +182,7 @@ pub fn build_ring_buffer(
             let sample: WakeLatSample = unsafe {
                 std::ptr::read_unaligned(data.as_ptr() as *const WakeLatSample)
             };
-            shared.record_sample(sample.lat_ns);
+            shared.record_sample(sample.lat_ns, sample.tier);
             if sample.sleep_ns > 0 {
                 shared.record_sleep(sample.sleep_ns);
             }
@@ -202,7 +191,7 @@ pub fn build_ring_buffer(
     })
 }
 
-// --- REFLEX THREAD ---
+// REFLEX THREAD
 
 // RING BUFFER CONSUMER. BLOCKS ON poll(), RECORDS SAMPLES, TIGHTENS KNOBS
 // WHEN P99 EXCEEDS THE CURRENT REGIME'S CEILING.
@@ -228,6 +217,7 @@ pub fn reflex_thread(
         }
 
         let p99 = shared.compute_and_reset_p99();
+        let tier_p99 = shared.compute_and_reset_tier_p99();
 
         if cooldown > 0 {
             cooldown -= 1;
@@ -236,7 +226,8 @@ pub fn reflex_thread(
 
         let current_regime = shared.current_regime();
         let ceiling = current_regime.p99_ceiling();
-        if p99 > ceiling {
+        let interactive_p99 = tier_p99[1];
+        if tuning::should_reflex_tighten(p99, interactive_p99, ceiling) {
             spike_count += 1;
             // REQUIRE 2 CONSECUTIVE ABOVE-CEILING CHECKS BEFORE TIGHTENING.
             // FILTERS TRANSIENT NOISE THAT CAUSES FALSE TRIGGERS AT LOW CORE COUNTS.
@@ -284,7 +275,7 @@ fn tighten_knobs(handle: &libbpf_rs::MapHandle) {
     let _ = handle.update(&key, value, libbpf_rs::MapFlags::ANY);
 }
 
-// --- MONITOR LOOP ---
+// MONITOR LOOP
 
 // 1-SECOND CONTROL LOOP. READS STATS, DETECTS WORKLOAD REGIME,
 // SETS BASELINE KNOBS, RELAXES GRADUALLY AFTER P99 NORMALIZES.
@@ -293,6 +284,7 @@ pub fn monitor_loop(
     sched: &mut Scheduler,
     shared: &Arc<SharedState>,
     shutdown: &'static AtomicBool,
+    verbose: bool,
 ) -> Result<bool> {
     let mut prev = PandemoniumStats::default();
     let mut regime = Regime::Mixed;
@@ -305,8 +297,6 @@ pub fn monitor_loop(
     let mut heavy_ticks: u64 = 0;
     let mut stability_score: u32 = 0;
     let mut prev_reflex_events: u64 = 0;
-    let mut l2_low_ticks: u32 = 0;
-    let mut l2_high_ticks: u32 = 0;
     let mut tick_counter: u64 = 0;
 
     let mut procdb = match ProcessDb::new() {
@@ -388,8 +378,6 @@ pub fn monitor_loop(
                 shared.set_regime(regime);
                 sched.write_tuning_knobs(&regime_knobs(regime))?;
                 regime_changed_this_tick = true;
-                l2_low_ticks = 0;
-                l2_high_ticks = 0;
                 tightened = false;
                 relax_counter = 0;
             }
@@ -440,25 +428,8 @@ pub fn monitor_loop(
             }
         }
 
-        // L2 BATCH SLICE FEEDBACK: CLOSED-LOOP CONTROL ON L2 HIT RATE
-        let current_knobs = sched.read_tuning_knobs();
-        let baseline = regime_knobs(regime);
-        let (new_batch_ns, new_low, new_high) = tuning::adjust_batch_slice(
-            current_knobs.batch_slice_ns,
-            baseline.batch_slice_ns,
-            l2_pct_b,
-            l2_low_ticks,
-            l2_high_ticks,
-        );
-        l2_low_ticks = new_low;
-        l2_high_ticks = new_high;
-        if new_batch_ns != current_knobs.batch_slice_ns {
-            let knobs = TuningKnobs {
-                batch_slice_ns: new_batch_ns,
-                ..current_knobs
-            };
-            sched.write_tuning_knobs(&knobs)?;
-        }
+        // SLEEP PATTERN ANALYSIS: IO-WAIT VS IDLE CLASSIFICATION
+        let (io_pct, _idle_sleep_pct) = shared.compute_and_reset_sleep();
 
         // STABILITY TRACKING: HIBERNATE REFLEX THREAD WHEN STABLE
         let reflex_now = shared.reflex_events.load(Ordering::Relaxed);
@@ -485,20 +456,22 @@ pub fn monitor_loop(
             (0, 0)
         };
 
-        // SLEEP PATTERN ANALYSIS: IO-WAIT VS IDLE CLASSIFICATION
-        let (io_pct, _idle_sleep_pct) = shared.compute_and_reset_sleep();
-
         let p99_us = p99_ns / 1000;
+        let tp99_b = shared.tier_p99_ns[0].load(Ordering::Relaxed) / 1000;
+        let tp99_i = shared.tier_p99_ns[1].load(Ordering::Relaxed) / 1000;
+        let tp99_l = shared.tier_p99_ns[2].load(Ordering::Relaxed) / 1000;
         let knobs = sched.read_tuning_knobs();
 
-        if tuning::should_print_telemetry(tick_counter, stability_score) {
+        if verbose && tuning::should_print_telemetry(tick_counter, stability_score) {
             println!(
-                "d/s: {:<8} idle: {}% shared: {:<6} preempt: {:<4} keep: {:<4} kick: H={:<4} S={:<4} enq: W={:<4} R={:<4} wake: {}us p99: {}us lat_idle: {}us lat_kick: {}us procdb: {}/{} sleep: io={}% slice: {}us guard: {} l2: B={}% I={}% L={}% [{}]",
+                "d/s: {:<8} idle: {}% shared: {:<6} preempt: {:<4} keep: {:<4} kick: H={:<4} S={:<4} enq: W={:<4} R={:<4} wake: {}us p99: {}us [B:{} I:{} L:{}] lat_idle: {}us lat_kick: {}us procdb: {}/{} sleep: io={}% slice: {}us batch: {}us guard: {} l2: B={}% I={}% L={}% [{}]",
                 delta_d, idle_pct, delta_shared, delta_preempt, delta_keep,
                 delta_hard, delta_soft, delta_enq_wake, delta_enq_requeue,
-                wake_avg_us, p99_us, lat_idle_us, lat_kick_us,
+                wake_avg_us, p99_us, tp99_b, tp99_i, tp99_l,
+                lat_idle_us, lat_kick_us,
                 db_total, db_confident,
-                io_pct, knobs.slice_ns / 1000, delta_guard,
+                io_pct, knobs.slice_ns / 1000, knobs.batch_slice_ns / 1000,
+                delta_guard,
                 l2_pct_b, l2_pct_i, l2_pct_l, regime.label(),
             );
         }

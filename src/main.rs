@@ -81,8 +81,8 @@ enum SubCmd {
     /// Run test gate (unit + integration)
     Test,
 
-    /// A/B scaling benchmark (EEVDF vs PANDEMONIUM across core counts)
-    TestScale,
+    /// CPU-pinned stress worker for bench-scale (internal use)
+    StressWorker(StressWorkerArgs),
 
 }
 
@@ -91,6 +91,13 @@ struct ProbeArgs {
     /// Death pipe FD for orphan detection (internal use)
     #[arg(long)]
     death_pipe_fd: Option<i32>,
+}
+
+#[derive(Parser)]
+struct StressWorkerArgs {
+    /// CPU to pin the stress worker to
+    #[arg(long)]
+    cpu: u32,
 }
 
 #[derive(Parser)]
@@ -185,7 +192,10 @@ fn main() -> Result<()> {
             &args.sched_args,
         ),
         Some(SubCmd::Test) => cli::test_gate::run_test_gate(),
-        Some(SubCmd::TestScale) => cli::test_gate::run_test_scale(),
+        Some(SubCmd::StressWorker(args)) => {
+            cli::stress::run_stress_worker(args.cpu);
+            Ok(())
+        }
     }
 }
 
@@ -300,13 +310,15 @@ fn run_scheduler(verbose: bool, dump_log: bool, nr_cpus: Option<u64>, no_adaptiv
 
                 let idle_pct = if delta_d > 0 { delta_idle * 100 / delta_d } else { 0 };
 
-                println!(
-                    "d/s: {:<8} idle: {}% shared: {:<6} preempt: {:<4} keep: {:<4} kick: H={:<4} S={:<4} enq: W={:<4} R={:<4} wake: {}us lat_idle: {}us lat_kick: {}us procdb: {} guard: {} l2: B={}% I={}% L={}% [BPF]",
-                    delta_d, idle_pct, delta_shared, delta_preempt, delta_keep,
-                    delta_hard, delta_soft, delta_enq_wake, delta_enq_requeue,
-                    wake_avg_us, lat_idle_us, lat_kick_us, delta_procdb, delta_guard,
-                    l2_pct_b, l2_pct_i, l2_pct_l,
-                );
+                if verbose {
+                    println!(
+                        "d/s: {:<8} idle: {}% shared: {:<6} preempt: {:<4} keep: {:<4} kick: H={:<4} S={:<4} enq: W={:<4} R={:<4} wake: {}us lat_idle: {}us lat_kick: {}us procdb: {} guard: {} l2: B={}% I={}% L={}% [BPF]",
+                        delta_d, idle_pct, delta_shared, delta_preempt, delta_keep,
+                        delta_hard, delta_soft, delta_enq_wake, delta_enq_requeue,
+                        wake_avg_us, lat_idle_us, lat_kick_us, delta_procdb, delta_guard,
+                        l2_pct_b, l2_pct_i, l2_pct_l,
+                    );
+                }
 
                 sched.log.snapshot(
                     delta_d, delta_idle, delta_shared,
@@ -335,7 +347,7 @@ fn run_scheduler(verbose: bool, dump_log: bool, nr_cpus: Option<u64>, no_adaptiv
 
             sched.read_exit_info()
         } else {
-            // FULL MODE: ADAPTIVE CONTROL LOOP WITH REFLEX + MONITOR
+            // ADAPTIVE MODE: BPF + ADAPTIVE CONTROL LOOP WITH REFLEX + MONITOR
             let shared = Arc::new(adaptive::SharedState::new());
             let ring_buf = adaptive::build_ring_buffer(&sched, Arc::clone(&shared))?;
             let knobs_handle = Scheduler::knobs_map_handle()?;
@@ -348,7 +360,7 @@ fn run_scheduler(verbose: bool, dump_log: bool, nr_cpus: Option<u64>, no_adaptiv
                 })?;
 
             log_info!("PANDEMONIUM IS ACTIVE (CTRL+C TO EXIT)");
-            let restart = adaptive::monitor_loop(&mut sched, &shared, &SHUTDOWN)?;
+            let restart = adaptive::monitor_loop(&mut sched, &shared, &SHUTDOWN, verbose)?;
             // SIGNAL REFLEX THREAD TO EXIT (MONITOR MAY RETURN FROM BPF EXIT,
             // NOT JUST CTRL+C -- WITHOUT THIS, reflex_handle.join() DEADLOCKS)
             SHUTDOWN.store(true, Ordering::Relaxed);

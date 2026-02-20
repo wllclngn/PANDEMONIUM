@@ -68,6 +68,9 @@ struct task_class_entry {
 	u8  tier;
 	u8  _pad[7];
 	u64 avg_runtime;
+	u64 runtime_dev;    // EWMA |RUNTIME - AVG_RUNTIME|
+	u64 wakeup_freq;    // WAKEUP FREQUENCY (EWMA)
+	u64 csw_rate;       // CONTEXT SWITCH RATE (EWMA)
 };
 
 #endif // __INTF_H

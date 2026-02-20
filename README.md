@@ -286,7 +286,7 @@ d/s: 251000  idle: 5% shared: 230000  preempt: 12  keep: 0  kick: H=8000 S=22000
 ./pandemonium.py bench-scale --schedulers scx_bpfland,scx_rusty
 ```
 
-Benchmarks compare EEVDF (kernel default), PANDEMONIUM (BPF-only and FULL adaptive), and external sched_ext schedulers across core counts via CPU hotplug.
+Benchmarks compare EEVDF (kernel default), PANDEMONIUM (BPF-only and BPF-adaptive), and external sched_ext schedulers across core counts via CPU hotplug.
 
 Results are archived to `~/.cache/pandemonium/{version}-{timestamp}.json` for cross-build regression tracking.
 

@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """
-PANDEMONIUM test orchestrator.
+PANDEMONIUM bench-scale orchestrator.
+
+Unified throughput + latency benchmark with Prometheus metrics output.
 
 Usage:
-    ./tests/pandemonium-tests.py bench-scale                    Full throughput + latency benchmark
-    ./tests/pandemonium-tests.py bench-scale --skip-latency     Throughput only (skip Rust latency)
-    ./tests/pandemonium-tests.py bench-scale --iterations 5     More iterations
+    ./tests/pandemonium-tests.py bench-scale
+    ./tests/pandemonium-tests.py bench-scale --iterations 3
     ./tests/pandemonium-tests.py bench-scale --schedulers scx_rusty,scx_bpfland
 """
 
 import argparse
 import math
 import os
+import traceback
+import re
 import signal
 import shutil
 import subprocess
@@ -29,17 +32,13 @@ from pandemonium_common import (
 )
 
 
-# =============================================================================
-# CONFIGURATION (test-specific)
-# =============================================================================
+# CONFIGURATION
 
 SCX_OPS = Path("/sys/kernel/sched_ext/root/ops")
 DEFAULT_EXTERNALS = ["scx_bpfland"]
 
 
-# =============================================================================
 # DMESG CAPTURE
-# =============================================================================
 
 def dmesg_baseline() -> int:
     """Snapshot current dmesg line count for later diffing."""
@@ -63,12 +62,10 @@ def capture_dmesg(baseline: int, stamp: str) -> None:
         log_info("dmesg: no new kernel messages")
         return
 
-    # Save all new lines
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     dmesg_path = LOG_DIR / f"dmesg-{stamp}.log"
     dmesg_path.write_text("\n".join(new_lines) + "\n")
 
-    # Summarize scheduler-related issues
     keywords = ["sched_ext", "pandemonium", "non-existent DSQ", "zero slice",
                 "panic", "BUG:", "RIP:", "Oops", "Call Trace"]
     filtered = [l for l in new_lines
@@ -97,9 +94,7 @@ def capture_dmesg(baseline: int, stamp: str) -> None:
     log_info(f"dmesg: {len(new_lines)} messages saved to {dmesg_path}")
 
 
-# =============================================================================
-# BUILD (test-specific helpers; shared build logic in pandemonium_common)
-# =============================================================================
+# BUILD HELPERS
 
 def fix_ownership():
     uid = os.getuid()
@@ -114,12 +109,10 @@ def fix_ownership():
 
 
 def nuke_stale_build():
-    """Nuke the build dir if any source file is newer than the binary.
-    Prevents stale test binaries from surviving across code changes."""
+    """Nuke the build dir if any source file is newer than the binary."""
     if not TARGET_DIR.exists():
         return
     if not BINARY.exists():
-        # build dir exists but no binary -- nuke it
         log_info(f"Nuking build directory (no binary): {TARGET_DIR}")
         subprocess.run(["sudo", "rm", "-rf", str(TARGET_DIR)],
                        capture_output=True)
@@ -135,23 +128,7 @@ def nuke_stale_build():
                 return
 
 
-def build_test(test_name: str) -> bool:
-    log_info(f"Building test binary: {test_name}...")
-    ret = run_cmd(
-        ["cargo", "test", "--release", "--test", test_name, "--no-run"],
-        env={**os.environ, "CARGO_TARGET_DIR": str(TARGET_DIR)},
-        cwd=SCRIPT_DIR,
-    )
-    if ret != 0:
-        log_error(f"Test build failed: {test_name}")
-        return False
-    log_info(f"Test binary ready: {test_name}")
-    return True
-
-
-# =============================================================================
 # SCHEDULER PROCESS MANAGEMENT
-# =============================================================================
 
 def is_scx_active() -> bool:
     try:
@@ -193,21 +170,22 @@ class SchedulerProcess:
     """RAII-style guard for a running sched_ext scheduler."""
 
     def __init__(self, proc: subprocess.Popen, name: str,
+                 stdout_path: str | None = None,
                  stderr_path: str | None = None):
         self.proc = proc
         self.name = name
         self.pgid = os.getpgid(proc.pid)
+        self.stdout_path = stdout_path
         self.stderr_path = stderr_path
 
     def stop(self):
         if self.proc.poll() is not None:
             return
-        # SIGINT → poll 500ms → SIGKILL
         try:
             os.killpg(self.pgid, signal.SIGINT)
         except ProcessLookupError:
             return
-        deadline = time.monotonic() + 0.5
+        deadline = time.monotonic() + 3.0
         while time.monotonic() < deadline:
             if self.proc.poll() is not None:
                 return
@@ -218,8 +196,16 @@ class SchedulerProcess:
             pass
         self.proc.wait()
 
+    def drain_stdout(self) -> str:
+        """Read all stdout captured to file (call after stop)."""
+        if self.stdout_path:
+            try:
+                return Path(self.stdout_path).read_text()
+            except (FileNotFoundError, PermissionError):
+                pass
+        return ""
+
     def read_stderr(self, limit: int = 4000) -> str:
-        """Read captured stderr from temp file."""
         if self.stderr_path:
             try:
                 return Path(self.stderr_path).read_text()[:limit]
@@ -228,12 +214,12 @@ class SchedulerProcess:
         return ""
 
     def cleanup(self):
-        """Remove stderr temp file."""
-        if self.stderr_path:
-            try:
-                os.unlink(self.stderr_path)
-            except (FileNotFoundError, PermissionError):
-                pass
+        for p in [self.stdout_path, self.stderr_path]:
+            if p:
+                try:
+                    os.unlink(p)
+                except (FileNotFoundError, PermissionError):
+                    pass
 
     def __del__(self):
         self.stop()
@@ -241,29 +227,31 @@ class SchedulerProcess:
 
 
 def start_scheduler(cmd: list[str], name: str) -> SchedulerProcess:
-    """Spawn a scheduler subprocess in its own process group."""
+    """Spawn a scheduler subprocess in its own process group.
+    Stdout and stderr go to files to avoid pipe buffer overflow."""
     full_cmd = ["sudo"] + cmd
     log_info(f"Starting: {' '.join(full_cmd)}")
     bin_path = cmd[0] if cmd else ""
     if bin_path and not os.path.exists(bin_path):
         log_error(f"Binary not found: {bin_path}")
-    # Redirect stderr to a FILE, not PIPE.
-    # BPF verifier dumps megabytes of log on failure, overflowing the
-    # 64KB pipe buffer and blocking the process indefinitely.
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+    stdout_path = str(LOG_DIR / f"sched-{name}-{os.getpid()}.stdout")
+    stdout_f = open(stdout_path, "w")
     stderr_path = str(LOG_DIR / f"sched-{name}-{os.getpid()}.stderr")
     stderr_f = open(stderr_path, "w")
     proc = subprocess.Popen(
         full_cmd,
-        stdout=subprocess.PIPE,
+        stdout=stdout_f,
         stderr=stderr_f,
         preexec_fn=os.setpgrp,
     )
+    stdout_f.close()
     stderr_f.close()
-    return SchedulerProcess(proc, name, stderr_path)
+    return SchedulerProcess(proc, name, stdout_path, stderr_path)
 
 
-def start_and_wait(cmd: list[str], name: str) -> SchedulerProcess | None:
+def start_and_wait(cmd: list[str], name: str,
+                   settle_secs: float = 2.0) -> SchedulerProcess | None:
     """Start a scheduler, wait for sched_ext activation. Returns None on failure."""
     guard = start_scheduler(cmd, name)
     if not wait_for_activation(10.0):
@@ -281,23 +269,23 @@ def start_and_wait(cmd: list[str], name: str) -> SchedulerProcess | None:
         wait_for_deactivation(5.0)
         return None
     log_info(f"{name} is active")
-    time.sleep(2)
+    time.sleep(settle_secs)
     return guard
 
 
-def stop_and_wait(guard: SchedulerProcess | None):
-    """Stop a scheduler and wait for sched_ext deactivation."""
+def stop_and_wait(guard: SchedulerProcess | None) -> str:
+    """Stop a scheduler, wait for deactivation. Returns captured stdout."""
     if guard is None:
-        return
+        return ""
     guard.stop()
+    stdout = guard.drain_stdout()
     if not wait_for_deactivation(5.0):
         log_warn(f"sched_ext still active after stopping {guard.name}")
     time.sleep(1)
+    return stdout
 
 
-# =============================================================================
 # CPU HOTPLUG
-# =============================================================================
 
 def _parse_cpu_range(path: str) -> int:
     try:
@@ -327,7 +315,7 @@ def get_online_cpus() -> int:
 
 def set_cpu_online(cpu: int, online: bool) -> bool:
     if cpu == 0:
-        return True  # CPU 0 cannot be offlined
+        return True
     path = f"/sys/devices/system/cpu/cpu{cpu}/online"
     value = "1" if online else "0"
     ret = subprocess.run(
@@ -369,9 +357,7 @@ def compute_core_counts(max_cpus: int) -> list[int]:
     return points
 
 
-# =============================================================================
 # STATISTICS
-# =============================================================================
 
 def mean_stdev(values: list[float]) -> tuple[float, float]:
     if not values:
@@ -384,9 +370,16 @@ def mean_stdev(values: list[float]) -> tuple[float, float]:
     return mean, math.sqrt(variance)
 
 
-# =============================================================================
-# PHASE 1: N-WAY COMPARISON
-# =============================================================================
+def percentile(values: list[float], pct: float) -> float:
+    """Compute percentile (0-100) using nearest-rank method."""
+    if not values:
+        return 0.0
+    s = sorted(values)
+    k = max(0, min(int(math.ceil(pct / 100.0 * len(s))) - 1, len(s) - 1))
+    return s[k]
+
+
+# MEASUREMENT
 
 def timed_run(cmd: str, clean_cmd: str | None = None) -> float | None:
     """Run a shell command, return wall-clock seconds or None on failure."""
@@ -406,315 +399,233 @@ def timed_run(cmd: str, clean_cmd: str | None = None) -> float | None:
     return elapsed
 
 
-def run_nway(entries: list[tuple[str, list[str] | None]],
-             iterations: int,
-             workload_cmd: str,
-             clean_cmd: str | None) -> list[tuple[str, list[float]]]:
+def parse_probe_output(stdout_text: str) -> dict:
+    """Parse probe stdout (one overshoot_us per line) into latency stats."""
+    values = []
+    for line in stdout_text.splitlines():
+        line = line.strip()
+        if line and line.lstrip("-").isdigit():
+            values.append(float(line))
+    if not values:
+        return {"samples": 0, "median_us": 0, "p99_us": 0, "worst_us": 0}
+    return {
+        "samples": len(values),
+        "median_us": int(percentile(values, 50)),
+        "p99_us": int(percentile(values, 99)),
+        "worst_us": int(max(values)),
+    }
+
+
+def measure_latency(binary: Path, n_cpus: int, iterations: int = 1,
+                    duration_secs: int = 15, warmup_secs: int = 3) -> dict:
+    """Spawn pinned stress workers on all cores + unpinned probe.
+
+    Stress workers saturate every CPU. Probe floats -- the scheduler
+    decides where to place it, measuring real preemption latency under
+    full load (no reserved core).
+
+    Multiple iterations pool all samples for final percentile calculation.
     """
-    Run N-way comparison.
+    if n_cpus < 1:
+        log_warn("Need at least 1 CPU for latency measurement")
+        return {"samples": 0, "median_us": 0, "p99_us": 0, "worst_us": 0}
 
-    entries: list of (name, cmd_to_spawn) where cmd_to_spawn is None for EEVDF.
-    Returns: list of (name, [times]) for each scheduler that completed.
+    stress_cpus = list(range(0, n_cpus))
+
+    log_info(f"Latency: {len(stress_cpus)} stress workers, probe unpinned, "
+             f"{iterations} iteration(s)")
+
+    workers = []
+    for cpu in stress_cpus:
+        p = subprocess.Popen(
+            [str(binary), "stress-worker", "--cpu", str(cpu)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        workers.append(p)
+
+    # Warmup probe (discard output, let scheduler classify workload)
+    log_info(f"Warmup: {warmup_secs}s")
+    warmup = subprocess.Popen(
+        [str(binary), "probe"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+    time.sleep(warmup_secs)
+    warmup.send_signal(signal.SIGINT)
+    try:
+        warmup.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        warmup.kill()
+        warmup.wait()
+
+    # Measurement iterations (pool all samples)
+    all_values: list[float] = []
+    for i in range(iterations):
+        log_info(f"Latency iteration {i + 1}/{iterations}: {duration_secs}s")
+        probe = subprocess.Popen(
+            [str(binary), "probe"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+        time.sleep(duration_secs)
+        probe.send_signal(signal.SIGINT)
+        try:
+            stdout, _ = probe.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            probe.kill()
+            stdout, _ = probe.communicate()
+
+        for line in stdout.decode(errors="replace").splitlines():
+            line = line.strip()
+            if line and line.lstrip("-").isdigit():
+                all_values.append(float(line))
+
+    # Stop stress workers
+    for w in workers:
+        w.send_signal(signal.SIGINT)
+    for w in workers:
+        try:
+            w.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            w.kill()
+            w.wait()
+
+    if not all_values:
+        result = {"samples": 0, "median_us": 0, "p99_us": 0, "worst_us": 0}
+    else:
+        result = {
+            "samples": len(all_values),
+            "median_us": int(percentile(all_values, 50)),
+            "p99_us": int(percentile(all_values, 99)),
+            "worst_us": int(max(all_values)),
+        }
+
+    log_info(f"Latency: {result['samples']} samples, "
+             f"median={result['median_us']}us, "
+             f"p99={result['p99_us']}us, "
+             f"worst={result['worst_us']}us")
+    return result
+
+
+# TELEMETRY PARSING
+
+def parse_tick_lines(stdout_text: str) -> list[dict]:
+    """Parse d/s: tick lines from scheduler stdout.
+
+    Handles both BPF-only format (ends with [BPF]) and adaptive format
+    (ends with [Light/Mixed/Heavy]).
     """
-    results = []
-
-    for phase_idx, (name, sched_cmd) in enumerate(entries):
-        log_info(f"Phase {phase_idx + 1}/{len(entries)}: {name}")
-
-        # Start scheduler (EEVDF = no-op)
-        guard = None
-        if sched_cmd is not None:
-            guard = start_and_wait(sched_cmd, name)
-            if guard is None:
-                continue
-
-        times = []
-        failed = False
-        for i in range(iterations):
-            log_info(f"  Iteration {i + 1}/{iterations}")
-            t = timed_run(workload_cmd, clean_cmd)
-            if t is None:
-                log_warn(f"  Workload failed under {name} -- aborting this scheduler")
-                failed = True
-                break
-            times.append(t)
-
-        stop_and_wait(guard)
-
-        if not failed and times:
-            results.append((name, times))
-        print()
-
-    return results
-
-
-def format_nway_report(results: list[tuple[str, list[float]]],
-                       workload_cmd: str,
-                       iterations: int) -> str:
-    """Format N-way results into a text report."""
-    lines = []
-    lines.append("PANDEMONIUM BENCH-SCALE: N-WAY COMPARISON")
-    lines.append(f"COMMAND:     {workload_cmd}")
-    lines.append(f"ITERATIONS:  {iterations}")
-    lines.append(f"CPUS:        {os.cpu_count()}")
-    lines.append("")
-
-    lines.append(f"{'SCHEDULER':<20} {'MEAN':>10} {'STDEV':>10} {'VS EEVDF':>12}")
-
-    if not results:
-        lines.append("(no results)")
-        return "\n".join(lines)
-
-    base_mean, _ = mean_stdev(results[0][1])
-
-    for name, times in results:
-        mean, std = mean_stdev(times)
-        if name == results[0][0]:
-            delta_str = "(baseline)"
-        elif base_mean > 0:
-            delta_pct = ((mean - base_mean) / base_mean) * 100.0
-            delta_str = f"{delta_pct:+.1f}%"
-        else:
-            delta_str = "N/A"
-        lines.append(f"{name:<20} {mean:>9.2f}s {std:>9.2f}s {delta_str:>12}")
-
-    return "\n".join(lines)
-
-
-def entries_for_cores(
-    base_entries: list[tuple[str, list[str] | None]],
-    n: int,
-) -> list[tuple[str, list[str] | None]]:
-    """Adjust scheduler commands for a specific core count.
-
-    PANDEMONIUM gets --nr-cpus N so its internal formulas match.
-    External schedulers see the online CPUs via kernel, no flag needed.
-    EEVDF is None (no scheduler process).
-    """
-    adjusted = []
-    for name, cmd in base_entries:
-        if cmd is None:
-            adjusted.append((name, None))
-        elif name == "PANDEMONIUM":
-            adjusted.append((name, cmd + ["--nr-cpus", str(n)]))
-        else:
-            adjusted.append((name, list(cmd)))
-    return adjusted
-
-
-def format_scaling_report(
-    all_results: dict[int, list[tuple[str, list[float]]]],
-    workload_cmd: str,
-    iterations: int,
-    max_cpus: int,
-) -> str:
-    """Format N-way scaling results: one table per core count + summary matrix."""
-    lines = [
-        "PANDEMONIUM BENCH-SCALE: N-WAY SCALING COMPARISON",
-        f"COMMAND:     {workload_cmd}",
-        f"ITERATIONS:  {iterations}",
-        f"MAX CPUS:    {max_cpus}",
-        "",
-    ]
-
-    sorted_cores = sorted(all_results.keys())
-
-    for n in sorted_cores:
-        results = all_results[n]
-        lines.append(f"[{n} CORES]")
-        lines.append(f"{'SCHEDULER':<20} {'MEAN':>10} {'STDEV':>10} {'VS EEVDF':>12}")
-
-        if not results:
-            lines.append("(no results)")
-            lines.append("")
+    ticks = []
+    for line in stdout_text.splitlines():
+        if not line.startswith("d/s:"):
             continue
 
-        base_mean, _ = mean_stdev(results[0][1])
-        for name, times in results:
-            m, std = mean_stdev(times)
-            if name == results[0][0]:
-                delta_str = "(baseline)"
-            elif base_mean > 0:
-                delta_pct = ((m - base_mean) / base_mean) * 100.0
-                delta_str = f"{delta_pct:+.1f}%"
-            else:
-                delta_str = "N/A"
-            lines.append(f"{name:<20} {m:>9.2f}s {std:>9.2f}s {delta_str:>12}")
-        lines.append("")
+        tick = {}
 
-    # Summary matrix: delta vs EEVDF at each core count
-    all_schedulers: list[str] = []
-    for n in sorted_cores:
-        for name, _ in all_results[n]:
-            if name not in all_schedulers:
-                all_schedulers.append(name)
-
-    if len(all_schedulers) > 1 and len(sorted_cores) > 1:
-        baseline = all_schedulers[0]
-        lines.append("SUMMARY: VS EEVDF (NEGATIVE = FASTER)")
-        header = f"{'SCHEDULER':<20}"
-        for n in sorted_cores:
-            header += f" {str(n) + 'C':>8}"
-        lines.append(header)
-
-        for sched in all_schedulers:
-            if sched == baseline:
-                continue
-            row = f"{sched:<20}"
-            for n in sorted_cores:
-                results = all_results[n]
-                base_m = sched_m = None
-                for name, times in results:
-                    m, _ = mean_stdev(times)
-                    if name == baseline:
-                        base_m = m
-                    if name == sched:
-                        sched_m = m
-                if base_m and sched_m and base_m > 0:
-                    delta = ((sched_m - base_m) / base_m) * 100.0
-                    row += f" {delta:>+7.1f}%"
-                else:
-                    row += f" {'--':>8}"
-            lines.append(row)
-        lines.append("")
-
-    return "\n".join(lines)
-
-
-# =============================================================================
-# BENCHMARK ARCHIVE
-# =============================================================================
-
-import json
-import re
-
-
-def _parse_us(s: str) -> int:
-    """Parse a value like '+15701us', '-999us', '69us' into integer microseconds."""
-    return int(re.sub(r"[us+]", "", s.strip()))
-
-
-def parse_latency_report(text: str) -> tuple[dict, dict]:
-    """Parse latency report text into structured dicts.
-
-    Returns (latency_by_cores, adaptive_gain_by_cores).
-    """
-    latency: dict[str, dict] = {}
-    adaptive: dict[str, dict] = {}
-
-    current_cores = None
-    in_adaptive = False
-
-    for line in text.splitlines():
-        # [LATENCY: 4 CORES]
-        m = re.match(r"\[LATENCY:\s+(\d+)\s+CORES\]", line)
+        # Common fields
+        m = re.search(r"d/s:\s*(\d+)", line)
         if m:
-            current_cores = m.group(1)
-            latency[current_cores] = {}
-            in_adaptive = False
-            continue
-
-        # [DELTA: ADAPTIVE GAIN ...]
-        if "[DELTA:" in line:
-            in_adaptive = True
-            current_cores = None
-            continue
-
-        # End of structured data -- stop parsing
-        if "[SUMMARY:" in line or "[SCHEDULER TELEMETRY]" in line:
-            current_cores = None
-            in_adaptive = False
-            continue
-
-        # Skip headers and empty lines
-        if not line.strip() or "SCHEDULER" in line or ("CORES" in line and "MEDIAN" in line):
-            continue
-
-        if in_adaptive:
-            # "    2     -9766us     -5995us     +7095us"
-            parts = line.split()
-            if len(parts) >= 4 and parts[0].isdigit():
-                cores = parts[0]
-                adaptive[cores] = {
-                    "median_us": _parse_us(parts[1]),
-                    "p99_us": _parse_us(parts[2]),
-                    "worst_us": _parse_us(parts[3]),
-                }
-            continue
-
-        if current_cores is not None:
-            # "EEVDF                        1490       69us      170us     1175us"
-            parts = line.split()
-            if len(parts) >= 4:
-                # Scheduler name may be multi-word: everything before the first numeric field
-                i = 0
-                while i < len(parts) and not parts[i].replace("us", "").lstrip("-+").isdigit():
-                    i += 1
-                if i == 0 or i >= len(parts):
-                    continue
-                name = " ".join(parts[:i])
-                nums = parts[i:]
-                if len(nums) >= 4:
-                    latency[current_cores][name] = {
-                        "samples": int(nums[0]),
-                        "median_us": _parse_us(nums[1]),
-                        "p99_us": _parse_us(nums[2]),
-                        "worst_us": _parse_us(nums[3]),
-                    }
-
-    return latency, adaptive
-
-
-def parse_knobs_report(text: str) -> dict:
-    """Parse [KNOBS] lines from scheduler telemetry.
-
-    Returns {cores: {phase: {key: value, ...}}} where phase is
-    "PANDEMONIUM (BPF)" or "PANDEMONIUM (FULL)".
-    """
-    knobs: dict[str, dict] = {}
-    current_cores = None
-    current_phase = None
-    in_telemetry = False
-
-    for line in text.splitlines():
-        if "[SCHEDULER TELEMETRY]" in line:
-            in_telemetry = True
-            continue
-
-        if not in_telemetry:
-            continue
-
-        # "2 CORES: BPF-ONLY" or "2 CORES: BPF+ADAPTIVE"
-        m = re.match(r"\s*(\d+)\s+CORES:\s+(BPF-ONLY|BPF\+ADAPTIVE)", line)
+            tick["dispatches"] = int(m.group(1))
+        m = re.search(r"idle:\s*(\d+)%", line)
         if m:
-            current_cores = m.group(1)
-            raw_phase = m.group(2)
-            current_phase = ("PANDEMONIUM (BPF)" if raw_phase == "BPF-ONLY"
-                             else "PANDEMONIUM (FULL)")
-            continue
+            tick["idle_pct"] = int(m.group(1))
+        m = re.search(r"shared:\s*(\d+)", line)
+        if m:
+            tick["shared"] = int(m.group(1))
+        m = re.search(r"preempt:\s*(\d+)", line)
+        if m:
+            tick["preempt"] = int(m.group(1))
+        m = re.search(r"keep:\s*(\d+)", line)
+        if m:
+            tick["keep"] = int(m.group(1))
+        m = re.search(r"kick:\s*H=(\d+)\s*S=(\d+)", line)
+        if m:
+            tick["kick_hard"] = int(m.group(1))
+            tick["kick_soft"] = int(m.group(2))
+        m = re.search(r"enq:\s*W=(\d+)\s*R=(\d+)", line)
+        if m:
+            tick["enq_wake"] = int(m.group(1))
+            tick["enq_requeue"] = int(m.group(2))
+        m = re.search(r"wake:\s*(\d+)us", line)
+        if m:
+            tick["wake_avg_us"] = int(m.group(1))
+        m = re.search(r"lat_idle:\s*(\d+)us", line)
+        if m:
+            tick["lat_idle_us"] = int(m.group(1))
+        m = re.search(r"lat_kick:\s*(\d+)us", line)
+        if m:
+            tick["lat_kick_us"] = int(m.group(1))
+        m = re.search(r"l2:\s*B=(\d+)%\s*I=(\d+)%\s*L=(\d+)%", line)
+        if m:
+            tick["l2_pct_batch"] = int(m.group(1))
+            tick["l2_pct_interactive"] = int(m.group(2))
+            tick["l2_pct_latcrit"] = int(m.group(3))
 
+        # BPF-only specific
+        if "[BPF]" in line:
+            tick["regime"] = "BPF"
+            m = re.search(r"procdb:\s*(\d+)\s", line)
+            if m:
+                tick["procdb_hits"] = int(m.group(1))
+            m = re.search(r"guard:\s*(\d+)", line)
+            if m:
+                tick["guard_clamps"] = int(m.group(1))
+
+        # Adaptive specific
+        elif re.search(r"\[(Light|Mixed|Heavy)\]", line, re.IGNORECASE):
+            m = re.search(r"\[(Light|Mixed|Heavy)\]", line, re.IGNORECASE)
+            tick["regime"] = m.group(1)
+            m = re.search(r"p99:\s*(\d+)us", line)
+            if m:
+                tick["p99_us"] = int(m.group(1))
+            m = re.search(r"p99:.*?\[B:(\d+)\s*I:(\d+)\s*L:(\d+)\]", line)
+            if m:
+                tick["tier_p99_batch"] = int(m.group(1))
+                tick["tier_p99_interactive"] = int(m.group(2))
+                tick["tier_p99_latcrit"] = int(m.group(3))
+            m = re.search(r"procdb:\s*(\d+)/(\d+)", line)
+            if m:
+                tick["procdb_total"] = int(m.group(1))
+                tick["procdb_confident"] = int(m.group(2))
+            m = re.search(r"sleep:\s*io=(\d+)%", line)
+            if m:
+                tick["io_pct"] = int(m.group(1))
+            m = re.search(r"slice:\s*(\d+)us", line)
+            if m:
+                tick["slice_us"] = int(m.group(1))
+            m = re.search(r"batch:\s*(\d+)us", line)
+            if m:
+                tick["batch_us"] = int(m.group(1))
+            m = re.search(r"guard:\s*(\d+)", line)
+            if m:
+                tick["guard_clamps"] = int(m.group(1))
+
+        if tick:
+            ticks.append(tick)
+
+    return ticks
+
+
+def parse_knobs_line(stdout_text: str) -> dict:
+    """Parse [KNOBS] summary line from scheduler stdout."""
+    for line in stdout_text.splitlines():
         if "[KNOBS]" not in line:
             continue
-        if current_cores is None or current_phase is None:
-            continue
 
-        # Parse key=value pairs from "[KNOBS] regime=MIXED slice_ns=4000000 ..."
-        entry: dict = {}
-        for km in re.finditer(r"(\w+)=(\S+)", line.split("[KNOBS]")[1]):
-            k, v = km.group(1), km.group(2)
+        knobs = {}
+        for m in re.finditer(r"(\w+)=(\S+)", line.split("[KNOBS]")[1]):
+            k, v = m.group(1), m.group(2)
             if v == "true":
-                entry[k] = True
+                knobs[k] = True
             elif v == "false":
-                entry[k] = False
+                knobs[k] = False
             else:
                 try:
-                    entry[k] = int(v)
+                    knobs[k] = int(v)
                 except ValueError:
-                    entry[k] = v
+                    knobs[k] = v
 
-        # Expand ticks=L:5/M:12/H:3 into ticks_light, ticks_mixed, ticks_heavy
-        if "ticks" in entry and isinstance(entry["ticks"], str):
-            ticks_str = entry.pop("ticks")
+        # Expand ticks=L:5/M:12/H:3
+        if "ticks" in knobs and isinstance(knobs["ticks"], str):
+            ticks_str = knobs.pop("ticks")
             for part in ticks_str.split("/"):
                 if ":" in part:
                     prefix, val = part.split(":", 1)
@@ -722,140 +633,499 @@ def parse_knobs_report(text: str) -> dict:
                              "H": "ticks_heavy"}.get(prefix)
                     if label:
                         try:
-                            entry[label] = int(val)
+                            knobs[label] = int(val)
                         except ValueError:
                             pass
 
-        if current_cores not in knobs:
-            knobs[current_cores] = {}
-        knobs[current_cores][current_phase] = entry
+        # Expand l2_hit=B:75%/I:60%/L:80%
+        if "l2_hit" in knobs and isinstance(knobs["l2_hit"], str):
+            l2_str = knobs.pop("l2_hit")
+            for part in l2_str.split("/"):
+                if ":" in part:
+                    prefix, val = part.split(":", 1)
+                    label = {"B": "l2_hit_batch", "I": "l2_hit_interactive",
+                             "L": "l2_hit_latcrit"}.get(prefix)
+                    if label:
+                        try:
+                            knobs[label] = int(val.rstrip("%"))
+                        except ValueError:
+                            pass
 
-    return knobs
+        return knobs
+
+    return {}
 
 
-def write_archive(
-    all_results: dict[int, list[tuple[str, list[float]]]],
-    latency_text: str,
-    iterations: int,
-    max_cpus: int,
-    stamp: str,
-) -> Path | None:
-    """Write structured JSON archive to ~/.cache/pandemonium/."""
-    version = get_version()
-    git = get_git_info()
+def aggregate_ticks(ticks: list[dict]) -> dict:
+    """Aggregate tick data into summary statistics."""
+    if not ticks:
+        return {}
 
-    # Throughput: structured from all_results
-    throughput: dict[str, dict] = {}
-    for n, results in sorted(all_results.items()):
-        core_key = str(n)
-        throughput[core_key] = {}
-        base_mean = None
-        for name, times in results:
-            m = sum(times) / len(times) if times else 0
-            std = 0.0
-            if len(times) >= 2:
-                std = (sum((x - m) ** 2 for x in times) / (len(times) - 1)) ** 0.5
-            entry = {"mean_s": round(m, 2), "stdev_s": round(std, 2)}
-            if base_mean is None:
-                base_mean = m
-            elif base_mean > 0:
-                entry["vs_eevdf_pct"] = round(((m - base_mean) / base_mean) * 100, 1)
-            throughput[core_key][name] = entry
+    agg = {}
+    numeric_keys = set()
+    for t in ticks:
+        for k, v in t.items():
+            if isinstance(v, (int, float)) and k != "regime":
+                numeric_keys.add(k)
 
-    # Latency + knobs: parsed from text
-    latency, adaptive = parse_latency_report(latency_text) if latency_text else ({}, {})
-    knobs = parse_knobs_report(latency_text) if latency_text else {}
+    for key in sorted(numeric_keys):
+        values = [float(t[key]) for t in ticks if key in t]
+        if not values:
+            continue
+        agg[key] = {
+            "mean": round(sum(values) / len(values), 1),
+            "p99": round(percentile(values, 99), 1),
+            "last": values[-1],
+        }
 
-    archive = {
-        "version": version,
-        "git_commit": git["commit"],
-        "git_dirty": git["dirty"],
-        "timestamp": stamp,
-        "iterations": iterations,
-        "max_cpus": max_cpus,
-        "throughput": throughput,
-        "latency": latency,
-        "adaptive_gain": adaptive,
-        "knobs": knobs,
-    }
+    # Regime distribution
+    regimes = [t.get("regime", "") for t in ticks if t.get("regime")]
+    if regimes:
+        agg["regime_counts"] = {}
+        for r in regimes:
+            agg["regime_counts"][r] = agg["regime_counts"].get(r, 0) + 1
+
+    return agg
+
+
+# PROMETHEUS OUTPUT
+
+def write_prometheus(data: dict, stamp: str) -> Path:
+    """Write Prometheus exposition format (.prom) to ~/.cache/pandemonium/."""
+    lines = []
+    emitted_types = set()
+
+    def gauge(name: str, help_text: str, value, labels: dict | None = None):
+        if name not in emitted_types:
+            lines.append(f"# HELP {name} {help_text}")
+            lines.append(f"# TYPE {name} gauge")
+            emitted_types.add(name)
+        if labels:
+            label_str = ",".join(f'{k}="{v}"' for k, v in labels.items())
+            lines.append(f"{name}{{{label_str}}} {value}")
+        else:
+            lines.append(f"{name} {value}")
+
+    # Metadata
+    version = data.get("version", "unknown")
+    git_commit = data.get("git_commit", "unknown")
+    git_dirty = "true" if data.get("git_dirty") else "false"
+    gauge("pandemonium_bench_info", "Build and run metadata", 1,
+          {"version": version, "git_commit": git_commit, "git_dirty": git_dirty})
+    gauge("pandemonium_bench_timestamp_seconds", "Benchmark start time",
+          int(datetime.strptime(stamp, "%Y%m%d-%H%M%S").timestamp()))
+    gauge("pandemonium_bench_iterations", "Number of throughput iterations",
+          data.get("iterations", 0))
+    gauge("pandemonium_bench_max_cpus", "Maximum CPUs available",
+          data.get("max_cpus", 0))
+
+    results = data.get("results", {})
+    for cores_str, schedulers in sorted(results.items(), key=lambda x: int(x[0])):
+        cores = cores_str
+
+        for sched_name, sched_data in schedulers.items():
+            labels = {"scheduler": sched_name, "cores": cores}
+
+            # Latency metrics
+            lat = sched_data.get("latency", {})
+            if lat.get("samples", 0) > 0:
+                gauge("pandemonium_bench_latency_samples",
+                      "Number of latency samples collected",
+                      lat["samples"], labels)
+                gauge("pandemonium_bench_latency_median_us",
+                      "Median wakeup latency",
+                      lat["median_us"], labels)
+                gauge("pandemonium_bench_latency_p99_us",
+                      "P99 wakeup latency",
+                      lat["p99_us"], labels)
+                gauge("pandemonium_bench_latency_worst_us",
+                      "Worst-case wakeup latency",
+                      lat["worst_us"], labels)
+
+            # Throughput metrics
+            tp = sched_data.get("throughput", {})
+            if "mean_s" in tp:
+                gauge("pandemonium_bench_throughput_seconds",
+                      "Wall-clock workload time (mean)",
+                      tp["mean_s"], labels)
+                if "stdev_s" in tp:
+                    gauge("pandemonium_bench_throughput_stdev_seconds",
+                          "Throughput standard deviation",
+                          tp["stdev_s"], labels)
+                if "vs_eevdf_pct" in tp:
+                    gauge("pandemonium_bench_throughput_vs_eevdf_pct",
+                          "Throughput delta vs EEVDF",
+                          tp["vs_eevdf_pct"], labels)
+
+            # Scheduler telemetry (PANDEMONIUM only)
+            telem = sched_data.get("telemetry", {})
+            knobs = telem.get("knobs", {})
+            tick_agg = telem.get("tick_aggregate", {})
+
+            if not knobs and not tick_agg:
+                continue
+
+            mode = "BPF" if "BPF" in sched_name else "ADAPTIVE"
+            telem_labels = {"mode": mode, "cores": cores}
+
+            if knobs:
+                knob_map = {
+                    "slice_ns": "slice_ns",
+                    "batch_slice_ns": "batch_ns",
+                    "preempt_thresh_ns": "preempt_ns",
+                    "cpu_bound_thresh_ns": "demotion_ns",
+                    "lag_scale": "lag",
+                }
+                for src_key, prom_suffix in knob_map.items():
+                    if src_key in knobs:
+                        gauge(f"pandemonium_bench_knob_{prom_suffix}",
+                              f"Final tuning knob: {prom_suffix}",
+                              knobs[src_key], telem_labels)
+
+                if "reflex" in knobs:
+                    gauge("pandemonium_bench_reflex_events",
+                          "Reflex tighten events",
+                          knobs["reflex"], telem_labels)
+                if "tightened" in knobs:
+                    val = 1 if knobs["tightened"] else 0
+                    gauge("pandemonium_bench_tightened",
+                          "Graduated relax tighten active",
+                          val, telem_labels)
+
+                for regime_key in ["ticks_light", "ticks_mixed", "ticks_heavy"]:
+                    if regime_key in knobs:
+                        regime_name = regime_key.replace("ticks_", "")
+                        gauge("pandemonium_bench_regime_ticks",
+                              "Ticks spent in each regime",
+                              knobs[regime_key],
+                              {**telem_labels, "regime": regime_name})
+
+                for l2_key in ["l2_hit_batch", "l2_hit_interactive",
+                               "l2_hit_latcrit"]:
+                    if l2_key in knobs:
+                        tier = l2_key.replace("l2_hit_", "")
+                        gauge("pandemonium_bench_l2_hit_pct",
+                              "L2 cache hit rate by tier",
+                              knobs[l2_key],
+                              {**telem_labels, "tier": tier})
+
+            if tick_agg:
+                for field in ["idle_pct", "preempt", "guard_clamps",
+                              "wake_avg_us", "p99_us"]:
+                    if field in tick_agg:
+                        stats = tick_agg[field]
+                        gauge(f"pandemonium_bench_{field}_mean",
+                              f"Mean {field} during measurement",
+                              stats["mean"], telem_labels)
+
+                regime_counts = tick_agg.get("regime_counts", {})
+                for regime, count in regime_counts.items():
+                    gauge("pandemonium_bench_regime_observed",
+                          "Observed regime ticks during measurement",
+                          count, {**telem_labels, "regime": regime})
 
     ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
-    path = ARCHIVE_DIR / f"{version}-{stamp}.json"
-    path.write_text(json.dumps(archive, indent=2) + "\n")
+    version = data.get("version", "unknown")
+    path = ARCHIVE_DIR / f"{version}-{stamp}.prom"
+    path.write_text("\n".join(lines) + "\n")
     return path
 
 
-# =============================================================================
-# PHASE 2: PANDEMONIUM SCALING ANALYSIS
-# =============================================================================
+# PROMETHEUS LIVE OUTPUT (BENCH-SYS)
 
-def run_scale_test(schedulers: list[str] | None = None) -> tuple[int, str]:
-    """Run the Rust scaling test (cargo test --test scale).
+_SYS_TICK_FIELDS = [
+    ("dispatches", "pandemonium_bench_dispatches"),
+    ("idle_pct", "pandemonium_bench_idle_pct"),
+    ("shared", "pandemonium_bench_shared"),
+    ("preempt", "pandemonium_bench_preempt"),
+    ("keep", "pandemonium_bench_keep"),
+    ("kick_hard", "pandemonium_bench_kick_hard"),
+    ("kick_soft", "pandemonium_bench_kick_soft"),
+    ("enq_wake", "pandemonium_bench_enq_wake"),
+    ("enq_requeue", "pandemonium_bench_enq_requeue"),
+    ("wake_avg_us", "pandemonium_bench_wake_us"),
+    ("lat_idle_us", "pandemonium_bench_lat_idle_us"),
+    ("lat_kick_us", "pandemonium_bench_lat_kick_us"),
+    ("guard_clamps", "pandemonium_bench_guard_clamps"),
+    ("p99_us", "pandemonium_bench_p99_us"),
+    ("slice_us", "pandemonium_bench_slice_us"),
+    ("batch_us", "pandemonium_bench_batch_us"),
+    ("io_pct", "pandemonium_bench_io_pct"),
+    ("procdb_total", "pandemonium_bench_procdb_total"),
+    ("procdb_confident", "pandemonium_bench_procdb_confident"),
+    ("procdb_hits", "pandemonium_bench_procdb_total"),
+]
 
-    Returns (exit_code, latency_report_text).
-    """
-    log_info("Ensuring test binary is built before sudo...")
-    if not build_test("scale"):
-        return 1, ""
-
-    print()
-    ncpus = os.cpu_count()
-    if ncpus:
-        log_info(f"System CPUs: {ncpus}")
-    log_info(f"Log directory: {LOG_DIR}/")
-    log_info("Running benchmark (requires root for sched_ext + CPU hotplug)...")
-
-    env = {**os.environ, "CARGO_TARGET_DIR": str(TARGET_DIR)}
-    if schedulers:
-        env["PANDEMONIUM_SCX_SCHEDULERS"] = ",".join(schedulers)
-
-    print()
-    ret = run_cmd(
-        ["sudo", "-E",
-         f"CARGO_TARGET_DIR={TARGET_DIR}",
-         "cargo", "test",
-         "--test", "scale", "--release",
-         "--", "--ignored", "--test-threads=1", "--nocapture"],
-        env=env,
-        cwd=SCRIPT_DIR,
-    )
-    print()
-
-    fix_ownership()
-
-    latency_text = ""
-    if LOG_DIR.exists():
-        logs = sorted(LOG_DIR.glob("scale-*.log"),
-                      key=lambda p: p.stat().st_mtime)
-        if logs:
-            latest = logs[-1]
-            size = latest.stat().st_size
-            log_info(f"Latest log: {latest} ({size} bytes)")
-            latency_text = latest.read_text()
-        else:
-            log_warn(f"No scale logs found in {LOG_DIR}")
-    else:
-        log_warn(f"Log directory does not exist: {LOG_DIR}")
-
-    return ret, latency_text
+_SYS_TICK_TIERED = [
+    ("pandemonium_bench_l2_hit_pct",
+     [("l2_pct_batch", "batch"), ("l2_pct_interactive", "interactive"),
+      ("l2_pct_latcrit", "latcrit")]),
+    ("pandemonium_bench_tier_p99_us",
+     [("tier_p99_batch", "batch"), ("tier_p99_interactive", "interactive"),
+      ("tier_p99_latcrit", "latcrit")]),
+]
 
 
-# =============================================================================
+def prom_sys_create(path: Path, version: str, git: dict, max_cpus: int):
+    """Create .prom with metadata header and all HELP/TYPE declarations."""
+    dirty = "true" if git.get("dirty") else "false"
+    commit = git.get("commit", "unknown")
+
+    decls = [
+        ("pandemonium_bench_dispatches", "Dispatches per second"),
+        ("pandemonium_bench_idle_pct", "Idle hit percentage"),
+        ("pandemonium_bench_shared", "Shared dispatches"),
+        ("pandemonium_bench_preempt", "Preemptions"),
+        ("pandemonium_bench_keep", "Keep running count"),
+        ("pandemonium_bench_kick_hard", "Hard kick count"),
+        ("pandemonium_bench_kick_soft", "Soft kick count"),
+        ("pandemonium_bench_enq_wake", "Enqueue wakeup count"),
+        ("pandemonium_bench_enq_requeue", "Enqueue requeue count"),
+        ("pandemonium_bench_wake_us", "Mean wakeup latency us"),
+        ("pandemonium_bench_lat_idle_us", "Idle path latency us"),
+        ("pandemonium_bench_lat_kick_us", "Kick path latency us"),
+        ("pandemonium_bench_guard_clamps", "Guard clamp events"),
+        ("pandemonium_bench_p99_us", "P99 wakeup latency us"),
+        ("pandemonium_bench_slice_us", "Current time slice us"),
+        ("pandemonium_bench_batch_us", "Current batch slice us"),
+        ("pandemonium_bench_io_pct", "IO sleep percentage"),
+        ("pandemonium_bench_procdb_total", "ProcDb profiles"),
+        ("pandemonium_bench_procdb_confident", "Confident ProcDb profiles"),
+        ("pandemonium_bench_l2_hit_pct", "L2 cache hit rate by tier"),
+        ("pandemonium_bench_tier_p99_us", "Per-tier P99 latency us"),
+        ("pandemonium_bench_knob_slice_ns", "Final knob: time slice ns"),
+        ("pandemonium_bench_knob_batch_ns", "Final knob: batch slice ns"),
+        ("pandemonium_bench_knob_preempt_ns", "Final knob: preempt thresh ns"),
+        ("pandemonium_bench_knob_demotion_ns", "Final knob: demotion thresh ns"),
+        ("pandemonium_bench_knob_lag", "Final knob: lag scale"),
+        ("pandemonium_bench_reflex_events", "Reflex tighten events"),
+        ("pandemonium_bench_tightened", "Graduated relax tighten active"),
+        ("pandemonium_bench_regime_ticks", "Ticks spent in each regime"),
+        ("pandemonium_bench_latency_samples", "Latency probe samples"),
+        ("pandemonium_bench_latency_median_us", "Median probe latency us"),
+        ("pandemonium_bench_latency_p99_us", "P99 probe latency us"),
+        ("pandemonium_bench_latency_worst_us", "Worst probe latency us"),
+    ]
+
+    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        f.write("# HELP pandemonium_bench_info Build and run metadata\n")
+        f.write("# TYPE pandemonium_bench_info gauge\n")
+        f.write(f'pandemonium_bench_info{{version="{version}",'
+                f'git_commit="{commit}",git_dirty="{dirty}"}} 1\n')
+        f.write("# HELP pandemonium_bench_max_cpus Maximum CPUs available\n")
+        f.write("# TYPE pandemonium_bench_max_cpus gauge\n")
+        f.write(f"pandemonium_bench_max_cpus {max_cpus}\n")
+        for name, help_text in decls:
+            f.write(f"# HELP {name} {help_text}\n")
+            f.write(f"# TYPE {name} gauge\n")
+
+
+def prom_sys_append_ticks(path: Path, ticks: list[dict],
+                          label_str: str, base_ts_ms: int):
+    """Append tick metrics to .prom file. Returns lines written."""
+    if not ticks:
+        return 0
+    with open(path, "a") as f:
+        for i, tick in enumerate(ticks):
+            ts = base_ts_ms - (len(ticks) - 1 - i) * 1000
+            regime = tick.get("regime", "")
+            if regime:
+                f.write(f"# tick regime={regime}\n")
+            for tick_key, prom_name in _SYS_TICK_FIELDS:
+                if tick_key in tick:
+                    f.write(f"{prom_name}{{{label_str}}} "
+                            f"{tick[tick_key]} {ts}\n")
+            for prom_name, tiers in _SYS_TICK_TIERED:
+                for tier_key, tier_name in tiers:
+                    if tier_key in tick:
+                        f.write(f'{prom_name}{{{label_str},'
+                                f'tier="{tier_name}"}} '
+                                f'{tick[tier_key]} {ts}\n')
+    return len(ticks)
+
+
+def prom_sys_append_knobs(path: Path, knobs: dict, label_str: str):
+    """Append [KNOBS] shutdown metrics to .prom file."""
+    if not knobs:
+        return
+    knob_map = [
+        ("slice_ns", "pandemonium_bench_knob_slice_ns"),
+        ("batch_slice_ns", "pandemonium_bench_knob_batch_ns"),
+        ("preempt_thresh_ns", "pandemonium_bench_knob_preempt_ns"),
+        ("cpu_bound_thresh_ns", "pandemonium_bench_knob_demotion_ns"),
+        ("lag_scale", "pandemonium_bench_knob_lag"),
+    ]
+    with open(path, "a") as f:
+        f.write("# shutdown knobs\n")
+        for src, prom in knob_map:
+            if src in knobs:
+                f.write(f"{prom}{{{label_str}}} {knobs[src]}\n")
+        if "reflex" in knobs:
+            f.write(f"pandemonium_bench_reflex_events{{{label_str}}} "
+                    f"{knobs['reflex']}\n")
+        if "tightened" in knobs:
+            val = 1 if knobs["tightened"] else 0
+            f.write(f"pandemonium_bench_tightened{{{label_str}}} {val}\n")
+        for rk in ["ticks_light", "ticks_mixed", "ticks_heavy"]:
+            if rk in knobs:
+                rname = rk.replace("ticks_", "")
+                f.write(f'pandemonium_bench_regime_ticks{{{label_str},'
+                        f'regime="{rname}"}} {knobs[rk]}\n')
+        for lk in ["l2_hit_batch", "l2_hit_interactive", "l2_hit_latcrit"]:
+            if lk in knobs:
+                tier = lk.replace("l2_hit_", "")
+                f.write(f'pandemonium_bench_l2_hit_pct{{{label_str},'
+                        f'tier="{tier}"}} {knobs[lk]}\n')
+
+
+def prom_sys_append_probe(path: Path, lat: dict, label_str: str):
+    """Append latency probe results to .prom file."""
+    if not lat or lat.get("samples", 0) == 0:
+        return
+    with open(path, "a") as f:
+        f.write("# latency probe\n")
+        f.write(f"pandemonium_bench_latency_samples{{{label_str}}} "
+                f"{lat['samples']}\n")
+        f.write(f"pandemonium_bench_latency_median_us{{{label_str}}} "
+                f"{lat['median_us']}\n")
+        f.write(f"pandemonium_bench_latency_p99_us{{{label_str}}} "
+                f"{lat['p99_us']}\n")
+        f.write(f"pandemonium_bench_latency_worst_us{{{label_str}}} "
+                f"{lat['worst_us']}\n")
+
+
+# REPORT
+
+def format_report(data: dict) -> str:
+    """Format benchmark results into a human-readable report."""
+    lines = []
+    lines.append("PANDEMONIUM BENCH-SCALE")
+    lines.append(f"VERSION:     {data.get('version', '?')}")
+    lines.append(f"ITERATIONS:  {data.get('iterations', '?')}")
+    lines.append(f"MAX CPUS:    {data.get('max_cpus', '?')}")
+    lines.append("")
+
+    results = data.get("results", {})
+    sorted_cores = sorted(results.keys(), key=int)
+
+    for cores_str in sorted_cores:
+        schedulers = results[cores_str]
+        lines.append(f"[{cores_str} CORES]")
+
+        # Throughput table
+        lines.append(f"{'SCHEDULER':<28} {'MEAN':>10} {'STDEV':>10} "
+                     f"{'VS EEVDF':>12}")
+        for sched_name, sched_data in schedulers.items():
+            tp = sched_data.get("throughput", {})
+            if "mean_s" not in tp:
+                continue
+            delta = tp.get("vs_eevdf_pct")
+            delta_str = f"{delta:+.1f}%" if delta is not None else "(baseline)"
+            lines.append(f"{sched_name:<28} {tp['mean_s']:>9.2f}s "
+                        f"{tp.get('stdev_s', 0):>9.2f}s {delta_str:>12}")
+
+        # Latency table
+        has_latency = any(s.get("latency", {}).get("samples", 0) > 0
+                         for s in schedulers.values())
+        if has_latency:
+            lines.append("")
+            lines.append(f"{'SCHEDULER':<28} {'SAMPLES':>8} {'MEDIAN':>10} "
+                        f"{'P99':>10} {'WORST':>10}")
+            for sched_name, sched_data in schedulers.items():
+                lat = sched_data.get("latency", {})
+                if lat.get("samples", 0) == 0:
+                    continue
+                lines.append(
+                    f"{sched_name:<28} {lat['samples']:>8} "
+                    f"{lat['median_us']:>9}us {lat['p99_us']:>9}us "
+                    f"{lat['worst_us']:>9}us")
+
+        lines.append("")
+
+    # Summary matrix: throughput delta vs EEVDF
+    all_schedulers = []
+    for cores_str in sorted_cores:
+        for name in results[cores_str]:
+            if name not in all_schedulers:
+                all_schedulers.append(name)
+
+    if len(all_schedulers) > 1 and len(sorted_cores) > 1:
+        lines.append("THROUGHPUT VS EEVDF (NEGATIVE = FASTER)")
+        header = f"{'SCHEDULER':<28}"
+        for c in sorted_cores:
+            header += f" {c + 'C':>8}"
+        lines.append(header)
+
+        for sched in all_schedulers:
+            if sched == all_schedulers[0]:
+                continue
+            row = f"{sched:<28}"
+            for c in sorted_cores:
+                tp = results.get(c, {}).get(sched, {}).get("throughput", {})
+                delta = tp.get("vs_eevdf_pct")
+                if delta is not None:
+                    row += f" {delta:>+7.1f}%"
+                else:
+                    row += f" {'--':>8}"
+            lines.append(row)
+
+        lines.append("")
+
+        lines.append("LATENCY P99 (us)")
+        header = f"{'SCHEDULER':<28}"
+        for c in sorted_cores:
+            header += f" {c + 'C':>8}"
+        lines.append(header)
+
+        for sched in all_schedulers:
+            row = f"{sched:<28}"
+            for c in sorted_cores:
+                lat = results.get(c, {}).get(sched, {}).get("latency", {})
+                p99 = lat.get("p99_us")
+                if p99 is not None and lat.get("samples", 0) > 0:
+                    row += f" {p99:>8}"
+                else:
+                    row += f" {'--':>8}"
+            lines.append(row)
+
+        lines.append("")
+
+    return "\n".join(lines)
+
+
 # BENCH-SCALE COMMAND
-# =============================================================================
+
+def entries_for_cores(
+    base_entries: list[tuple[str, list[str] | None]],
+    n: int,
+) -> list[tuple[str, list[str] | None]]:
+    """Adjust scheduler commands for a specific core count.
+
+    PANDEMONIUM variants get --nr-cpus N.
+    External schedulers see the online CPUs via kernel.
+    EEVDF is None (no scheduler process).
+    """
+    adjusted = []
+    for name, cmd in base_entries:
+        if cmd is None:
+            adjusted.append((name, None))
+        elif "PANDEMONIUM" in name:
+            adjusted.append((name, cmd + ["--nr-cpus", str(n)]))
+        else:
+            adjusted.append((name, list(cmd)))
+    return adjusted
+
 
 def cmd_bench_scale(args) -> int:
-    """Full benchmark: N-way scaling comparison + PANDEMONIUM latency scaling."""
+    """Unified benchmark: throughput + latency at each core count."""
 
     subprocess.run(["sudo", "true"])
 
-    # Snapshot dmesg for post-run diffing
     dmesg_start = dmesg_baseline()
 
-    # Nuke build dir if sources changed since last build
     nuke_stale_build()
 
-    # Build PANDEMONIUM
     if not build():
         return 1
 
@@ -869,13 +1139,12 @@ def cmd_bench_scale(args) -> int:
             log_error("Could not deactivate sched_ext -- is another scheduler running?")
             return 1
 
-    # RESTORE ALL CPUS FIRST: PREVIOUS RUN MAY HAVE LEFT CPUS OFFLINE.
-    # USE get_possible_cpus() (NOT get_online_cpus()) SO WE RESTORE EVERYTHING.
+    # Restore all CPUs (previous run may have left some offline)
     possible = get_possible_cpus()
     restore_all_cpus(possible)
     time.sleep(0.5)
 
-    # PRE-FLIGHT: VERIFY PANDEMONIUM CAN LOAD BPF AND ACTIVATE
+    # Pre-flight: verify PANDEMONIUM can load BPF and activate
     log_info("Pre-flight: verifying PANDEMONIUM can activate...")
     preflight = start_and_wait([str(BINARY)], "PANDEMONIUM")
     if preflight is None:
@@ -887,10 +1156,11 @@ def cmd_bench_scale(args) -> int:
     log_info("Pre-flight PASSED")
     print()
 
-    # Build entry list: EEVDF + PANDEMONIUM + externals
+    # Build entry list: EEVDF + PANDEMONIUM (BPF) + PANDEMONIUM (ADAPTIVE) + externals
     base_entries: list[tuple[str, list[str] | None]] = [
         ("EEVDF", None),
-        ("PANDEMONIUM", [str(BINARY)]),
+        ("PANDEMONIUM (BPF)", [str(BINARY), "--verbose", "--no-adaptive"]),
+        ("PANDEMONIUM (ADAPTIVE)", [str(BINARY), "--verbose"]),
     ]
 
     for name in args.schedulers:
@@ -901,17 +1171,13 @@ def cmd_bench_scale(args) -> int:
         else:
             log_warn(f"SKIPPING {name} (not installed)")
 
-    if len(base_entries) < 2:
-        log_error("Need at least 2 schedulers to compare")
-        return 1
-
     # Workload
     workload_cmd = args.cmd or f"CARGO_TARGET_DIR={TARGET_DIR} cargo build --release"
     clean_cmd = args.clean_cmd
     if not args.cmd:
         clean_cmd = f"cargo clean --target-dir {TARGET_DIR}"
 
-    # Determine core counts
+    # Core counts
     max_cpus = get_online_cpus()
     if args.core_counts:
         core_counts = [int(c.strip()) for c in args.core_counts.split(",")]
@@ -927,22 +1193,33 @@ def cmd_bench_scale(args) -> int:
     log_info(f"Core counts: {core_counts}")
     log_info(f"Iterations: {args.iterations}")
     log_info(f"Workload: {workload_cmd}")
-    n_runs = len(core_counts) * len(base_entries) * args.iterations
-    log_info(f"Total runs: {n_runs}")
     print()
 
-    # Phase 1: N-way scaling comparison (all schedulers x all core counts)
-    log_info("PHASE 1: N-WAY SCALING COMPARISON")
-    print()
+    # Data structure for all results
+    version = get_version()
+    git = get_git_info()
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
 
-    all_results: dict[int, list[tuple[str, list[float]]]] = {}
+    data = {
+        "version": version,
+        "git_commit": git["commit"],
+        "git_dirty": git["dirty"],
+        "timestamp": stamp,
+        "iterations": args.iterations,
+        "max_cpus": max_cpus,
+        "results": {},
+    }
+
+    eevdf_mean = {}  # {cores_str: mean_s} for vs_eevdf calculation
 
     with CpuGuard(max_cpus):
-        # Restore all CPUs first (previous run may have left them offline)
         restore_all_cpus(max_cpus)
         time.sleep(0.5)
 
         for n in core_counts:
+            cores_str = str(n)
+            data["results"][cores_str] = {}
+
             log_info(f"[{n} CORES]")
 
             if n < max_cpus:
@@ -959,47 +1236,88 @@ def cmd_bench_scale(args) -> int:
             print()
 
             entries = entries_for_cores(base_entries, n)
-            results = run_nway(entries, args.iterations, workload_cmd, clean_cmd)
-            all_results[n] = results
+
+            for sched_name, sched_cmd in entries:
+                log_info(f"Scheduler: {sched_name}")
+
+                sched_result: dict = {
+                    "throughput": {},
+                    "latency": {},
+                    "telemetry": {},
+                }
+
+                # Start scheduler (EEVDF = no-op)
+                guard = None
+                if sched_cmd is not None:
+                    settle = 10.0 if "ADAPTIVE" in sched_name else 5.0
+                    guard = start_and_wait(sched_cmd, sched_name,
+                                          settle_secs=settle)
+                    if guard is None:
+                        print()
+                        continue
+
+                # Latency measurement
+                latency = measure_latency(BINARY, n, iterations=args.iterations)
+                sched_result["latency"] = latency
+
+                # Throughput measurement
+                times = []
+                for i in range(args.iterations):
+                    log_info(f"Throughput iteration {i + 1}/{args.iterations}")
+                    t = timed_run(workload_cmd, clean_cmd)
+                    if t is None:
+                        log_warn(f"Workload failed under {sched_name}")
+                        break
+                    times.append(t)
+
+                if times:
+                    m, std = mean_stdev(times)
+                    tp = {"times": [round(t, 2) for t in times],
+                          "mean_s": round(m, 2),
+                          "stdev_s": round(std, 2)}
+                    if sched_name == "EEVDF":
+                        eevdf_mean[cores_str] = m
+                    elif cores_str in eevdf_mean and eevdf_mean[cores_str] > 0:
+                        delta = ((m - eevdf_mean[cores_str])
+                                 / eevdf_mean[cores_str]) * 100.0
+                        tp["vs_eevdf_pct"] = round(delta, 1)
+                    sched_result["throughput"] = tp
+
+                # Stop scheduler, capture telemetry
+                stdout = stop_and_wait(guard)
+                if stdout and "PANDEMONIUM" in sched_name:
+                    ticks = parse_tick_lines(stdout)
+                    knobs = parse_knobs_line(stdout)
+                    sched_result["telemetry"] = {
+                        "tick_count": len(ticks),
+                        "tick_aggregate": aggregate_ticks(ticks),
+                        "knobs": knobs,
+                    }
+
+                data["results"][cores_str][sched_name] = sched_result
+                print()
 
             # Restore CPUs for next round
             if n < max_cpus:
                 restore_all_cpus(max_cpus)
                 time.sleep(0.5)
 
-    report = format_scaling_report(all_results, workload_cmd,
-                                   args.iterations, max_cpus)
+    # Report
+    report = format_report(data)
     print()
     print(report)
-    print()
 
-    # Phase 2: Latency scaling (Rust test with all schedulers)
-    scale_ret = 0
-    latency_text = ""
-    if not args.skip_latency:
-        log_info("PHASE 2: LATENCY SCALING")
-        print()
-        scale_ret, latency_text = run_scale_test(args.schedulers)
-    else:
-        log_info("Phase 2 skipped (--skip-latency)")
-
-    # Save combined report (throughput + latency)
+    # Save log
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    combined = report + "\n"
-    if latency_text:
-        combined += "\n" + latency_text
     report_path = LOG_DIR / f"bench-scale-{stamp}.log"
-    report_path.write_text(combined)
+    report_path.write_text(report)
     log_info(f"Report saved to {report_path}")
 
-    # Write structured archive for cross-build comparison
-    archive_path = write_archive(all_results, latency_text,
-                                 args.iterations, max_cpus, stamp)
-    if archive_path:
-        log_info(f"Archive saved to {archive_path}")
+    # Write Prometheus metrics
+    prom_path = write_prometheus(data, stamp)
+    log_info(f"Prometheus metrics saved to {prom_path}")
 
-    # Capture dmesg diff (crashes, panics, scheduler errors)
+    # Capture dmesg
     capture_dmesg(dmesg_start, stamp)
 
     # Restart PANDEMONIUM service if it was running
@@ -1014,14 +1332,216 @@ def cmd_bench_scale(args) -> int:
         else:
             log_warn("Failed to restart PANDEMONIUM service")
 
-    if not all_results:
+    fix_ownership()
+
+    if not data["results"]:
         return 1
-    return scale_ret
+    return 0
 
 
-# =============================================================================
+# BENCH-SYS COMMAND
+
+def cmd_bench_sys(args) -> int:
+    """Live system telemetry capture. Run a scheduler, use your desktop,
+    Ctrl+C when done. Writes Prometheus metrics from the session.
+
+    --scheduler values:
+        adaptive     PANDEMONIUM with adaptive control loop (default)
+        no-adaptive  PANDEMONIUM BPF-only
+        eevdf        No scheduler (kernel default)
+        <name>       Any installed sched_ext scheduler (e.g. scx_bpfland)
+    """
+
+    scheduler = args.scheduler
+    is_pandemonium = scheduler in ("adaptive", "no-adaptive")
+    is_eevdf = scheduler == "eevdf"
+    is_external = not is_pandemonium and not is_eevdf
+
+    subprocess.run(["sudo", "true"])
+
+    dmesg_start = dmesg_baseline()
+
+    # Only build PANDEMONIUM binary when we need it (pandemonium modes or probe)
+    if is_pandemonium or args.with_probe:
+        nuke_stale_build()
+        if not build():
+            return 1
+
+    # Resolve external scheduler
+    if is_external:
+        ext_path = find_scheduler(scheduler)
+        if not ext_path:
+            log_error(f"Scheduler not found: {scheduler}")
+            return 1
+        log_info(f"Found: {scheduler} ({ext_path})")
+
+    # Stop any active sched_ext scheduler
+    if is_scx_active():
+        name = scx_scheduler_name()
+        log_warn(f"sched_ext is active ({name}) -- stopping")
+        subprocess.run(["sudo", "systemctl", "stop", "pandemonium"],
+                       capture_output=True)
+        subprocess.run(["sudo", "killall", "-INT", "pandemonium"],
+                       capture_output=True)
+        if not wait_for_deactivation(5.0):
+            subprocess.run(["sudo", "killall", "-KILL", "pandemonium"],
+                           capture_output=True)
+            if not wait_for_deactivation(3.0):
+                log_error("Could not deactivate sched_ext")
+                return 1
+
+    max_cpus = get_online_cpus()
+
+    # Build scheduler command
+    guard = None
+    if is_pandemonium:
+        sched_cmd = [str(BINARY), "--verbose"]
+        if scheduler == "no-adaptive":
+            sched_cmd.append("--no-adaptive")
+        for comp in (args.compositor or []):
+            sched_cmd.extend(["--compositor", comp])
+        sched_display = f"PANDEMONIUM ({'BPF' if scheduler == 'no-adaptive' else 'ADAPTIVE'})"
+    elif is_external:
+        sched_cmd = [scheduler]
+        sched_display = scheduler
+    else:
+        sched_cmd = None
+        sched_display = "EEVDF"
+
+    # Start scheduler (EEVDF = no-op)
+    if sched_cmd is not None:
+        settle = 10.0 if scheduler == "adaptive" else 5.0
+        guard = start_and_wait(sched_cmd, sched_display, settle_secs=settle)
+        if guard is None:
+            log_error(f"{sched_display} failed to activate")
+            capture_dmesg(dmesg_start, datetime.now().strftime("%Y%m%d-%H%M%S"))
+            return 1
+
+    # Optionally start latency probe
+    probe_proc = None
+    if args.with_probe:
+        if not BINARY.exists():
+            log_error("Probe requires PANDEMONIUM binary "
+                      "-- build failed or skipped")
+            if guard:
+                stop_and_wait(guard)
+            return 1
+        log_info("Starting latency probe (unpinned)")
+        probe_proc = subprocess.Popen(
+            [str(BINARY), "probe"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+
+    # Create .prom file immediately with header
+    version = get_version()
+    git = get_git_info()
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    prom_path = ARCHIVE_DIR / f"{version}-{stamp}.prom"
+    labels = {"scheduler": sched_display, "cores": str(max_cpus)}
+    label_str = ",".join(f'{k}="{v}"' for k, v in labels.items())
+
+    prom_sys_create(prom_path, version, git, max_cpus)
+    log_info(f"Prometheus: {prom_path}")
+
+    log_info(f"{sched_display} is active ({max_cpus} CPUs)")
+    log_info("Use your system normally. Ctrl+C to stop and collect.")
+    print()
+
+    # Live loop: append ticks to .prom as they arrive
+    ticks_written = 0
+    try:
+        while True:
+            if guard is not None and guard.proc.poll() is not None:
+                log_warn(f"{sched_display} exited unexpectedly")
+                break
+            time.sleep(1)
+
+            if is_pandemonium and guard is not None and guard.stdout_path:
+                try:
+                    stdout_text = Path(guard.stdout_path).read_text()
+                except (FileNotFoundError, PermissionError):
+                    continue
+                ticks = parse_tick_lines(stdout_text)
+                new_count = len(ticks) - ticks_written
+                if new_count > 0:
+                    now_ms = int(time.time() * 1000)
+                    prom_sys_append_ticks(
+                        prom_path, ticks[ticks_written:],
+                        label_str, now_ms)
+                    ticks_written = len(ticks)
+    except KeyboardInterrupt:
+        print()
+        log_info("Stopping...")
+
+    # Block SIGINT during final cleanup
+    prev_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+    try:
+        # Collect probe data
+        if probe_proc is not None:
+            probe_proc.send_signal(signal.SIGINT)
+            try:
+                stdout_bytes, _ = probe_proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                probe_proc.kill()
+                stdout_bytes, _ = probe_proc.communicate()
+            probe_latency = parse_probe_output(
+                stdout_bytes.decode(errors="replace"))
+            prom_sys_append_probe(prom_path, probe_latency, label_str)
+            log_info(f"Probe: {probe_latency['samples']} samples, "
+                     f"median={probe_latency['median_us']}us, "
+                     f"p99={probe_latency['p99_us']}us, "
+                     f"worst={probe_latency['worst_us']}us")
+
+        # Stop scheduler, flush remaining ticks + knobs
+        sched_stdout = stop_and_wait(guard)
+        if is_pandemonium and sched_stdout:
+            ticks = parse_tick_lines(sched_stdout)
+            if len(ticks) > ticks_written:
+                now_ms = int(time.time() * 1000)
+                prom_sys_append_ticks(
+                    prom_path, ticks[ticks_written:],
+                    label_str, now_ms)
+                ticks_written = len(ticks)
+            knobs = parse_knobs_line(sched_stdout)
+            prom_sys_append_knobs(prom_path, knobs, label_str)
+
+        # Console summary
+        print()
+        log_info(f"SESSION: {sched_display}, {max_cpus} CPUs, "
+                 f"{ticks_written} ticks")
+        log_info(f"Prometheus: {prom_path}")
+
+        capture_dmesg(dmesg_start, stamp)
+        fix_ownership()
+
+    except Exception:
+        log_error("Cleanup failed:")
+        traceback.print_exc()
+        if guard is not None:
+            try:
+                guard.stop()
+            except Exception:
+                pass
+
+    signal.signal(signal.SIGINT, prev_handler)
+
+    # Restart PANDEMONIUM service if it was enabled
+    ret = subprocess.run(["systemctl", "is-enabled", "pandemonium"],
+                         capture_output=True).returncode
+    if ret == 0:
+        log_info("Re-starting PANDEMONIUM service...")
+        subprocess.run(["sudo", "systemctl", "start", "pandemonium"],
+                       capture_output=True)
+        if wait_for_activation(5.0):
+            log_info("PANDEMONIUM service restored")
+        else:
+            log_warn("Failed to restart PANDEMONIUM service")
+
+    return 0
+
+
 # MAIN
-# =============================================================================
 
 def main() -> int:
     parser = argparse.ArgumentParser(
@@ -1031,7 +1551,7 @@ def main() -> int:
     sub = parser.add_subparsers(dest="command")
 
     bench = sub.add_parser("bench-scale",
-                           help="Full N-way + scaling benchmark")
+                           help="Unified throughput + latency benchmark")
     bench.add_argument("--cmd", type=str, default=None,
                        help="Custom workload command (default: self-build)")
     bench.add_argument("--clean-cmd", type=str, default=None,
@@ -1045,8 +1565,18 @@ def main() -> int:
     bench.add_argument("--core-counts", type=str, default=None,
                        help="Comma-separated core counts "
                             "(default: auto 2,4,8,...,max)")
-    bench.add_argument("--skip-latency", action="store_true",
-                       help="Skip Phase 2 (latency scaling)")
+
+    sys_bench = sub.add_parser("bench-sys",
+                               help="Live system telemetry capture")
+    sys_bench.add_argument("--scheduler", type=str, default="adaptive",
+                           help="Scheduler to run: adaptive (default), "
+                                "no-adaptive, eevdf, or external name "
+                                "(e.g. scx_bpfland)")
+    sys_bench.add_argument("--with-probe", action="store_true",
+                           help="Run latency probe during session")
+    sys_bench.add_argument("--compositor", action="append",
+                           help="Additional compositor process names "
+                                "(PANDEMONIUM modes only)")
 
     args = parser.parse_args()
 
@@ -1054,12 +1584,14 @@ def main() -> int:
         parser.print_help()
         return 0
 
-    # Parse scheduler list
     if hasattr(args, "schedulers") and isinstance(args.schedulers, str):
-        args.schedulers = [s.strip() for s in args.schedulers.split(",") if s.strip()]
+        args.schedulers = [s.strip() for s in args.schedulers.split(",")
+                           if s.strip()]
 
     if args.command == "bench-scale":
         return cmd_bench_scale(args)
+    if args.command == "bench-sys":
+        return cmd_bench_sys(args)
 
     log_error(f"Unknown command: {args.command}")
     return 1

@@ -3,7 +3,8 @@
 PANDEMONIUM build/run/install manager.
 
 Usage:
-    ./pandemonium.py bench-scale  Full benchmark (N-way + scaling)
+    ./pandemonium.py bench-scale  Unified throughput + latency benchmark
+    ./pandemonium.py bench-sys    Live system telemetry capture (Ctrl+C to stop)
     ./pandemonium.py install      Build + install + activate systemd service
     ./pandemonium.py clean        Wipe build artifacts
     ./pandemonium.py status       Show build/install status
@@ -24,9 +25,7 @@ from pandemonium_common import (
 )
 
 
-# =============================================================================
 # CONFIGURATION (install-specific)
-# =============================================================================
 
 INSTALL_PATH = Path("/usr/local/bin/pandemonium")
 
@@ -49,9 +48,7 @@ WantedBy=multi-user.target
 SERVICE_PATH = Path("/etc/systemd/system/pandemonium.service")
 
 
-# =============================================================================
 # COMMANDS
-# =============================================================================
 
 def cmd_install() -> int:
     """Build, install binary, create systemd service, enable and start."""
@@ -190,9 +187,7 @@ def cmd_status() -> int:
     return 0
 
 
-# =============================================================================
 # MAIN
-# =============================================================================
 
 def main() -> int:
     if len(sys.argv) < 2:
@@ -214,6 +209,12 @@ def main() -> int:
         return subprocess.run(
             [sys.executable, str(SCRIPT_DIR / "tests" / "pandemonium-tests.py"),
              "bench-scale"] + sys.argv[2:],
+            cwd=SCRIPT_DIR,
+        ).returncode
+    elif cmd == "bench-sys":
+        return subprocess.run(
+            [sys.executable, str(SCRIPT_DIR / "tests" / "pandemonium-tests.py"),
+             "bench-sys"] + sys.argv[2:],
             cwd=SCRIPT_DIR,
         ).returncode
     else:

@@ -20,9 +20,7 @@ const LOG_DIR: &str = "/tmp/pandemonium";
 const ACTIVATION_TIMEOUT: Duration = Duration::from_secs(10);
 const ACTIVATION_POLL: Duration = Duration::from_millis(500);
 
-// ---------------------------------------------------------------------------
 // HELPERS
-// ---------------------------------------------------------------------------
 
 fn binary_path() -> String {
     let target_dir = std::env::var("CARGO_TARGET_DIR")
@@ -153,9 +151,7 @@ fn timestamp() -> String {
     format!("{}-{:06}", y, secs % 1_000_000)
 }
 
-// ---------------------------------------------------------------------------
 // LAYER 2: INTEGRATION (LOAD/CLASSIFY/UNLOAD)
-// ---------------------------------------------------------------------------
 
 #[test]
 #[ignore]
@@ -219,9 +215,7 @@ fn layer2_load_classify_unload() {
     assert!(!is_scx_active(), "SCHED_EXT STILL ACTIVE AFTER STOP");
 }
 
-// ---------------------------------------------------------------------------
 // LAYER 3: LATENCY GATE (CYCLICTEST)
-// ---------------------------------------------------------------------------
 
 #[test]
 #[ignore]
@@ -294,9 +288,7 @@ fn layer3_latency_gate() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // LAYER 4: INTERACTIVE RESPONSIVENESS (WAKEUP LATENCY)
-// ---------------------------------------------------------------------------
 
 #[test]
 #[ignore]
@@ -338,9 +330,7 @@ fn layer4_interactive_responsiveness() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // LAYER 5: CONTENTION LATENCY (INTERACTIVE UNDER BATCH PRESSURE)
-// ---------------------------------------------------------------------------
 
 #[test]
 #[ignore]
@@ -417,9 +407,7 @@ fn layer5_contention_latency() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // FULL TEST GATE (RUN ALL LAYERS, PRODUCE REPORT)
-// ---------------------------------------------------------------------------
 
 #[test]
 #[ignore]

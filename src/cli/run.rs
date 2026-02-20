@@ -95,16 +95,11 @@ fn save_logs(scheduler_output: &str, dmesg: &str, returncode: i32) -> Result<(St
     let report_path = format!("{}/report-{}.log", LOG_DIR, stamp);
     let report = format!(
         "PANDEMONIUM RUN -- {stamp}\n\
-         EXIT CODE: {returncode}\n\
-         {sep}\n\
+         EXIT CODE: {returncode}\n\n\
          SCHEDULER OUTPUT\n\
-         {sep}\n\
-         {scheduler_output}\n\
-         {sep}\n\
+         {scheduler_output}\n\n\
          KERNEL LOG (DMESG)\n\
-         {sep}\n\
          {dmesg_text}\n",
-        sep = "=".repeat(60),
         dmesg_text = if dmesg.is_empty() {
             "(NO RELEVANT KERNEL MESSAGES)"
         } else {

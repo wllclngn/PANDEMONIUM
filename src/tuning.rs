@@ -2,7 +2,7 @@
 // PURE-RUST MODULE: ZERO BPF DEPENDENCIES
 // SHARED BETWEEN BINARY CRATE (scheduler.rs, adaptive.rs) AND LIB CRATE (tests)
 
-// --- REGIME THRESHOLDS (SCHMITT TRIGGER) ---
+// REGIME THRESHOLDS (SCHMITT TRIGGER)
 // DIRECTIONAL HYSTERESIS PREVENTS OSCILLATION AT REGIME BOUNDARIES.
 // WIDE DEAD ZONES: MUST CLEARLY ENTER A REGIME AND CLEARLY LEAVE IT.
 
@@ -11,7 +11,7 @@ pub const HEAVY_EXIT_PCT: u64  = 25;   // LEAVE HEAVY: IDLE > 25%
 pub const LIGHT_ENTER_PCT: u64 = 50;   // ENTER LIGHT: IDLE > 50%
 pub const LIGHT_EXIT_PCT: u64  = 30;   // LEAVE LIGHT: IDLE < 30%
 
-// --- REGIME PROFILES ---
+// REGIME PROFILES
 // PREEMPT_THRESH CONTROLS WHEN TICK PREEMPTS BATCH TASKS (IF INTERACTIVE WAITING).
 // BATCH_SLICE_NS CONTROLS MAX UNINTERRUPTED BATCH RUN WHEN NO INTERACTIVE WAITING.
 // CPU_BOUND_THRESH_NS CONTROLS DEMOTION THRESHOLD PER REGIME (FEATURE 5).
@@ -31,33 +31,33 @@ const HEAVY_PREEMPT_NS: u64   = 2_000_000;   // 2MS: SLIGHTLY RELAXED
 const HEAVY_LAG_SCALE: u64    = 2;
 const HEAVY_BATCH_NS: u64     = 20_000_000;  // 20MS: LET BATCH RIP
 
-// --- P99 CEILINGS ---
+// P99 CEILINGS
 
 const LIGHT_P99_CEIL_NS: u64  = 3_000_000;   // 3MS
 const MIXED_P99_CEIL_NS: u64  = 5_000_000;   // 5MS: BELOW 16MS FRAME BUDGET
 const HEAVY_P99_CEIL_NS: u64  = 10_000_000;  // 10MS: HEAVY LOAD, REALISTIC
 
-// --- CPU-BOUND DEMOTION THRESHOLDS (FEATURE 5) ---
+// CPU-BOUND DEMOTION THRESHOLDS
 // PER-REGIME: LENIENT IN LIGHT, AGGRESSIVE IN HEAVY
 
 pub const LIGHT_DEMOTION_NS: u64 = 3_500_000;  // 3.5MS: LENIENT, FEW CONTEND
 pub const MIXED_DEMOTION_NS: u64 = 2_500_000;  // 2.5MS: CURRENT CPU_BOUND_THRESH_NS
 pub const HEAVY_DEMOTION_NS: u64 = 2_000_000;  // 2.0MS: AGGRESSIVE
 
-// --- ADAPTIVE SAMPLES_PER_CHECK (FEATURE 4) ---
+// ADAPTIVE SAMPLES_PER_CHECK
 
 pub const LIGHT_SAMPLES_PER_CHECK: u32 = 16;
 pub const MIXED_SAMPLES_PER_CHECK: u32 = 32;
 pub const HEAVY_SAMPLES_PER_CHECK: u32 = 64;
 
-// --- CLASSIFIER THRESHOLDS (PHASE 4: POLISH) ---
+// CLASSIFIER THRESHOLDS
 // LAT_CRI SCORE BOUNDARIES FOR TIER CLASSIFICATION
 // EXPOSED AS TUNING KNOBS FOR RUNTIME ADJUSTMENT
 
 pub const DEFAULT_LAT_CRI_THRESH_HIGH: u64 = 32;  // >= THIS: LAT_CRITICAL
 pub const DEFAULT_LAT_CRI_THRESH_LOW: u64  = 8;   // >= THIS: INTERACTIVE, BELOW: BATCH
 
-// --- TUNING KNOBS ---
+// TUNING KNOBS
 // MATCHES struct tuning_knobs IN BPF (intf.h)
 
 #[repr(C)]
@@ -86,7 +86,7 @@ impl Default for TuningKnobs {
     }
 }
 
-// --- REGIME ---
+// REGIME
 
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -122,7 +122,7 @@ impl Regime {
     }
 }
 
-// --- REGIME KNOBS ---
+// REGIME KNOBS
 
 pub fn regime_knobs(r: Regime) -> TuningKnobs {
     match r {
@@ -156,7 +156,7 @@ pub fn regime_knobs(r: Regime) -> TuningKnobs {
     }
 }
 
-// --- REGIME DETECTION (SCHMITT TRIGGER) ---
+// REGIME DETECTION (SCHMITT TRIGGER)
 // DIRECTION-AWARE: CURRENT REGIME DETERMINES WHICH THRESHOLDS APPLY.
 // DEAD ZONES PREVENT OSCILLATION THAT SINGLE-BOUNDARY DETECTION CAUSED.
 
@@ -188,7 +188,7 @@ pub fn detect_regime(current: Regime, idle_pct: u64) -> Regime {
     }
 }
 
-// --- ADAPTIVE SAMPLES PER CHECK ---
+// ADAPTIVE SAMPLES PER CHECK
 
 pub fn samples_per_check_for_regime(r: Regime) -> u32 {
     match r {
@@ -198,7 +198,7 @@ pub fn samples_per_check_for_regime(r: Regime) -> u32 {
     }
 }
 
-// --- STABILITY MODE (PHASE 2.5) ---
+// STABILITY MODE
 // REFLEX THREAD HIBERNATION WHEN SYSTEM IS STABLE.
 // REDUCES P99 COMPUTATION FROM ~1250/SEC TO ~312/SEC DURING STABLE GAMING.
 
@@ -232,47 +232,7 @@ pub fn hibernate_samples_per_check(regime: Regime, stability_score: u32) -> u32 
     }
 }
 
-// --- L2 BATCH SLICE FEEDBACK (PHASE 2.5) ---
-// CLOSED-LOOP CONTROL: L2 HIT RATE DRIVES BATCH_SLICE_NS ADJUSTMENTS.
-// LOW L2 -> LONGER BATCH SLICES (FEWER MIGRATIONS).
-// HIGH L2 -> SHORTER BATCH SLICES (MORE RESPONSIVE).
-
-pub const L2_LOW_THRESH: u64 = 55;             // BELOW: L2 DEGRADED
-pub const L2_HIGH_THRESH: u64 = 70;            // ABOVE: L2 EXCELLENT
-pub const BATCH_STEP_UP_NS: u64 = 2_000_000;   // +2MS PER STEP (AGGRESSIVE RECOVERY)
-pub const BATCH_STEP_DOWN_NS: u64 = 1_000_000; // -1MS PER STEP (CONSERVATIVE TIGHTENING)
-pub const BATCH_MAX_NS: u64 = 24_000_000;      // 24MS ABSOLUTE CEILING
-pub const L2_HOLD_TICKS: u32 = 3;              // 3 CONSECUTIVE TICKS TO TRIGGER
-
-pub fn adjust_batch_slice(
-    current_batch_ns: u64,
-    baseline_batch_ns: u64,
-    l2_pct: u64,
-    l2_low_ticks: u32,
-    l2_high_ticks: u32,
-) -> (u64, u32, u32) {
-    if l2_pct < L2_LOW_THRESH {
-        let new_low = l2_low_ticks + 1;
-        if new_low >= L2_HOLD_TICKS {
-            let new_batch = (current_batch_ns + BATCH_STEP_UP_NS).min(BATCH_MAX_NS);
-            return (new_batch, 0, 0);
-        }
-        return (current_batch_ns, new_low, 0);
-    }
-    if l2_pct > L2_HIGH_THRESH {
-        let new_high = l2_high_ticks + 1;
-        if new_high >= L2_HOLD_TICKS {
-            let new_batch = current_batch_ns
-                .saturating_sub(BATCH_STEP_DOWN_NS)
-                .max(baseline_batch_ns);
-            return (new_batch, 0, 0);
-        }
-        return (current_batch_ns, 0, new_high);
-    }
-    (current_batch_ns, 0, 0)
-}
-
-// --- TELEMETRY GATING (PHASE 2.5) ---
+// TELEMETRY GATING
 
 pub fn should_print_telemetry(tick_counter: u64, stability_score: u32) -> bool {
     if stability_score >= STABILITY_THRESHOLD {
@@ -281,3 +241,46 @@ pub fn should_print_telemetry(tick_counter: u64, stability_score: u32) -> bool {
         true
     }
 }
+
+// P99 HISTOGRAM
+
+pub const HIST_BUCKETS: usize = 12;
+pub const HIST_EDGES_NS: [u64; HIST_BUCKETS] = [
+    10_000,      // 10us
+    25_000,      // 25us
+    50_000,      // 50us
+    100_000,     // 100us
+    250_000,     // 250us
+    500_000,     // 500us
+    1_000_000,   // 1ms
+    2_000_000,   // 2ms
+    5_000_000,   // 5ms
+    10_000_000,  // 10ms
+    20_000_000,  // 20ms
+    u64::MAX,    // +inf
+];
+
+// COMPUTE P99 FROM DRAINED HISTOGRAM COUNTS. PURE FUNCTION.
+// CAP AT 20MS (LAST REAL BUCKET) -- +INF WOULD POISON EVERY COMPARISON.
+pub fn compute_p99_from_histogram(counts: &[u64; HIST_BUCKETS]) -> u64 {
+    let total: u64 = counts.iter().sum();
+    if total == 0 {
+        return 0;
+    }
+    let threshold = (total * 99 + 99) / 100;
+    let mut cumulative = 0u64;
+    for i in 0..HIST_BUCKETS {
+        cumulative += counts[i];
+        if cumulative >= threshold {
+            return HIST_EDGES_NS[i].min(HIST_EDGES_NS[HIST_BUCKETS - 2]);
+        }
+    }
+    HIST_EDGES_NS[HIST_BUCKETS - 2]
+}
+
+// REFLEX TIGHTEN DECISION: USES BOTH AGGREGATE AND INTERACTIVE P99.
+// TIGHTEN IF EITHER EXCEEDS CEILING (INTERACTIVE STARVATION HIDDEN IN AGGREGATE).
+pub fn should_reflex_tighten(aggregate_p99: u64, interactive_p99: u64, ceiling: u64) -> bool {
+    aggregate_p99 > ceiling || interactive_p99 > ceiling
+}
+
