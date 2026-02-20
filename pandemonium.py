@@ -29,7 +29,11 @@ from pandemonium_common import (
 
 INSTALL_PATH = Path("/usr/local/bin/pandemonium")
 
-SERVICE_UNIT = """\
+def _service_unit(verbose: bool = False) -> str:
+    exec_line = "/usr/local/bin/pandemonium"
+    if verbose:
+        exec_line += " --verbose"
+    return f"""\
 [Unit]
 Description=PANDEMONIUM adaptive Linux scheduler (sched_ext)
 After=multi-user.target
@@ -37,7 +41,7 @@ ConditionPathExists=/sys/kernel/sched_ext
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/pandemonium
+ExecStart={exec_line}
 Restart=on-failure
 RestartSec=5
 
@@ -50,7 +54,7 @@ SERVICE_PATH = Path("/etc/systemd/system/pandemonium.service")
 
 # COMMANDS
 
-def cmd_install() -> int:
+def cmd_install(verbose: bool = False) -> int:
     """Build, install binary, create systemd service, enable and start."""
     if not build(force=True):
         return 1
@@ -71,10 +75,11 @@ def cmd_install() -> int:
 
     print()
     log_info("Installing systemd service...")
+    unit = _service_unit(verbose=verbose)
     proc = subprocess.Popen(
         ["sudo", "tee", str(SERVICE_PATH)],
         stdin=subprocess.PIPE, stdout=subprocess.DEVNULL)
-    proc.communicate(input=SERVICE_UNIT.encode())
+    proc.communicate(input=unit.encode())
     if proc.returncode != 0:
         log_error("Failed to write service file")
         return proc.returncode
@@ -198,7 +203,7 @@ def main() -> int:
     log_info(f"PANDEMONIUMv{get_version()}: {cmd} SELECTED")
 
     if cmd == "install":
-        return cmd_install()
+        return cmd_install(verbose="--verbose" in sys.argv[2:])
     elif cmd == "clean":
         return cmd_clean()
     elif cmd == "status":
