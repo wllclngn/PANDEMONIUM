@@ -8,6 +8,9 @@
 #define MAX_CPUS  1024
 #define MAX_NODES 32
 
+// KERNEL PROCESS FLAGS (NOT IN vmlinux.h -- THESE ARE #define MACROS)
+#define PF_KTHREAD 0x00200000
+
 // TUNING KNOBS -- RUST ADAPTIVE LOOP WRITES THESE, BPF READS THEM
 // SINGLE-ELEMENT BPF_MAP_TYPE_ARRAY, UPDATED EVERY 50-1000MS
 struct tuning_knobs {
@@ -18,6 +21,7 @@ struct tuning_knobs {
 	u64 cpu_bound_thresh_ns; // CPU-BOUND DEMOTION THRESHOLD (REGIME-DEPENDENT)
 	u64 lat_cri_thresh_high; // CLASSIFIER: LAT_CRITICAL THRESHOLD (DEFAULT 32)
 	u64 lat_cri_thresh_low;  // CLASSIFIER: INTERACTIVE THRESHOLD (DEFAULT 8)
+	u64 affinity_mode;      // L2 PLACEMENT: 0=OFF, 1=WEAK, 2=STRONG
 };
 
 // PER-CPU STATISTICS (BPF_MAP_TYPE_PERCPU_ARRAY VALUE)
@@ -49,17 +53,9 @@ struct pandemonium_stats {
 	u64 nr_l2_miss_interactive;
 	u64 nr_l2_hit_lat_crit;
 	u64 nr_l2_miss_lat_crit;
-};
-
-// WAKEUP LATENCY SAMPLE -- PUSHED TO RING BUFFER FOR P99 CALCULATION
-// BPF RECORDS THESE IN running(); RUST DRAINS FOR ADAPTIVE CONTROL
-struct wake_lat_sample {
-	u64 lat_ns;      // WAKEUP-TO-RUN LATENCY IN NANOSECONDS
-	u64 sleep_ns;    // HOW LONG TASK SLEPT BEFORE THIS WAKEUP (0 IF UNKNOWN)
-	u32 pid;         // TASK PID (FOR FILTERING)
-	u8  path;        // 0=IDLE FAST PATH, 1=HARD KICK, 2=SOFT KICK
-	u8  tier;        // TASK TIER AT WAKEUP TIME
-	u8  _pad[2];
+	// CONTENTION: DSQ DEPTH AT TIER 3 ENQUEUE
+	u64 dsq_depth_sum;
+	u64 dsq_depth_samples;
 };
 
 // PROCESS CLASSIFICATION: BPF OBSERVES, RUST LEARNS, BPF APPLIES

@@ -22,17 +22,35 @@ fn main() {
     std::fs::create_dir_all(&vmlinux_dir).expect("failed to create vmlinux dir");
 
     let vmlinux_h = vmlinux_dir.join("vmlinux.h");
-    let cache_path = PathBuf::from("/tmp/pandemonium-vmlinux.h");
+    let cache_dir = PathBuf::from(env::var("HOME").expect("HOME not set"))
+        .join(".cache")
+        .join("pandemonium");
+    std::fs::create_dir_all(&cache_dir).expect("failed to create cache dir");
+    let cache_path = cache_dir.join("vmlinux.h");
 
-    if cache_path.exists() && cache_path.metadata().map(|m| m.len() > 1000).unwrap_or(false) {
+    if cache_path.exists()
+        && cache_path
+            .metadata()
+            .map(|m| m.len() > 1000)
+            .unwrap_or(false)
+    {
         let raw = std::fs::read_to_string(&cache_path).expect("cached vmlinux.h is not utf-8");
         let patched = patch_vmlinux_c23(&raw);
         std::fs::write(&vmlinux_h, patched.as_bytes()).expect("failed to write vmlinux.h");
     } else {
         let output = Command::new("bpftool")
-            .args(["btf", "dump", "file", "/sys/kernel/btf/vmlinux", "format", "c"])
+            .args([
+                "btf",
+                "dump",
+                "file",
+                "/sys/kernel/btf/vmlinux",
+                "format",
+                "c",
+            ])
             .output()
-            .expect("bpftool not found -- install once: pacman -S bpf (only needed for first build)");
+            .expect(
+                "bpftool not found -- install once: pacman -S bpf (only needed for first build)",
+            );
         if !output.status.success() {
             panic!(
                 "bpftool failed: {}",
@@ -49,11 +67,8 @@ fn main() {
     // SO THAT #include "../vmlinux.h" FROM scx/ HEADERS RESOLVES
     let vmlinux_symlink = out_dir.join("include").join("vmlinux.h");
     let _ = std::fs::remove_file(&vmlinux_symlink);
-    std::os::unix::fs::symlink(
-        vmlinux_dir.join("vmlinux.h"),
-        &vmlinux_symlink,
-    )
-    .expect("failed to symlink vmlinux.h");
+    std::os::unix::fs::symlink(vmlinux_dir.join("vmlinux.h"), &vmlinux_symlink)
+        .expect("failed to symlink vmlinux.h");
 
     let gen_include = out_dir.join("include");
     let skel_out = out_dir.join("bpf.skel.rs");

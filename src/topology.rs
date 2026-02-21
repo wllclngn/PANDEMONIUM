@@ -11,8 +11,8 @@ use crate::scheduler::Scheduler;
 
 pub struct CpuTopology {
     pub nr_cpus: usize,
-    pub l2_domain: Vec<u32>,              // l2_domain[cpu] = group_id
-    pub l2_groups: Vec<Vec<u32>>,         // l2_groups[group_id] = [cpu, ...]
+    pub l2_domain: Vec<u32>,      // l2_domain[cpu] = group_id
+    pub l2_groups: Vec<Vec<u32>>, // l2_groups[group_id] = [cpu, ...]
 }
 
 impl CpuTopology {
@@ -64,12 +64,31 @@ impl CpuTopology {
         Ok(())
     }
 
+    // WRITE L2 SIBLINGS FLAT ARRAY TO BPF MAP
+    // l2_siblings[group_id * 8 + slot] = cpu_id, SENTINEL u32::MAX MARKS END
+    pub fn populate_l2_siblings_map(&self, sched: &Scheduler) -> Result<()> {
+        const MAX_L2_SIBLINGS: usize = 8;
+        for (gid, members) in self.l2_groups.iter().enumerate() {
+            for (slot, &cpu) in members.iter().enumerate().take(MAX_L2_SIBLINGS) {
+                sched.write_l2_sibling(gid as u32, slot as u32, cpu)?;
+            }
+            if members.len() < MAX_L2_SIBLINGS {
+                sched.write_l2_sibling(gid as u32, members.len() as u32, u32::MAX)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn log_summary(&self) {
         for (gid, members) in self.l2_groups.iter().enumerate() {
             let cpus: Vec<String> = members.iter().map(|c| c.to_string()).collect();
             log_info!("L2 GROUP {}: [{}]", gid, cpus.join(","));
         }
-        log_info!("L2 GROUPS: {} across {} CPUs", self.l2_groups.len(), self.nr_cpus);
+        log_info!(
+            "L2 GROUPS: {} across {} CPUs",
+            self.l2_groups.len(),
+            self.nr_cpus
+        );
     }
 }
 
@@ -132,8 +151,10 @@ mod tests {
             .unwrap()
             .filter(|e| {
                 e.as_ref()
-                    .map(|e| e.file_name().to_string_lossy().starts_with("cpu")
-                         && e.file_name().to_string_lossy()[3..].parse::<u32>().is_ok())
+                    .map(|e| {
+                        e.file_name().to_string_lossy().starts_with("cpu")
+                            && e.file_name().to_string_lossy()[3..].parse::<u32>().is_ok()
+                    })
                     .unwrap_or(false)
             })
             .count();
@@ -149,8 +170,12 @@ mod tests {
         // EVERY CPU MUST HAVE A VALID GROUP ID
         let max_group = topo.l2_groups.len() as u32;
         for cpu in 0..nr_cpus {
-            assert!(topo.l2_domain[cpu] < max_group || topo.l2_domain[cpu] == cpu as u32,
-                "CPU {} has invalid l2 group {}", cpu, topo.l2_domain[cpu]);
+            assert!(
+                topo.l2_domain[cpu] < max_group || topo.l2_domain[cpu] == cpu as u32,
+                "CPU {} has invalid l2 group {}",
+                cpu,
+                topo.l2_domain[cpu]
+            );
         }
 
         // AT LEAST ONE GROUP MUST EXIST

@@ -20,7 +20,7 @@ TARGET_DIR = Path("/tmp/pandemonium-build")
 LOG_DIR = Path("/tmp/pandemonium")
 ARCHIVE_DIR = Path.home() / ".cache" / "pandemonium"
 BINARY = TARGET_DIR / "release" / "pandemonium"
-VMLINUX_CACHE = Path("/tmp/pandemonium-vmlinux.h")
+VMLINUX_CACHE = ARCHIVE_DIR / "vmlinux.h"
 MIN_KERNEL = (6, 12)
 
 SOURCE_PATTERNS = [

@@ -5,17 +5,14 @@
 // ZERO BPF DEPENDENCIES. RUN OFFLINE.
 
 use pandemonium::tuning::{
-    Regime, TuningKnobs, detect_regime, regime_knobs,
-    samples_per_check_for_regime,
-    compute_stability_score, hibernate_samples_per_check,
-    should_print_telemetry,
-    compute_p99_from_histogram, should_reflex_tighten,
-    HEAVY_ENTER_PCT, HEAVY_EXIT_PCT, LIGHT_ENTER_PCT, LIGHT_EXIT_PCT,
-    LIGHT_DEMOTION_NS, MIXED_DEMOTION_NS, HEAVY_DEMOTION_NS,
-    LIGHT_SAMPLES_PER_CHECK, MIXED_SAMPLES_PER_CHECK, HEAVY_SAMPLES_PER_CHECK,
-    STABILITY_THRESHOLD, HIBERNATE_MULTIPLIER,
-    DEFAULT_LAT_CRI_THRESH_HIGH, DEFAULT_LAT_CRI_THRESH_LOW,
-    HIST_BUCKETS,
+    compute_p99_from_histogram, compute_stability_score, contention_adjust_batch_ns,
+    detect_contention, detect_regime, regime_knobs, should_print_telemetry,
+    should_reflex_tighten, sleep_adjust_batch_ns, Regime, TuningKnobs, AFFINITY_OFF,
+    AFFINITY_STRONG, AFFINITY_WEAK, BATCH_MAX_NS, CONTENTION_BATCH_CUT_PCT,
+    CONTENTION_HOLD_TICKS, DEFAULT_LAT_CRI_THRESH_HIGH, DEFAULT_LAT_CRI_THRESH_LOW,
+    DSQ_DEPTH_THRESH, GUARD_CLAMP_THRESH, HEAVY_DEMOTION_NS, HEAVY_ENTER_PCT, HEAVY_EXIT_PCT,
+    HIST_BUCKETS, LIGHT_DEMOTION_NS, LIGHT_ENTER_PCT, LIGHT_EXIT_PCT, MIXED_DEMOTION_NS,
+    STABILITY_THRESHOLD,
 };
 
 // REGIME DETECTION (SCHMITT TRIGGER)
@@ -74,6 +71,7 @@ fn regime_knobs_light_values() {
     assert_eq!(k.cpu_bound_thresh_ns, LIGHT_DEMOTION_NS);
     assert_eq!(k.lat_cri_thresh_high, DEFAULT_LAT_CRI_THRESH_HIGH);
     assert_eq!(k.lat_cri_thresh_low, DEFAULT_LAT_CRI_THRESH_LOW);
+    assert_eq!(k.affinity_mode, AFFINITY_WEAK);
 }
 
 #[test]
@@ -86,6 +84,7 @@ fn regime_knobs_mixed_values() {
     assert_eq!(k.cpu_bound_thresh_ns, MIXED_DEMOTION_NS);
     assert_eq!(k.lat_cri_thresh_high, DEFAULT_LAT_CRI_THRESH_HIGH);
     assert_eq!(k.lat_cri_thresh_low, DEFAULT_LAT_CRI_THRESH_LOW);
+    assert_eq!(k.affinity_mode, AFFINITY_STRONG);
 }
 
 #[test]
@@ -98,15 +97,16 @@ fn regime_knobs_heavy_values() {
     assert_eq!(k.cpu_bound_thresh_ns, HEAVY_DEMOTION_NS);
     assert_eq!(k.lat_cri_thresh_high, DEFAULT_LAT_CRI_THRESH_HIGH);
     assert_eq!(k.lat_cri_thresh_low, DEFAULT_LAT_CRI_THRESH_LOW);
+    assert_eq!(k.affinity_mode, AFFINITY_WEAK);
 }
 
 // DEMOTION THRESHOLD (FEATURE 5)
 
 #[test]
 fn demotion_threshold_per_regime() {
-    assert_eq!(LIGHT_DEMOTION_NS, 3_500_000);  // 3.5MS: LENIENT
-    assert_eq!(MIXED_DEMOTION_NS, 2_500_000);  // 2.5MS: CURRENT DEFAULT
-    assert_eq!(HEAVY_DEMOTION_NS, 2_000_000);  // 2.0MS: AGGRESSIVE
+    assert_eq!(LIGHT_DEMOTION_NS, 3_500_000); // 3.5MS: LENIENT
+    assert_eq!(MIXED_DEMOTION_NS, 2_500_000); // 2.5MS: CURRENT DEFAULT
+    assert_eq!(HEAVY_DEMOTION_NS, 2_000_000); // 2.0MS: AGGRESSIVE
 }
 
 #[test]
@@ -117,24 +117,12 @@ fn demotion_threshold_in_knobs() {
     assert_eq!(regime_knobs(Regime::Heavy).cpu_bound_thresh_ns, 2_000_000);
 }
 
-// ADAPTIVE BATCH SIZE (FEATURE 4)
-
-#[test]
-fn samples_per_check_per_regime() {
-    assert_eq!(samples_per_check_for_regime(Regime::Light), LIGHT_SAMPLES_PER_CHECK);
-    assert_eq!(samples_per_check_for_regime(Regime::Mixed), MIXED_SAMPLES_PER_CHECK);
-    assert_eq!(samples_per_check_for_regime(Regime::Heavy), HEAVY_SAMPLES_PER_CHECK);
-    assert_eq!(LIGHT_SAMPLES_PER_CHECK, 16);
-    assert_eq!(MIXED_SAMPLES_PER_CHECK, 32);
-    assert_eq!(HEAVY_SAMPLES_PER_CHECK, 64);
-}
-
 // TUNING KNOBS ABI
 
 #[test]
-fn tuning_knobs_size_is_7_u64() {
-    // MUST MATCH struct tuning_knobs IN intf.h (7 x u64 = 56 BYTES)
-    assert_eq!(std::mem::size_of::<TuningKnobs>(), 56);
+fn tuning_knobs_size_is_8_u64() {
+    // MUST MATCH struct tuning_knobs IN intf.h (8 x u64 = 64 BYTES)
+    assert_eq!(std::mem::size_of::<TuningKnobs>(), 64);
 }
 
 #[test]
@@ -147,6 +135,7 @@ fn tuning_knobs_default() {
     assert_eq!(k.cpu_bound_thresh_ns, MIXED_DEMOTION_NS);
     assert_eq!(k.lat_cri_thresh_high, DEFAULT_LAT_CRI_THRESH_HIGH);
     assert_eq!(k.lat_cri_thresh_low, DEFAULT_LAT_CRI_THRESH_LOW);
+    assert_eq!(k.affinity_mode, AFFINITY_OFF);
 }
 
 // STABILITY MODE
@@ -188,20 +177,6 @@ fn stability_score_resets_on_p99_above_half_ceiling() {
     assert_eq!(score, 0);
 }
 
-// HIBERNATE SAMPLES PER CHECK
-
-#[test]
-fn hibernate_samples_per_check_base_when_unstable() {
-    let spc = hibernate_samples_per_check(Regime::Mixed, 5);
-    assert_eq!(spc, MIXED_SAMPLES_PER_CHECK);
-}
-
-#[test]
-fn hibernate_samples_per_check_4x_when_stable() {
-    let spc = hibernate_samples_per_check(Regime::Mixed, STABILITY_THRESHOLD);
-    assert_eq!(spc, MIXED_SAMPLES_PER_CHECK * HIBERNATE_MULTIPLIER);
-}
-
 // TELEMETRY GATING
 
 #[test]
@@ -233,7 +208,7 @@ fn per_tier_p99_isolates_tiers() {
     let batch_p99 = compute_p99_from_histogram(&batch_counts);
     let interactive_p99 = compute_p99_from_histogram(&interactive_counts);
 
-    assert_eq!(batch_p99, 50_000);       // 50US
+    assert_eq!(batch_p99, 50_000); // 50US
     assert_eq!(interactive_p99, 1_000_000); // 1MS
 }
 
@@ -281,8 +256,88 @@ fn classifier_thresholds_in_all_regimes() {
     // ALL REGIMES USE THE SAME CLASSIFIER THRESHOLDS (FOR NOW)
     for regime in [Regime::Light, Regime::Mixed, Regime::Heavy] {
         let k = regime_knobs(regime);
-        assert_eq!(k.lat_cri_thresh_high, 32, "high threshold mismatch in {:?}", regime);
-        assert_eq!(k.lat_cri_thresh_low, 8, "low threshold mismatch in {:?}", regime);
+        assert_eq!(
+            k.lat_cri_thresh_high, 32,
+            "high threshold mismatch in {:?}",
+            regime
+        );
+        assert_eq!(
+            k.lat_cri_thresh_low, 8,
+            "low threshold mismatch in {:?}",
+            regime
+        );
     }
 }
 
+// SLEEP-INFORMED BATCH TUNING
+
+#[test]
+fn sleep_adjust_io_heavy_extends() {
+    // IO_PCT=70 -> +25% BATCH
+    let result = sleep_adjust_batch_ns(20_000_000, 70);
+    assert_eq!(result, 25_000_000);
+}
+
+#[test]
+fn sleep_adjust_idle_heavy_tightens() {
+    // IO_PCT=10 -> -25% BATCH
+    let result = sleep_adjust_batch_ns(20_000_000, 10);
+    assert_eq!(result, 15_000_000);
+}
+
+#[test]
+fn sleep_adjust_dead_zone() {
+    // IO_PCT=30 -> NO CHANGE
+    let result = sleep_adjust_batch_ns(20_000_000, 30);
+    assert_eq!(result, 20_000_000);
+}
+
+#[test]
+fn sleep_adjust_caps_at_max() {
+    // EVEN WITH IO-HEAVY, CAN'T EXCEED BATCH_MAX_NS
+    let result = sleep_adjust_batch_ns(22_000_000, 70);
+    assert_eq!(result, BATCH_MAX_NS);
+}
+
+// CONTENTION RESPONSE
+
+#[test]
+fn detect_contention_guard_clamps() {
+    // HIGH GUARD CLAMPS ALONE TRIGGERS CONTENTION
+    assert!(detect_contention(GUARD_CLAMP_THRESH + 1, 0, 1000, 0));
+}
+
+#[test]
+fn detect_contention_kick_ratio() {
+    // HIGH KICK RATIO ALONE TRIGGERS CONTENTION
+    // 310 HARD KICKS / 1000 DISPATCHES = 31% > 30% THRESHOLD
+    assert!(detect_contention(0, 310, 1000, 0));
+}
+
+#[test]
+fn detect_contention_dsq_depth() {
+    // DEEP QUEUES ALONE TRIGGER CONTENTION
+    assert!(detect_contention(0, 0, 1000, DSQ_DEPTH_THRESH + 1));
+}
+
+#[test]
+fn detect_contention_all_clear() {
+    // BELOW ALL THRESHOLDS: NO CONTENTION
+    assert!(!detect_contention(5, 100, 1000, 2));
+}
+
+#[test]
+fn contention_adjust_cuts_at_threshold() {
+    // 3 TICKS OF CONTENTION -> 75% CUT
+    let (batch, ticks) = contention_adjust_batch_ns(20_000_000, 20_000_000, CONTENTION_HOLD_TICKS);
+    assert_eq!(batch, 20_000_000 * CONTENTION_BATCH_CUT_PCT / 100);
+    assert_eq!(ticks, 0); // RESET AFTER CUT
+}
+
+#[test]
+fn contention_adjust_floors_at_half_baseline() {
+    // CAN'T GO BELOW 50% OF BASELINE EVEN WITH AGGRESSIVE CUTS
+    let (batch, _) = contention_adjust_batch_ns(8_000_000, 20_000_000, CONTENTION_HOLD_TICKS);
+    // 8M * 75% = 6M, BUT FLOOR IS 20M / 2 = 10M
+    assert_eq!(batch, 10_000_000);
+}

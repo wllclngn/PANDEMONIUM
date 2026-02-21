@@ -55,7 +55,7 @@ SERVICE_PATH = Path("/etc/systemd/system/pandemonium.service")
 # COMMANDS
 
 def cmd_install(verbose: bool = False) -> int:
-    """Build, install binary, create systemd service, enable and start."""
+    """Build, install binary, create systemd service, and start (once)."""
     if not build(force=True):
         return 1
 
@@ -85,36 +85,19 @@ def cmd_install(verbose: bool = False) -> int:
         return proc.returncode
     log_info(f"Created {SERVICE_PATH}")
 
-    for step, cmd in [
-        ("Reloading systemd", ["sudo", "systemctl", "daemon-reload"]),
-        ("Enabling service",  ["sudo", "systemctl", "enable", "pandemonium"]),
-        ("Starting service",  ["sudo", "systemctl", "start", "pandemonium"]),
-    ]:
-        log_info(step + "...")
-        ret = subprocess.run(cmd).returncode
-        if ret != 0:
-            log_error(f"{step} failed (exit {ret})")
-            return ret
-
-    log_info("Waiting for sched_ext activation...")
-    for _ in range(50):
-        try:
-            active = Path("/sys/kernel/sched_ext/root/ops").read_text().strip()
-            if active:
-                log_info(f"sched_ext active: {active}")
-                break
-        except (FileNotFoundError, PermissionError):
-            pass
-        time.sleep(0.1)
-    else:
-        log_warn("sched_ext did not activate within 5s (check: systemctl status pandemonium)")
+    ret = subprocess.run(["sudo", "systemctl", "daemon-reload"]).returncode
+    if ret != 0:
+        log_error("systemctl daemon-reload failed")
+        return ret
 
     print()
-    log_info("PANDEMONIUM is installed and driving your system")
-    log_info("Manage with:")
+    log_info("PANDEMONIUM is installed")
+    log_info("To start:")
+    log_info("  sudo systemctl start pandemonium")
+    log_info("To start on boot (after confirming it works on your hardware):")
+    log_info("  sudo systemctl enable pandemonium")
+    log_info("To check status:")
     log_info("  systemctl status pandemonium")
-    log_info("  systemctl stop pandemonium")
-    log_info("  systemctl restart pandemonium")
     return 0
 
 

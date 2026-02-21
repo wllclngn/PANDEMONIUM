@@ -21,7 +21,6 @@ mod tuning;
 
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -83,7 +82,6 @@ enum SubCmd {
 
     /// CPU-pinned stress worker for bench-scale (internal use)
     StressWorker(StressWorkerArgs),
-
 }
 
 #[derive(Parser)]
@@ -173,9 +171,7 @@ fn main() -> Result<()> {
             cli::probe::run_probe(args.death_pipe_fd);
             Ok(())
         }
-        Some(SubCmd::Start(args)) => {
-            cli::run::run_start(args.observe, &args.sched_args)
-        }
+        Some(SubCmd::Start(args)) => cli::run::run_start(args.observe, &args.sched_args),
         Some(SubCmd::Dmesg) => cli::run::run_dmesg(),
         Some(SubCmd::Bench(args)) => cli::bench::run_bench(
             args.mode,
@@ -200,43 +196,43 @@ fn main() -> Result<()> {
 }
 
 // DEFAULT COMPOSITORS: BOOSTED TO LAT_CRITICAL VIA BPF MAP LOOKUP
-const DEFAULT_COMPOSITORS: &[&str] = &[
-    "kwin", "gnome-shell", "sway", "Hyprland", "picom", "weston",
-];
+const DEFAULT_COMPOSITORS: &[&str] =
+    &["kwin", "gnome-shell", "sway", "Hyprland", "picom", "weston"];
 
-fn run_scheduler(verbose: bool, dump_log: bool, nr_cpus: Option<u64>, no_adaptive: bool, extra_compositors: &[String]) -> Result<()> {
+fn run_scheduler(
+    verbose: bool,
+    dump_log: bool,
+    nr_cpus: Option<u64>,
+    no_adaptive: bool,
+    extra_compositors: &[String],
+) -> Result<()> {
     ctrlc::set_handler(move || {
         SHUTDOWN.store(true, Ordering::Relaxed);
     })?;
 
-    let nr_cpus_display = nr_cpus.unwrap_or_else(|| {
-        libbpf_rs::num_possible_cpus().unwrap_or(1) as u64
-    });
-    let governor = std::fs::read_to_string(
-        "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor",
-    )
-    .unwrap_or_default()
-    .trim()
-    .to_string();
+    let nr_cpus_display =
+        nr_cpus.unwrap_or_else(|| libbpf_rs::num_possible_cpus().unwrap_or(1) as u64);
+    let governor = std::fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
 
     log_info!("PANDEMONIUM v{}", env!("CARGO_PKG_VERSION"));
     log_info!(
         "CPUS: {} (governor: {})",
         nr_cpus_display,
-        if governor.is_empty() { "unknown" } else { &governor }
+        if governor.is_empty() {
+            "unknown"
+        } else {
+            &governor
+        }
     );
     log_info!("VERBOSE: {}", verbose);
 
     let mut open_object = MaybeUninit::uninit();
 
-    let adaptive = !no_adaptive;
-
     loop {
-        let mut sched = Scheduler::init(
-            &mut open_object,
-            nr_cpus,
-            adaptive,
-        )?;
+        let mut sched = Scheduler::init(&mut open_object, nr_cpus)?;
 
         // POPULATE CACHE TOPOLOGY MAP AT STARTUP
         match topology::CpuTopology::detect(nr_cpus_display as usize) {
@@ -244,6 +240,9 @@ fn run_scheduler(verbose: bool, dump_log: bool, nr_cpus: Option<u64>, no_adaptiv
                 topo.log_summary();
                 if let Err(e) = topo.populate_bpf_map(&sched) {
                     log_warn!("CACHE TOPOLOGY MAP WRITE FAILED: {}", e);
+                }
+                if let Err(e) = topo.populate_l2_siblings_map(&sched) {
+                    log_warn!("L2 SIBLINGS MAP WRITE FAILED: {}", e);
                 }
             }
             Err(e) => log_warn!("CACHE TOPOLOGY DETECT FAILED: {}", e),
@@ -261,7 +260,7 @@ fn run_scheduler(verbose: bool, dump_log: bool, nr_cpus: Option<u64>, no_adaptiv
             }
         }
 
-        let should_restart = if !adaptive {
+        let should_restart = if no_adaptive {
             // BPF-ONLY MODE: SCHEDULER RUNS WITH DEFAULT KNOBS, NO RUST TUNING
             // STILL PRINTS STATS SO BENCHMARKS GET TELEMETRY FOR BOTH PHASES
             log_info!("PANDEMONIUM IS ACTIVE (BPF ONLY, CTRL+C TO EXIT)");
@@ -292,23 +291,55 @@ fn run_scheduler(verbose: bool, dump_log: bool, nr_cpus: Option<u64>, no_adaptiv
                 let d_idle_cnt = stats.wake_lat_idle_cnt.wrapping_sub(prev.wake_lat_idle_cnt);
                 let d_kick_sum = stats.wake_lat_kick_sum.wrapping_sub(prev.wake_lat_kick_sum);
                 let d_kick_cnt = stats.wake_lat_kick_cnt.wrapping_sub(prev.wake_lat_kick_cnt);
-                let lat_idle_us = if d_idle_cnt > 0 { d_idle_sum / d_idle_cnt / 1000 } else { 0 };
-                let lat_kick_us = if d_kick_cnt > 0 { d_kick_sum / d_kick_cnt / 1000 } else { 0 };
+                let lat_idle_us = if d_idle_cnt > 0 {
+                    d_idle_sum / d_idle_cnt / 1000
+                } else {
+                    0
+                };
+                let lat_kick_us = if d_kick_cnt > 0 {
+                    d_kick_sum / d_kick_cnt / 1000
+                } else {
+                    0
+                };
                 let delta_guard = stats.nr_guard_clamps.wrapping_sub(prev.nr_guard_clamps);
                 let delta_procdb = stats.nr_procdb_hits.wrapping_sub(prev.nr_procdb_hits);
 
                 // L2 CACHE AFFINITY DELTAS
                 let dl2_hb = stats.nr_l2_hit_batch.wrapping_sub(prev.nr_l2_hit_batch);
                 let dl2_mb = stats.nr_l2_miss_batch.wrapping_sub(prev.nr_l2_miss_batch);
-                let dl2_hi = stats.nr_l2_hit_interactive.wrapping_sub(prev.nr_l2_hit_interactive);
-                let dl2_mi = stats.nr_l2_miss_interactive.wrapping_sub(prev.nr_l2_miss_interactive);
-                let dl2_hl = stats.nr_l2_hit_lat_crit.wrapping_sub(prev.nr_l2_hit_lat_crit);
-                let dl2_ml = stats.nr_l2_miss_lat_crit.wrapping_sub(prev.nr_l2_miss_lat_crit);
-                let l2_pct_b = if dl2_hb + dl2_mb > 0 { dl2_hb * 100 / (dl2_hb + dl2_mb) } else { 0 };
-                let l2_pct_i = if dl2_hi + dl2_mi > 0 { dl2_hi * 100 / (dl2_hi + dl2_mi) } else { 0 };
-                let l2_pct_l = if dl2_hl + dl2_ml > 0 { dl2_hl * 100 / (dl2_hl + dl2_ml) } else { 0 };
+                let dl2_hi = stats
+                    .nr_l2_hit_interactive
+                    .wrapping_sub(prev.nr_l2_hit_interactive);
+                let dl2_mi = stats
+                    .nr_l2_miss_interactive
+                    .wrapping_sub(prev.nr_l2_miss_interactive);
+                let dl2_hl = stats
+                    .nr_l2_hit_lat_crit
+                    .wrapping_sub(prev.nr_l2_hit_lat_crit);
+                let dl2_ml = stats
+                    .nr_l2_miss_lat_crit
+                    .wrapping_sub(prev.nr_l2_miss_lat_crit);
+                let l2_pct_b = if dl2_hb + dl2_mb > 0 {
+                    dl2_hb * 100 / (dl2_hb + dl2_mb)
+                } else {
+                    0
+                };
+                let l2_pct_i = if dl2_hi + dl2_mi > 0 {
+                    dl2_hi * 100 / (dl2_hi + dl2_mi)
+                } else {
+                    0
+                };
+                let l2_pct_l = if dl2_hl + dl2_ml > 0 {
+                    dl2_hl * 100 / (dl2_hl + dl2_ml)
+                } else {
+                    0
+                };
 
-                let idle_pct = if delta_d > 0 { delta_idle * 100 / delta_d } else { 0 };
+                let idle_pct = if delta_d > 0 {
+                    delta_idle * 100 / delta_d
+                } else {
+                    0
+                };
 
                 if verbose {
                     println!(
@@ -321,9 +352,16 @@ fn run_scheduler(verbose: bool, dump_log: bool, nr_cpus: Option<u64>, no_adaptiv
                 }
 
                 sched.log.snapshot(
-                    delta_d, delta_idle, delta_shared,
-                    delta_preempt, delta_keep, wake_avg_us,
-                    delta_hard, delta_soft, lat_idle_us, lat_kick_us,
+                    delta_d,
+                    delta_idle,
+                    delta_shared,
+                    delta_preempt,
+                    delta_keep,
+                    wake_avg_us,
+                    delta_hard,
+                    delta_soft,
+                    lat_idle_us,
+                    lat_kick_us,
                 );
 
                 prev = stats;
@@ -335,9 +373,21 @@ fn run_scheduler(verbose: bool, dump_log: bool, nr_cpus: Option<u64>, no_adaptiv
             let l2_total_b = final_stats.nr_l2_hit_batch + final_stats.nr_l2_miss_batch;
             let l2_total_i = final_stats.nr_l2_hit_interactive + final_stats.nr_l2_miss_interactive;
             let l2_total_l = final_stats.nr_l2_hit_lat_crit + final_stats.nr_l2_miss_lat_crit;
-            let l2_cum_b = if l2_total_b > 0 { final_stats.nr_l2_hit_batch * 100 / l2_total_b } else { 0 };
-            let l2_cum_i = if l2_total_i > 0 { final_stats.nr_l2_hit_interactive * 100 / l2_total_i } else { 0 };
-            let l2_cum_l = if l2_total_l > 0 { final_stats.nr_l2_hit_lat_crit * 100 / l2_total_l } else { 0 };
+            let l2_cum_b = if l2_total_b > 0 {
+                final_stats.nr_l2_hit_batch * 100 / l2_total_b
+            } else {
+                0
+            };
+            let l2_cum_i = if l2_total_i > 0 {
+                final_stats.nr_l2_hit_interactive * 100 / l2_total_i
+            } else {
+                0
+            };
+            let l2_cum_l = if l2_total_l > 0 {
+                final_stats.nr_l2_hit_lat_crit * 100 / l2_total_l
+            } else {
+                0
+            };
             println!(
                 "[KNOBS] regime=BPF slice_ns={} batch_ns={} preempt_ns={} demotion_ns={} lag={} l2_hit=B:{}%/I:{}%/L:{}%",
                 knobs.slice_ns, knobs.batch_slice_ns,
@@ -347,25 +397,9 @@ fn run_scheduler(verbose: bool, dump_log: bool, nr_cpus: Option<u64>, no_adaptiv
 
             sched.read_exit_info()
         } else {
-            // ADAPTIVE MODE: BPF + ADAPTIVE CONTROL LOOP WITH REFLEX + MONITOR
-            let shared = Arc::new(adaptive::SharedState::new());
-            let ring_buf = adaptive::build_ring_buffer(&sched, Arc::clone(&shared))?;
-            let knobs_handle = Scheduler::knobs_map_handle()?;
-
-            let shared_reflex = Arc::clone(&shared);
-            let reflex_handle = std::thread::Builder::new()
-                .name("reflex".into())
-                .spawn(move || {
-                    adaptive::reflex_thread(ring_buf, shared_reflex, knobs_handle, &SHUTDOWN);
-                })?;
-
+            // ADAPTIVE MODE: BPF + SINGLE-THREAD MONITOR LOOP
             log_info!("PANDEMONIUM IS ACTIVE (CTRL+C TO EXIT)");
-            let restart = adaptive::monitor_loop(&mut sched, &shared, &SHUTDOWN, verbose)?;
-            // SIGNAL REFLEX THREAD TO EXIT (MONITOR MAY RETURN FROM BPF EXIT,
-            // NOT JUST CTRL+C -- WITHOUT THIS, reflex_handle.join() DEADLOCKS)
-            SHUTDOWN.store(true, Ordering::Relaxed);
-            let _ = reflex_handle.join();
-            restart
+            adaptive::monitor_loop(&mut sched, &SHUTDOWN, verbose)?
         };
 
         log_info!("PANDEMONIUM IS SHUTTING DOWN");

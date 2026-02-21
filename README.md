@@ -1,40 +1,39 @@
 # PANDEMONIUM
 
-Built in Rust and C23, PANDEMONIUM is a Linux kernel scheduler built for sched_ext. Utilizing BPF patterns, PANDEMONIUM classifies every task by its behavior--wakeup frequency, context switch rate, runtime, sleep patterns--and adapts scheduling decisions in real time. Two-thread adaptive control loop (zero mutexes), three-tier behavioral dispatch, L2 cache affinity instrumentation, workload regime detection, and a persistent process database that learns task classifications across lifetimes.
+Built in Rust and C23, PANDEMONIUM is a Linux kernel scheduler built for sched_ext. Utilizing BPF patterns, PANDEMONIUM classifies every task by its behavior--wakeup frequency, context switch rate, runtime, sleep patterns--and adapts scheduling decisions in real time. Single-thread adaptive control loop (zero mutexes), three-tier behavioral dispatch, L2 cache affinity placement, sleep-informed batch tuning, contention response, workload regime detection, and a persistent process database that learns task classifications across lifetimes.
 
-PANDEMONIUM is made possible by contributions from the sched_ext and CachyOS communities within the Linux ecosystem.
+PANDEMONIUM is included in the [sched-ext/scx](https://github.com/sched-ext/scx) project alongside scx_rusty, scx_lavd, scx_layered, scx_cosmos, and the rest of the sched_ext family. Thank you to Piotr Gorski and the sched-ext team. PANDEMONIUM is made possible by contributions from the sched_ext and CachyOS communities within the Linux ecosystem.
 
 ## Performance
 
-Benchmarked on 12 AMD Zen CPUs, kernel 6.18.9-arch1-2, clang 21.1.6. Numbers from bench-scale with warm procdb (v3.0.0).
+Benchmarked on 12 AMD Zen CPUs, kernel 6.18.9-arch1-2, clang 21.1.6. Numbers from bench-scale (v5.0.0).
 
 ### Throughput (kernel build, vs EEVDF baseline)
 
 | Cores | PANDEMONIUM | scx_bpfland |
 |-------|-------------|-------------|
-| 2     | +18.3%      | +4.8%       |
-| 4     | +7.4%       | +5.4%       |
-| 8     | +4.5%       | +5.4%       |
-| 12    | +0.6%       | +0.1%       |
+| 4     | +3.9%       | +4.2%       |
+| 8     | +1.9%       | +3.2%       |
+| 12    | -0.0%       | +0.7%       |
 
-At 12 cores, PANDEMONIUM runs at near-parity with EEVDF (+0.6%, within measurement noise). At 8 cores, overhead matches scx_bpfland -- the remaining cost is inherent sched_ext dispatch overhead. Low core counts (2-4) carry more overhead proportionally: each extra context switch costs more when there are fewer cores to absorb it.
+At 12 cores, PANDEMONIUM matches EEVDF throughput. BPF per-CPU histograms replaced the ring buffer architecture, cutting per-dispatch overhead from approximately 150-200ns to approximately 20ns (approximately 10x cheaper).
 
 ### P99 Wakeup Latency (interactive probe under CPU saturation)
 
 | Cores | EEVDF    | PANDEMONIUM | scx_bpfland | vs EEVDF   |
 |-------|----------|-------------|-------------|------------|
-| 2     | 3,848us  | 155us       | 4,960us     | **25x**    |
-| 4     | 1,006us  | 146us       | 1,887us     | **7x**     |
-| 8     | 2,315us  | 182us       | 1,977us     | **13x**    |
-| 12    | 832us    | 199us       | 1,698us     | **4x**     |
+| 2     | 4,563us  | 424us       | 3,747us     | **10.8x**  |
+| 4     | 2,409us  | 500us       | 3,123us     | **4.8x**   |
+| 8     | 1,326us  | 438us       | 2,010us     | **3x**     |
+| 12    | 1,013us  | 211us       | 2,008us     | **4.8x**   |
 
-Sub-200us P99 across all core counts under full CPU saturation. PANDEMONIUM's worst-case latency at 12 cores (1,021us) is lower than scx_bpfland's P99 (1,698us). EEVDF worst-case at 12 cores: 48ms. PANDEMONIUM worst-case: 1ms. 47x tighter.
+Sub-500us P99 across all core counts under full CPU saturation. PANDEMONIUM's worst-case at 8 cores (2,001us) is comparable to scx_bpfland's P99 (2,010us). EEVDF worst-case at 2 cores: 82ms. PANDEMONIUM worst-case: 2ms. 41x tighter.
 
 ## Key Features
 
 ### Three-Tier Dispatch
 - **Idle CPU Fast Path**: `select_cpu()` places wakeups directly to per-CPU DSQ with zero contention, kicks with `SCX_KICK_IDLE`
-- **Node-Local Placement**: `enqueue()` finds idle CPUs within the NUMA node, dispatches to per-CPU DSQ with `SCX_KICK_PREEMPT` for non-batch tasks
+- **Node-Local Placement with L2 Affinity**: `enqueue()` tries L2 sibling first (INTERACTIVE/BATCH with affinity_mode > 0), then falls back to any idle CPU within the NUMA node. LAT_CRITICAL and kernel threads (PF_KTHREAD) skip affinity for fastest-available placement
 - **Direct Preemptive Placement**: LAT_CRITICAL tasks (any path) and INTERACTIVE wakeups placed directly onto busy CPU's per-CPU DSQ with `SCX_KICK_PREEMPT`. Requeued INTERACTIVE tasks fall to overflow DSQ to avoid unnecessary BPF helper calls
 - **NUMA-Scoped Overflow**: Per-node overflow DSQ with cross-node work stealing as final fallback
 - **Event-Driven Preemption**: `tick()` checks `interactive_waiting` flag (set by enqueue when non-batch tasks hit overflow DSQ) and preempts batch tasks above `preempt_thresh_ns`. Zero polling -- no BPF timer
@@ -48,11 +47,13 @@ Sub-200us P99 across all core counts under full CPU saturation. PANDEMONIUM's wo
 - **Compositor Boosting**: BPF hash map populated by Rust at startup. Default compositors (kwin, sway, Hyprland, gnome-shell, picom, weston) always LAT_CRITICAL. User-extensible via `--compositor` CLI flag
 - **Runtime Variance Tracking**: EWMA of |runtime - avg_runtime| penalizes jittery tasks in the lat_cri formula
 
-### L2 Cache Affinity Instrumentation
-- **Per-Dispatch Tracking**: Every dispatch through `select_cpu()` and `enqueue()` compares the selected CPU's L2 domain against the task's last CPU
+### L2 Cache Affinity
+- **Active Placement**: `find_idle_l2_sibling()` in enqueue Tier 1 finds idle CPUs in the same L2 domain as the task's last CPU. Bounded loop (max 8 iterations), verifier-safe
+- **Affinity Mode**: Per-regime knob (LIGHT=WEAK, MIXED=STRONG, HEAVY=WEAK). MIXED is the gaming regime where L2 placement matters most
+- **Kernel Thread Bypass**: kworkers and ksoftirqd (PF_KTHREAD) skip L2 affinity entirely -- infrastructure threads need fastest-available, not L2-optimal
+- **Per-Dispatch Tracking**: Every dispatch compares the selected CPU's L2 domain against the task's last CPU
 - **Per-Tier Hit/Miss Counters**: Separate L2 hit rates for BATCH, INTERACTIVE, and LAT_CRITICAL tiers
-- **Cache Domain Map**: Rust populates `cache_domain` BPF map from sysfs topology at startup
-- **Adaptive Feedback**: L2 hit rate feeds into batch slice adjustment (step up when L2 degrades below 55%, step down when L2 exceeds 70%)
+- **Cache Domain Map**: Rust populates `cache_domain` and `l2_siblings` BPF maps from sysfs topology at startup
 
 ### Process Classification Database (procdb)
 - **Cross-Lifecycle Learning**: BPF publishes mature task profiles (tier + avg_runtime) keyed by `comm[16]` to an observation map
@@ -65,26 +66,32 @@ Sub-200us P99 across all core counts under full CPU saturation. PANDEMONIUM's wo
 
 ### Sleep-Aware Scheduling
 - **quiescent() Callback**: Records sleep timestamp when tasks go to sleep
-- **Sleep Duration Tracking**: `running()` computes sleep duration, pushes to ring buffer with tier and path metadata
-- **I/O-Wait Classification**: Histogram-based analysis classifies short sleepers (I/O-bound interactive) vs long sleepers. Reported as `io=N%` in telemetry
+- **Sleep Duration Tracking**: `running()` computes sleep duration, classifies into BPF per-CPU histogram (IO-WAIT / SHORT IO / MODERATE / IDLE)
+- **Sleep-Informed Batch Tuning**: IO-heavy workloads (>60% io_pct) extend batch slices +25%, idle-heavy workloads (<15%) tighten -25%, dead zone unchanged. 25ms ceiling
+- **Wakeup Latency Histograms**: Per-CPU BPF histograms (3 tiers x 12 buckets) replace the ring buffer. Cost per wakeup: 1 map lookup + 1 atomic increment (approximately 20ns)
 
 ### Adaptive Control Loop
-- **Two Threads, Zero Mutexes**: Reflex thread (ring buffer consumer, sub-millisecond response) and monitor thread (1-second control loop, regime detection). Lock-free shared state via atomics
+- **One Thread, Zero Mutexes**: Single monitor thread runs a 1-second control loop. Reads BPF histogram maps, computes P99, adjusts knobs. No ring buffer, no reflex thread
 - **Workload Regime Detection**: LIGHT (idle >50%), MIXED (10-50%), HEAVY (<10%) with Schmitt trigger hysteresis and 2-tick hold to prevent regime bouncing
 - **Regime Profiles**:
-  - LIGHT: slice 2ms, preempt 1ms, batch 20ms (low contention)
-  - MIXED: slice 1ms, preempt 1ms, batch 20ms (tight response)
-  - HEAVY: slice 4ms, preempt 2ms, batch 20ms (throughput)
-- **Reflex Tightening**: BPF emits per-wakeup latency via ring buffer. Reflex thread computes P99 from a lock-free histogram and tightens slice_ns and preempt_thresh_ns by 25% when P99 exceeds the regime ceiling. batch_slice_ns stays wide for throughput. Only fires in MIXED regime
-- **Graduated Relax**: After P99 normalizes, knobs step back toward baseline by 500us per tick with a 2-second hold. Floor is 500us (MIN_SLICE_NS)
-- **Stability Hibernation**: Tracks consecutive stable ticks (no regime changes, no guard clamps, no reflex events, P99 below ceiling). After 10 stable ticks, reflex thread polling rate drops to 4x base, telemetry output halves
-- **L2 Batch Slice Feedback**: Adjusts batch_slice_ns based on L2 cache hit rate. Steps up +2ms when L2 drops below 55% for 3 consecutive ticks, steps down -1ms when L2 exceeds 70%. Capped at 24ms ceiling, floored at regime baseline
+  - LIGHT: slice 2ms, preempt 1ms, batch 20ms, affinity WEAK
+  - MIXED: slice 1ms, preempt 1ms, batch 20ms, affinity STRONG
+  - HEAVY: slice 4ms, preempt 2ms, batch 20ms, affinity WEAK
+- **Knob Adjustment Layering**:
+  1. `regime_knobs()` sets baseline (e.g. 20ms batch, 1ms slice)
+  2. `sleep_adjust_batch_ns()` adjusts for IO/idle pattern (+/- 25% batch)
+  3. `contention_adjust_batch_ns()` cuts batch to 75% after 3 ticks of contention (floor at 50% of baseline)
+  4. Tighten check: P99 above ceiling tightens slice_ns by 25% (MIXED only)
+  5. Graduated relax: step back toward baseline by 500us/tick with 2-second hold
+  - L2 placement is a separate axis (affinity_mode knob controls BPF enqueue)
+- **Contention Detection**: Monitors guard clamps (>10), kick ratio (>30%), and DSQ queue depth (>4). Sustained contention triggers batch slice cut to reduce queue pressure
+- **Stability Tracking**: Consecutive stable ticks (no regime changes, no guard clamps, P99 below ceiling). After 10 stable ticks, telemetry output halves
 - **P99 Ceilings**: LIGHT 3ms, MIXED 5ms, HEAVY 10ms
 
 ### Core-Count Scaling
 - **Preempt Threshold**: `60 / (nr_cpu_ids + 2)`, clamped 3-20. Scales interactive kick aggressiveness with CPU count
 - **CPU Hotplug**: `cpu_online`/`cpu_offline` callbacks prevent sched_ext auto-exit during benchmark CPU restriction
-- **Topology Detection**: Parses sysfs for physical packages, L2/L3 cache domains, NUMA nodes. Populates cache_domain BPF map at init
+- **Topology Detection**: Parses sysfs for physical packages, L2/L3 cache domains, NUMA nodes. Populates cache_domain and l2_siblings BPF maps at init
 - **BPF-Verifier Safe**: All EWMA uses bit shifts, no floats. Loop bounds via `bpf_for` and `MAX_CPUS`/`MAX_NODES` defines
 
 ## Architecture
@@ -92,19 +99,21 @@ Sub-200us P99 across all core counts under full CPU saturation. PANDEMONIUM's wo
 ```
 pandemonium.py           Build/install manager (Python)
 pandemonium_common.py    Shared infrastructure (logging, build, constants)
+export_scx.py            Automated import into sched-ext/scx monorepo
 src/
   main.rs              Entry point, CLI, scheduler loop, telemetry
-  scheduler.rs         BPF skeleton lifecycle, tuning knobs I/O
-  adaptive.rs          Adaptive control loop (reflex + monitor threads)
-  tuning.rs            Regime knobs, stability scoring, L2 feedback functions
+  scheduler.rs         BPF skeleton lifecycle, tuning knobs I/O, histogram reads
+  adaptive.rs          Adaptive control loop (single monitor thread, histogram P99,
+                         sleep adjustment, contention response, tighten/relax)
+  tuning.rs            Regime knobs, stability scoring, sleep/contention functions
   procdb.rs            Process classification database (observe -> learn -> predict -> persist)
-  topology.rs          CPU topology detection (sysfs -> cache_domain BPF map)
+  topology.rs          CPU topology detection (sysfs -> cache_domain + l2_siblings BPF maps)
   event.rs             Pre-allocated ring buffer for stats time series
   log.rs               Logging macros
   lib.rs               Library root
   bpf/
     main.bpf.c         BPF scheduler (~960 lines, GNU C23)
-    intf.h             Shared structs: tuning_knobs, pandemonium_stats, wake_lat_sample, task_class_entry
+    intf.h             Shared structs: tuning_knobs, pandemonium_stats, task_class_entry
   cli/
     mod.rs             Shared constants, helpers
     check.rs           Dependency + kernel config verification
@@ -118,9 +127,9 @@ src/
 build.rs               vmlinux.h generation + C23 patching + BPF compilation
 tests/
   pandemonium-tests.py Test orchestrator (bench-scale, CPU hotplug, dmesg capture)
-  adaptive.rs          Adaptive layer tests (33 tests: regime, stability, L2 feedback)
+  adaptive.rs          Adaptive layer tests (36 tests: regime, stability, sleep, contention)
   event.rs             Unit tests (ring buffer)
-  procdb.rs            Process database tests (22 tests: confidence, eviction, persistence)
+  procdb.rs            Process database tests (26 tests: confidence, eviction, persistence)
   scale.rs             Latency scaling benchmark
 include/
   scx/                 Vendored sched_ext headers
@@ -132,7 +141,10 @@ include/
 select_cpu()  ->  Idle CPU found?  ->  Per-CPU DSQ (fast path, KICK_IDLE)
                       |
                       v (no)
-enqueue()     ->  Node-local idle?  ->  Per-CPU DSQ + PREEMPT kick
+enqueue()     ->  L2 sibling idle?  ->  Per-CPU DSQ (L2-affine placement)
+                  (skip for LAT_CRITICAL    |
+                   and kernel threads)      v (no)
+              ->  Node-local idle?  ->  Per-CPU DSQ + PREEMPT kick
                       |
                       v (no)
               ->  LAT_CRITICAL or   ->  Direct per-CPU + KICK_PREEMPT
@@ -148,19 +160,24 @@ tick()        ->  interactive_waiting?  ->  Preempt batch if avg_runtime > thres
 ### Adaptive Layer (adaptive.rs)
 
 ```
-BPF ring buffer              Reflex Thread              Monitor Thread
-(per-wakeup latency)  --->   P99 histogram       |      1s control loop
-                              |                   |      idle% -> regime
-                              v                   |      regime -> baseline knobs
-                        P99 > ceiling? --------+  |      P99 ok? -> graduated relax
-                        (MIXED only)           |  |      L2 hit% -> batch slice adjust
-                              |                v  v      stability -> hibernate polling
-                              v          BPF reads knobs on next dispatch
-                        tighten slice
-                        + preempt knobs
+BPF per-CPU histograms              Monitor Thread (1s loop)
+(wake_lat_hist, sleep_hist)  --->   Read + drain histograms
+                                    Compute P99 per tier
+                                      |
+                                      v
+                                    regime_knobs() -> baseline
+                                      -> sleep_adjust_batch_ns() -> IO/idle
+                                        -> contention_adjust() -> guard/kicks/DSQ
+                                          -> tighten check -> P99 ceiling
+                                            -> graduated relax -> step toward baseline
+                                      |
+                                      v
+                                    BPF reads knobs on next dispatch
+
+L2 placement (separate axis):  affinity_mode knob -> BPF enqueue
 ```
 
-Two threads, zero mutexes. BPF produces events, Rust reacts. Rust writes knobs, BPF reads them on the very next scheduling decision.
+One thread, zero mutexes. BPF produces histograms, Rust reads them once per second. Rust writes knobs, BPF reads them on the very next scheduling decision.
 
 ### Process Database (procdb.rs)
 
@@ -188,10 +205,11 @@ task_class_observe  -------->  ingest()  -------->  task_class_init
 | `slice_ns` | 1ms | Interactive/lat_cri slice ceiling |
 | `preempt_thresh_ns` | 1ms | Tick preemption threshold |
 | `lag_scale` | 4 | Deadline lag multiplier (higher = more vtime credit) |
-| `batch_slice_ns` | 20ms | Batch task slice ceiling (L2 feedback adjusts) |
+| `batch_slice_ns` | 20ms | Batch task slice ceiling (sleep/contention adjusts) |
 | `cpu_bound_thresh_ns` | 2.5ms | CPU-bound demotion threshold (regime-dependent) |
 | `lat_cri_thresh_high` | 32 | Classifier: LAT_CRITICAL threshold |
 | `lat_cri_thresh_low` | 8 | Classifier: INTERACTIVE threshold |
+| `affinity_mode` | 1 | L2 placement (0=OFF, 1=WEAK, 2=STRONG) |
 
 ## Requirements
 
@@ -212,7 +230,7 @@ pacman -S clang libbpf bpf rust
 ```bash
 # Build manager (recommended)
 ./pandemonium.py rebuild        # Force clean rebuild
-./pandemonium.py install        # Build + install to /usr/local/bin + systemd service
+./pandemonium.py install        # Build + install to /usr/local/bin + systemd service file
 ./pandemonium.py status         # Show build/install status
 ./pandemonium.py clean          # Wipe build artifacts
 
@@ -220,7 +238,14 @@ pacman -S clang libbpf bpf rust
 CARGO_TARGET_DIR=/tmp/pandemonium-build cargo build --release
 ```
 
-vmlinux.h is generated from the running kernel's BTF via bpftool on first build and cached at `/tmp/pandemonium-vmlinux.h`. Subsequent builds use the cache -- bpftool is not needed after the first build.
+vmlinux.h is generated from the running kernel's BTF via bpftool on first build and cached at `~/.cache/pandemonium/vmlinux.h`. Subsequent builds use the cache -- bpftool is not needed after the first build.
+
+After install, start and enable manually:
+
+```bash
+sudo systemctl start pandemonium          # Start now (one-time)
+sudo systemctl enable pandemonium         # Start on boot (after confirming it works)
+```
 
 Note: the source directory path contains spaces, so `CARGO_TARGET_DIR=/tmp/pandemonium-build` is required for the vendored libbpf Makefile.
 
@@ -288,7 +313,7 @@ d/s: 251000  idle: 5% shared: 230000  preempt: 12  keep: 0  kick: H=8000 S=22000
 
 Benchmarks compare EEVDF (kernel default), PANDEMONIUM (BPF-only and BPF-adaptive), and external sched_ext schedulers across core counts via CPU hotplug.
 
-Results are archived to `~/.cache/pandemonium/{version}-{timestamp}.json` for cross-build regression tracking.
+Results are archived to `~/.cache/pandemonium/{version}-{timestamp}.prom` (Prometheus format) for cross-build regression tracking.
 
 ## Testing
 
@@ -303,21 +328,31 @@ pandemonium test
 ./pandemonium.py bench-scale
 ```
 
-66 tests across 5 test files:
+73 tests across 5 test files:
 
 | File | Tests | Coverage |
 |------|-------|----------|
-| tests/adaptive.rs | 33 | Regime detection, tuning knobs, stability scoring, L2 feedback, hibernate, telemetry gating |
-| tests/procdb.rs | 22 | Profile confidence, eviction, persistence, determinism |
+| tests/adaptive.rs | 36 | Regime detection, tuning knobs, stability scoring, sleep adjustment, contention detection/response, telemetry gating |
+| tests/procdb.rs | 26 | Profile confidence, eviction, persistence, determinism |
 | tests/event.rs | 5 | Ring buffer, snapshot, summary |
 | src/main.rs | 6 | Topology parsing |
 | tests/gate.rs | 5 | BPF lifecycle, latency, contention (require root) |
+
+## sched-ext/scx Integration
+
+PANDEMONIUM is included in the sched-ext/scx monorepo. `export_scx.py` automates the import:
+
+```bash
+./export_scx.py /path/to/scx
+```
+
+The script copies source files into `scheds/rust/scx_pandemonium/`, renames the crate, strips `[profile.release]` (the workspace provides its own), registers the workspace member, and runs `cargo fmt`. It does not touch `build.rs` -- PANDEMONIUM's C23 keyword patching and BORE anonymous field renaming in vmlinux.h are specific to our build and not handled by `scx_cargo::BpfBuilder`.
 
 ## Attribution
 
 - `include/scx/*` headers from the [sched_ext](https://github.com/sched-ext/scx) project (GPL-2.0)
 - vmlinux.h generated from the running kernel's BTF (cached after first build)
-- Listed under "Other sched_ext Schedulers" in the [sched-ext/scx README](https://github.com/sched-ext/scx)
+- Included in the [sched-ext/scx](https://github.com/sched-ext/scx) project
 
 ## License
 

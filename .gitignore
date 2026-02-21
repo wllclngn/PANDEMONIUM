@@ -17,3 +17,6 @@ __pycache__/
 
 # Repo artifacts
 COMMIT_MESSAGE.txt
+
+# Benchmark archive (local only, dated subfolders)
+benchmark-results/

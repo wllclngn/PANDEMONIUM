@@ -27,7 +27,6 @@ char _license[] SEC("license") = "GPL";
 // CONFIGURATION (SET BY RUST VIA RODATA BEFORE LOAD)
 
 const volatile u64 nr_cpu_ids = 1;
-const volatile bool ringbuf_active = false;
 
 // BEHAVIORAL CONSTANTS
 
@@ -123,10 +122,36 @@ struct {
 	__type(value, u8);
 } compositor_map SEC(".maps");
 
+// L2 SIBLINGS MAP: FLAT ARRAY FOR L2-AWARE CPU PLACEMENT
+// l2_siblings[group_id * MAX_L2_SIBLINGS + slot] = cpu_id
+// SENTINEL: (u32)-1 MARKS END OF GROUP
+// POPULATED BY RUST AT STARTUP FROM CpuTopology
+#define MAX_L2_SIBLINGS 8
+
 struct {
-	__uint(type, BPF_MAP_TYPE_RINGBUF);
-	__uint(max_entries, 256 * 1024);
-} wake_lat_rb SEC(".maps");
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 512);
+	__type(key, u32);
+	__type(value, u32);
+} l2_siblings SEC(".maps");
+
+// WAKEUP LATENCY HISTOGRAM: 3 TIERS x 12 BUCKETS = 36 ENTRIES PER CPU
+// BPF INCREMENTS IN running(); RUST READS ONCE PER SECOND IN MONITOR LOOP
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 36);
+	__type(key, u32);
+	__type(value, u64);
+} wake_lat_hist SEC(".maps");
+
+// SLEEP DURATION HISTOGRAM: 4 BUCKETS PER CPU
+// BPF INCREMENTS IN running(); RUST READS ONCE PER SECOND
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 4);
+	__type(key, u32);
+	__type(value, u64);
+} sleep_hist SEC(".maps");
 
 // PER-TASK CONTEXT
 
@@ -207,6 +232,59 @@ static __always_inline void count_l2_affinity(struct pandemonium_stats *s,
 		if (hit) s->nr_l2_hit_lat_crit += 1;
 		else     s->nr_l2_miss_lat_crit += 1;
 	}
+}
+
+// L2 CACHE PLACEMENT: FIND IDLE SIBLING IN SAME L2 DOMAIN
+// BOUNDED LOOP (MAX 8 ITERATIONS), VERIFIER-SAFE.
+// RETURNS IDLE CPU IN SAME L2 GROUP, OR -1 IF NONE FOUND.
+
+static __always_inline s32 find_idle_l2_sibling(const struct task_ctx *tctx)
+{
+	if (tctx->last_cpu < 0)
+		return -1;
+
+	u32 lcpu = (u32)tctx->last_cpu;
+	u32 *group = bpf_map_lookup_elem(&cache_domain, &lcpu);
+	if (!group)
+		return -1;
+
+	u32 base = *group * MAX_L2_SIBLINGS;
+	for (int i = 0; i < MAX_L2_SIBLINGS; i++) {
+		u32 key = base + i;
+		u32 *val = bpf_map_lookup_elem(&l2_siblings, &key);
+		if (!val || *val == (u32)-1)
+			break;
+		s32 cpu = (s32)*val;
+		if (scx_bpf_test_and_clear_cpu_idle(cpu))
+			return cpu;
+	}
+	return -1;
+}
+
+// HISTOGRAM BUCKETING: MATCHES HIST_EDGES_NS AND SLEEP_EDGES_NS IN RUST
+
+static __always_inline u32 lat_bucket(u64 lat_ns)
+{
+	if (lat_ns <= 10000) return 0;
+	if (lat_ns <= 25000) return 1;
+	if (lat_ns <= 50000) return 2;
+	if (lat_ns <= 100000) return 3;
+	if (lat_ns <= 250000) return 4;
+	if (lat_ns <= 500000) return 5;
+	if (lat_ns <= 1000000) return 6;
+	if (lat_ns <= 2000000) return 7;
+	if (lat_ns <= 5000000) return 8;
+	if (lat_ns <= 10000000) return 9;
+	if (lat_ns <= 20000000) return 10;
+	return 11;
+}
+
+static __always_inline u32 sleep_bucket(u64 sleep_ns)
+{
+	if (sleep_ns <= 1000000) return 0;
+	if (sleep_ns <= 10000000) return 1;
+	if (sleep_ns <= 100000000) return 2;
+	return 3;
 }
 
 // EWMA
@@ -447,9 +525,18 @@ void BPF_STRUCT_OPS(pandemonium_enqueue, struct task_struct *p,
 	bool is_wakeup = tctx && tctx->awake_vtime == 0;
 
 	// TIER 1: IDLE CPU -> DIRECT PER-CPU DSQ
+	// L2 PLACEMENT: TRY IDLE SIBLING IN SAME L2 DOMAIN FIRST.
+	// LAT_CRITICAL AND KERNEL THREADS SKIP AFFINITY -- FASTEST CPU WINS.
+	// KWORKERS/KSOFTIRQD ARE INFRASTRUCTURE; NEVER L2-STEER THEM.
 	// GUARD: CPU MUST BE < nr_cpu_ids SO ITS PER-CPU DSQ EXISTS.
-	// pick_idle_cpu_node() CAN RETURN OFFLINE CPUs (THEY'RE "IDLE").
-	s32 cpu = __COMPAT_scx_bpf_pick_idle_cpu_node(p->cpus_ptr, node, 0);
+	s32 cpu = -1;
+	if (knobs && knobs->affinity_mode > 0 && tctx &&
+	    tctx->tier != TIER_LAT_CRITICAL &&
+	    !(p->flags & PF_KTHREAD)) {
+		cpu = find_idle_l2_sibling(tctx);
+	}
+	if (cpu < 0)
+		cpu = __COMPAT_scx_bpf_pick_idle_cpu_node(p->cpus_ptr, node, 0);
 	if (cpu >= 0 && (u64)cpu < nr_cpu_ids) {
 		dl = tctx ? task_deadline(p, tctx, node_dsq, knobs)
 			  : vtime_now;
@@ -553,14 +640,19 @@ void BPF_STRUCT_OPS(pandemonium_enqueue, struct task_struct *p,
 			s->nr_enq_requeue += 1;
 			s->nr_soft_kicks += 1;
 		}
+		// DSQ DEPTH: CONTENTION SIGNAL FOR RUST ADAPTIVE LAYER
+		u64 nr_queued = scx_bpf_dsq_nr_queued(node_dsq);
+		s->dsq_depth_sum += nr_queued;
+		s->dsq_depth_samples += 1;
 	}
 }
 
 // DISPATCH: CPU IS IDLE AND NEEDS WORK
-// 1. OWN PER-CPU DSQ (DIRECT PLACEMENT FROM ENQUEUE -- ZERO CONTENTION)
-// 2. NODE OVERFLOW DSQ (VTIME-ORDERED, RESPECTS BEHAVIORAL PRIORITY)
-// 3. CROSS-NODE STEAL (LAST RESORT)
-// 4. KEEP_RUNNING IF PREV STILL WANTS CPU AND NOTHING QUEUED
+// 1. ANTI-STARVATION: OVERFLOW FIRST EVERY 4TH DISPATCH (WHEN QUEUED)
+// 2. OWN PER-CPU DSQ (DIRECT PLACEMENT FROM ENQUEUE -- ZERO CONTENTION)
+// 3. NODE OVERFLOW DSQ (VTIME-ORDERED, RESPECTS BEHAVIORAL PRIORITY)
+// 4. CROSS-NODE STEAL (LAST RESORT)
+// 5. KEEP_RUNNING IF PREV STILL WANTS CPU AND NOTHING QUEUED
 //
 // NOTE: CACHE AFFINITY IN DISPATCH WAS REMOVED IN v0.9.9 BECAUSE
 // DSQ ITERATION TO FIND AFFINITY MATCHES CAUSES PRIORITY INVERSION:
@@ -571,7 +663,22 @@ void BPF_STRUCT_OPS(pandemonium_enqueue, struct task_struct *p,
 void BPF_STRUCT_OPS(pandemonium_dispatch, s32 cpu, struct task_struct *prev)
 {
 	s32 node = __COMPAT_scx_bpf_cpu_node(cpu);
+	u64 node_dsq = nr_cpu_ids + (u64)node;
 	struct pandemonium_stats *s;
+
+	// ANTI-STARVATION: PERIODICALLY DRAIN OVERFLOW BEFORE PER-CPU DSQ.
+	// WITHOUT THIS, BATCH TASKS IN THE OVERFLOW DSQ STARVE INDEFINITELY
+	// WHEN select_cpu AND enqueue TIER 1/2 CONTINUOUSLY FEED PER-CPU DSQs.
+	// EVERY 4TH DISPATCH (PER-CPU COUNTER, NO ATOMICS NEEDED): CHECK
+	// OVERFLOW FIRST. PRESERVES LOCALITY 75% OF THE TIME.
+	s = get_stats();
+	if (s && scx_bpf_dsq_nr_queued(node_dsq) > 0 &&
+	    (s->nr_dispatches & 3) == 0) {
+		if (scx_bpf_dsq_move_to_local(node_dsq)) {
+			s->nr_dispatches += 1;
+			return;
+		}
+	}
 
 	// PER-CPU DSQ: DIRECT PLACEMENT FROM ENQUEUE
 	if (scx_bpf_dsq_move_to_local((u64)cpu)) {
@@ -582,14 +689,11 @@ void BPF_STRUCT_OPS(pandemonium_dispatch, s32 cpu, struct task_struct *prev)
 	}
 
 	// NODE OVERFLOW DSQ: VTIME-ORDERED CONSUME
-	{
-		u64 node_dsq = nr_cpu_ids + (u64)node;
-		if (scx_bpf_dsq_move_to_local(node_dsq)) {
-			s = get_stats();
-			if (s)
-				s->nr_dispatches += 1;
-			return;
-		}
+	if (scx_bpf_dsq_move_to_local(node_dsq)) {
+		s = get_stats();
+		if (s)
+			s->nr_dispatches += 1;
+		return;
 	}
 
 	// CROSS-NODE STEAL
@@ -724,21 +828,20 @@ void BPF_STRUCT_OPS(pandemonium_running, struct task_struct *p)
 			}
 		}
 
-		// RING BUFFER: ONLY WHEN RUST ADAPTIVE LOOP IS CONSUMING
-		if (ringbuf_active) {
-			struct wake_lat_sample *sample =
-				bpf_ringbuf_reserve(&wake_lat_rb,
-						    sizeof(*sample), 0);
-			if (sample) {
-				sample->lat_ns = wake_lat;
-				sample->sleep_ns = sleep_dur;
-				sample->pid = p->pid;
-				sample->path = path;
-				sample->tier = (u8)tctx->tier;
-				__builtin_memset(sample->_pad, 0,
-						 sizeof(sample->_pad));
-				bpf_ringbuf_submit(sample, 0);
-			}
+		// HISTOGRAM: BPF-SIDE LATENCY BUCKETING (NO RING BUFFER)
+		u32 tier_idx = (u32)tctx->tier;
+		if (tier_idx > 2) tier_idx = 2;
+		u32 bucket = lat_bucket(wake_lat);
+		u32 hist_key = tier_idx * 12 + bucket;
+		u64 *hist_val = bpf_map_lookup_elem(&wake_lat_hist, &hist_key);
+		if (hist_val)
+			__sync_fetch_and_add(hist_val, 1);
+
+		if (sleep_dur > 0) {
+			u32 sbucket = sleep_bucket(sleep_dur);
+			u64 *sval = bpf_map_lookup_elem(&sleep_hist, &sbucket);
+			if (sval)
+				__sync_fetch_and_add(sval, 1);
 		}
 	}
 
@@ -894,6 +997,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(pandemonium_init)
 		knobs->cpu_bound_thresh_ns = 2500000;    // 2.5MS (RESERVED FOR FUTURE USE)
 		knobs->lat_cri_thresh_high = LAT_CRI_THRESH_HIGH; // 32
 		knobs->lat_cri_thresh_low  = LAT_CRI_THRESH_LOW;  // 8
+		knobs->affinity_mode = 0;                // OFF BY DEFAULT (RUST SETS PER REGIME)
 	}
 
 	return 0;
