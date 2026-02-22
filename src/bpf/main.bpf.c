@@ -480,6 +480,7 @@ s32 BPF_STRUCT_OPS(pandemonium_select_cpu, struct task_struct *p,
 		// ON AN IDLE CPU THE PER-CPU DSQ IS EMPTY, SO THIS TASK
 		// IS THE ONLY ENTRY AND GETS PICKED UP IMMEDIATELY.
 		s32 node = __COMPAT_scx_bpf_cpu_node(cpu);
+		if (node < 0 || (u32)node >= nr_nodes) node = 0;
 		u64 node_dsq = nr_cpu_ids + (u64)node;
 		u64 dl = tctx ? task_deadline(p, tctx, node_dsq, knobs)
 			      : vtime_now;
@@ -514,6 +515,7 @@ void BPF_STRUCT_OPS(pandemonium_enqueue, struct task_struct *p,
 		    u64 enq_flags)
 {
 	s32 node = __COMPAT_scx_bpf_cpu_node(scx_bpf_task_cpu(p));
+	if (node < 0 || (u32)node >= nr_nodes) node = 0;
 	u64 node_dsq = nr_cpu_ids + (u64)node;
 
 	struct task_ctx *tctx = lookup_task_ctx(p);
@@ -653,16 +655,10 @@ void BPF_STRUCT_OPS(pandemonium_enqueue, struct task_struct *p,
 // 3. NODE OVERFLOW DSQ (VTIME-ORDERED, RESPECTS BEHAVIORAL PRIORITY)
 // 4. CROSS-NODE STEAL (LAST RESORT)
 // 5. KEEP_RUNNING IF PREV STILL WANTS CPU AND NOTHING QUEUED
-//
-// NOTE: CACHE AFFINITY IN DISPATCH WAS REMOVED IN v0.9.9 BECAUSE
-// DSQ ITERATION TO FIND AFFINITY MATCHES CAUSES PRIORITY INVERSION:
-// HIGH-PRIORITY KWORKERS GET SKIPPED IN FAVOR OF LOW-PRIORITY BATCH
-// TASKS WITH BETTER AFFINITY, CAUSING 30+ SECOND RUNNABLE STALLS.
-// AFFINITY IS STILL TRACKED (last_cpu IN task_ctx, cache_domain MAP)
-// FOR FUTURE USE IN ENQUEUE-SIDE PLACEMENT.
 void BPF_STRUCT_OPS(pandemonium_dispatch, s32 cpu, struct task_struct *prev)
 {
 	s32 node = __COMPAT_scx_bpf_cpu_node(cpu);
+	if (node < 0 || (u32)node >= nr_nodes) node = 0;
 	u64 node_dsq = nr_cpu_ids + (u64)node;
 	struct pandemonium_stats *s;
 

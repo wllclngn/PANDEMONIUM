@@ -4,16 +4,16 @@ Shared infrastructure for PANDEMONIUM build/test scripts.
 Used by pandemonium.py (build manager) and tests/pandemonium-tests.py (test orchestrator).
 """
 
+import glob
 import os
 import platform
+import shutil
 import subprocess
 from datetime import datetime
 from pathlib import Path
 
 
-# =============================================================================
 # CONFIGURATION
-# =============================================================================
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 TARGET_DIR = Path("/tmp/pandemonium-build")
@@ -189,13 +189,17 @@ def build(force: bool = False) -> bool:
             log_info("No existing binary, full build required")
 
     if force:
-        log_info("Forced rebuild, cleaning package cache...")
+        log_info("Forced rebuild, cleaning package + BPF artifacts...")
         subprocess.run(
             ["cargo", "clean", "-p", "pandemonium"],
             env={**os.environ, "CARGO_TARGET_DIR": str(TARGET_DIR)},
             cwd=str(SCRIPT_DIR),
             capture_output=True,
         )
+        # NUKE BPF BUILD SCRIPT OUTPUT SO SKELETON GETS REGENERATED.
+        # cargo clean -p only removes Rust artifacts, not OUT_DIR.
+        for d in glob.glob(str(TARGET_DIR / "release" / "build" / "pandemonium-*")):
+            shutil.rmtree(d, ignore_errors=True)
 
     log_info("Building (release)...")
     ret = run_cmd(

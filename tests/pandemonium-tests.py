@@ -100,7 +100,7 @@ def fix_ownership():
     uid = os.getuid()
     gid = os.getgid()
     log_info(f"Fixing ownership to {uid}:{gid}...")
-    for d in [TARGET_DIR, LOG_DIR]:
+    for d in [TARGET_DIR, LOG_DIR, ARCHIVE_DIR]:
         if d.exists():
             subprocess.run(
                 ["sudo", "chown", "-R", f"{uid}:{gid}", str(d)],
