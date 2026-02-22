@@ -56,6 +56,8 @@ struct pandemonium_stats {
 	// CONTENTION: DSQ DEPTH AT TIER 3 ENQUEUE
 	u64 dsq_depth_sum;
 	u64 dsq_depth_samples;
+	// CPU RELEASE: TASKS RESCUED FROM LOCAL DSQ BY scx_bpf_reenqueue_local()
+	u64 nr_reenqueue;
 };
 
 // PROCESS CLASSIFICATION: BPF OBSERVES, RUST LEARNS, BPF APPLIES

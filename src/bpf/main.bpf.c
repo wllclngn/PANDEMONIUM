@@ -1014,6 +1014,22 @@ void BPF_STRUCT_OPS(pandemonium_quiescent, struct task_struct *p,
 		tctx->sleep_start_ns = bpf_ktime_get_ns();
 }
 
+// CPU RELEASE: RESCUE STRANDED TASKS WHEN RT/DL PREEMPTS OUR CPU
+// CALLED WHEN THE KERNEL TAKES A CPU AWAY FROM SCHED_EXT (DL SERVER,
+// RT TASKS, PIPEWIRE). WITHOUT THIS, TASKS THAT dispatch() MOVED TO THE
+// LOCAL DSQ VIA scx_bpf_dsq_move_to_local() GET STUCK, TRIGGERING THE
+// WATCHDOG. EVERY REFERENCE SCHEDULER IMPLEMENTS THIS.
+void BPF_STRUCT_OPS(pandemonium_cpu_release, s32 cpu,
+		    struct scx_cpu_release_args *args)
+{
+	u32 nr = scx_bpf_reenqueue_local();
+	if (nr > 0) {
+		struct pandemonium_stats *s = get_stats();
+		if (s)
+			s->nr_reenqueue += nr;
+	}
+}
+
 // CPU HOTPLUG CALLBACKS
 void BPF_STRUCT_OPS(pandemonium_cpu_online, s32 cpu) {}
 void BPF_STRUCT_OPS(pandemonium_cpu_offline, s32 cpu) {}
@@ -1028,6 +1044,7 @@ SCX_OPS_DEFINE(pandemonium_ops,
 	       .tick         = (void *)pandemonium_tick,
 	       .enable       = (void *)pandemonium_enable,
 	       .quiescent    = (void *)pandemonium_quiescent,
+	       .cpu_release  = (void *)pandemonium_cpu_release,
 	       .cpu_online   = (void *)pandemonium_cpu_online,
 	       .cpu_offline  = (void *)pandemonium_cpu_offline,
 	       .init         = (void *)pandemonium_init,

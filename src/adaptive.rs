@@ -110,6 +110,7 @@ pub fn monitor_loop(
             0
         };
         let delta_guard = stats.nr_guard_clamps.wrapping_sub(prev.nr_guard_clamps);
+        let delta_reenq = stats.nr_reenqueue.wrapping_sub(prev.nr_reenqueue);
 
         // L2 CACHE AFFINITY DELTAS
         let dl2_hb = stats.nr_l2_hit_batch.wrapping_sub(prev.nr_l2_hit_batch);
@@ -330,14 +331,14 @@ pub fn monitor_loop(
 
         if verbose && tuning::should_print_telemetry(tick_counter, stability_score) {
             println!(
-                "d/s: {:<8} idle: {}% shared: {:<6} preempt: {:<4} keep: {:<4} kick: H={:<4} S={:<4} enq: W={:<4} R={:<4} wake: {}us p99: {}us [B:{} I:{} L:{}] lat_idle: {}us lat_kick: {}us procdb: {}/{} sleep: io={}% slice: {}us batch: {}us guard: {} l2: B={}% I={}% L={}% [{}]",
+                "d/s: {:<8} idle: {}% shared: {:<6} preempt: {:<4} keep: {:<4} kick: H={:<4} S={:<4} enq: W={:<4} R={:<4} wake: {}us p99: {}us [B:{} I:{} L:{}] lat_idle: {}us lat_kick: {}us procdb: {}/{} sleep: io={}% slice: {}us batch: {}us guard: {} reenq: {} l2: B={}% I={}% L={}% [{}]",
                 delta_d, idle_pct, delta_shared, delta_preempt, delta_keep,
                 delta_hard, delta_soft, delta_enq_wake, delta_enq_requeue,
                 wake_avg_us, p99_us, tp99_b, tp99_i, tp99_l,
                 lat_idle_us, lat_kick_us,
                 db_total, db_confident,
                 io_pct, knobs.slice_ns / 1000, knobs.batch_slice_ns / 1000,
-                delta_guard,
+                delta_guard, delta_reenq,
                 l2_pct_b, l2_pct_i, l2_pct_l, regime.label(),
             );
         }

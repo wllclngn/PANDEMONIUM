@@ -303,6 +303,7 @@ fn run_scheduler(
                 };
                 let delta_guard = stats.nr_guard_clamps.wrapping_sub(prev.nr_guard_clamps);
                 let delta_procdb = stats.nr_procdb_hits.wrapping_sub(prev.nr_procdb_hits);
+                let delta_reenq = stats.nr_reenqueue.wrapping_sub(prev.nr_reenqueue);
 
                 // L2 CACHE AFFINITY DELTAS
                 let dl2_hb = stats.nr_l2_hit_batch.wrapping_sub(prev.nr_l2_hit_batch);
@@ -343,11 +344,11 @@ fn run_scheduler(
 
                 if verbose {
                     println!(
-                        "d/s: {:<8} idle: {}% shared: {:<6} preempt: {:<4} keep: {:<4} kick: H={:<4} S={:<4} enq: W={:<4} R={:<4} wake: {}us lat_idle: {}us lat_kick: {}us procdb: {} guard: {} l2: B={}% I={}% L={}% [BPF]",
+                        "d/s: {:<8} idle: {}% shared: {:<6} preempt: {:<4} keep: {:<4} kick: H={:<4} S={:<4} enq: W={:<4} R={:<4} wake: {}us lat_idle: {}us lat_kick: {}us procdb: {} guard: {} reenq: {} l2: B={}% I={}% L={}% [BPF]",
                         delta_d, idle_pct, delta_shared, delta_preempt, delta_keep,
                         delta_hard, delta_soft, delta_enq_wake, delta_enq_requeue,
                         wake_avg_us, lat_idle_us, lat_kick_us, delta_procdb, delta_guard,
-                        l2_pct_b, l2_pct_i, l2_pct_l,
+                        delta_reenq, l2_pct_b, l2_pct_i, l2_pct_l,
                     );
                 }
 

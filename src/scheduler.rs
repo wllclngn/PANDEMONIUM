@@ -50,10 +50,11 @@ pub struct PandemoniumStats {
     pub nr_l2_miss_lat_crit: u64,
     pub dsq_depth_sum: u64,
     pub dsq_depth_samples: u64,
+    pub nr_reenqueue: u64,
 }
 
 // COMPILE-TIME ABI SAFETY: MUST MATCH STRUCT LAYOUTS IN intf.h
-const _: () = assert!(std::mem::size_of::<PandemoniumStats>() == 208);
+const _: () = assert!(std::mem::size_of::<PandemoniumStats>() == 216);
 const _: () = assert!(std::mem::size_of::<TuningKnobs>() == 64);
 
 // TuningKnobs lives in tuning.rs (zero BPF dependencies, testable offline)
@@ -179,6 +180,7 @@ impl<'a> Scheduler<'a> {
                 total.nr_l2_miss_lat_crit += stats.nr_l2_miss_lat_crit;
                 total.dsq_depth_sum += stats.dsq_depth_sum;
                 total.dsq_depth_samples += stats.dsq_depth_samples;
+                total.nr_reenqueue += stats.nr_reenqueue;
             }
         }
 
