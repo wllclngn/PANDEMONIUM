@@ -9,11 +9,12 @@
 #   1. COPIES SOURCE FILES INTO scheds/rust/scx_pandemonium/
 #   2. RENAMES CRATE: pandemonium -> scx_pandemonium
 #   3. STRIPS [profile.release] (WORKSPACE PROVIDES ITS OWN)
-#   4. ADDS WORKSPACE MEMBER TO ROOT Cargo.toml IF MISSING
+#   4. REPLACES build.rs WITH scx_cargo::BpfBuilder VERSION
+#   5. SWAPS libbpf-cargo FOR scx_cargo IN [build-dependencies]
+#   6. PATCHES bpf_skel.rs INCLUDE PATH (bpf.skel.rs -> main_skel.rs)
+#   7. ADDS WORKSPACE MEMBER TO ROOT Cargo.toml IF MISSING
 #
 # WHAT IT DOES NOT DO:
-#   - DOES NOT TOUCH build.rs (C23 + BORE PATCHING IS OURS)
-#   - DOES NOT MIGRATE TO scx_cargo::BpfBuilder
 #   - DOES NOT COMMIT OR PUSH ANYTHING
 #   - DOES NOT MODIFY Cargo.lock (RUN cargo update AFTER)
 
@@ -140,6 +141,58 @@ def strip_profile_release(dst_root):
     return 0
 
 
+SCX_BUILD_RS = """\
+fn main() {
+    scx_cargo::BpfBuilder::new()
+        .unwrap()
+        .enable_intf("src/bpf/intf.h", "bpf_intf.rs")
+        .enable_skel("src/bpf/main.bpf.c", "main")
+        .build()
+        .unwrap();
+}
+"""
+
+
+def replace_build_rs(dst_root):
+    """Replace standalone build.rs with scx_cargo::BpfBuilder version."""
+    build_rs = os.path.join(dst_root, "build.rs")
+    open(build_rs, "w").write(SCX_BUILD_RS)
+    print("  REPLACE: build.rs -> scx_cargo::BpfBuilder")
+    return 1
+
+
+def swap_build_deps(dst_root):
+    """Replace libbpf-cargo with scx_cargo in [build-dependencies]."""
+    cargo_path = os.path.join(dst_root, "Cargo.toml")
+    text = open(cargo_path).read()
+    new_text = re.sub(
+        r'libbpf-cargo\s*=\s*"[^"]*"',
+        'scx_cargo = "1.0"',
+        text,
+    )
+    if new_text != text:
+        open(cargo_path, "w").write(new_text)
+        print("  SWAP: libbpf-cargo -> scx_cargo in [build-dependencies]")
+        return 1
+    print("  WARNING: libbpf-cargo not found in [build-dependencies]")
+    return 0
+
+
+def patch_bpf_skel_include(dst_root):
+    """Patch bpf_skel.rs to use BpfBuilder's output filename."""
+    skel_path = os.path.join(dst_root, "src", "bpf_skel.rs")
+    if not os.path.exists(skel_path):
+        print("  WARNING: src/bpf_skel.rs not found")
+        return 0
+    text = open(skel_path).read()
+    new_text = text.replace("/bpf.skel.rs", "/main_skel.rs")
+    if new_text != text:
+        open(skel_path, "w").write(new_text)
+        print("  PATCH: bpf_skel.rs include path (bpf.skel.rs -> main_skel.rs)")
+        return 1
+    return 0
+
+
 def add_workspace_member(scx_root):
     """Add scx_pandemonium to workspace Cargo.toml members if missing."""
     cargo_path = os.path.join(scx_root, "Cargo.toml")
@@ -232,12 +285,18 @@ def main():
     print("\n[3] STRIP RELEASE PROFILE")
     stripped = strip_profile_release(dst_root)
 
-    # STEP 4: WORKSPACE REGISTRATION
-    print("\n[4] WORKSPACE REGISTRATION")
+    # STEP 4: REPLACE build.rs WITH scx_cargo::BpfBuilder
+    print("\n[4] BUILD SYSTEM")
+    replace_build_rs(dst_root)
+    swap_build_deps(dst_root)
+    patch_bpf_skel_include(dst_root)
+
+    # STEP 5: WORKSPACE REGISTRATION
+    print("\n[5] WORKSPACE REGISTRATION")
     registered = add_workspace_member(scx_root)
 
-    # STEP 5: CARGO FMT
-    print("\n[5] FORMAT")
+    # STEP 6: CARGO FMT
+    print("\n[6] FORMAT")
     result = subprocess.run(
         ["cargo", "fmt", "--manifest-path", os.path.join(dst_root, "Cargo.toml")],
         capture_output=True, text=True,
