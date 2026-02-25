@@ -6,7 +6,7 @@ PANDEMONIUM is included in the [sched-ext/scx](https://github.com/sched-ext/scx)
 
 ## Performance
 
-Benchmarked on 12 AMD Zen CPUs, kernel 6.18.9-arch1-2, clang 21.1.6. Numbers from bench-scale (v5.3.0, 3 iterations per core count).
+Benchmarked on 12 AMD Zen CPUs, kernel 6.18.9-arch1-2, clang 21.1.6. Numbers from bench-scale (v5.3.1, 3 iterations per core count).
 
 ### Throughput (kernel build, vs EEVDF baseline)
 
@@ -17,7 +17,7 @@ Benchmarked on 12 AMD Zen CPUs, kernel 6.18.9-arch1-2, clang 21.1.6. Numbers fro
 | 8     | +2.6%             | +0.9%                  | +2.8%       |
 | 12    | +3.2%             | +1.2%                  | +3.3%       |
 
-At 4 cores, PANDEMONIUM matches EEVDF and scx_bpfland within 0.2%. Adaptive mode beats scx_bpfland at 4C, 8C, and 12C. Batch DSQ separation (v5.3.0) gives dispatch explicit control over interactive vs batch priority without vtime contention.
+At 4 cores, PANDEMONIUM matches EEVDF and scx_bpfland within 0.2%. Adaptive mode beats scx_bpfland at 4C, 8C, and 12C. Batch DSQ separation (v5.3.1) gives dispatch explicit control over interactive vs batch priority without vtime contention.
 
 ### P99 Wakeup Latency (interactive probe under CPU saturation)
 
@@ -28,7 +28,7 @@ At 4 cores, PANDEMONIUM matches EEVDF and scx_bpfland within 0.2%. Adaptive mode
 | 8     | 76us     | 2,003us           | 2,005us     |
 | 12    | 303us    | 756us             | 2,003us     |
 
-BPF-only P99 beats EEVDF at 2 and 4 cores, and beats scx_bpfland at every core count. The classification-gated DSQ routing (v5.3.0) keeps unclassified fork storm tasks out of the interactive fast lane while CUSUM burst detection dynamically raises the classification bar during storms.
+BPF-only P99 beats EEVDF at 2 and 4 cores, and beats scx_bpfland at every core count. The classification-gated DSQ routing (v5.3.1) keeps unclassified fork storm tasks out of the interactive fast lane while CUSUM burst detection dynamically raises the classification bar during storms.
 
 ### Burst P99 (fork/exec storm under CPU saturation)
 
@@ -39,7 +39,7 @@ BPF-only P99 beats EEVDF at 2 and 4 cores, and beats scx_bpfland at every core c
 | 8     | 2,890us  | 17,000us          | 2,004us     |
 | 12    | 65us     | 6,002us           | 2,007us     |
 
-Burst P99 improved 10-20x from pre-v5.3.0 baselines (187ms at 2C, 73ms at 12C) through layered defense: classification gate, CUSUM detection, and dynamic age threshold. Zero crashes across all 12 BPF-mode runs.
+Burst P99 improved 10-20x from pre-v5.3.1 baselines (187ms at 2C, 73ms at 12C) through layered defense: classification gate, CUSUM detection, and dynamic age threshold. Zero crashes across all 12 BPF-mode runs.
 
 ## Key Features
 
@@ -384,7 +384,7 @@ PANDEMONIUM is included in the sched-ext/scx monorepo. `export_scx.py` automates
 ./export_scx.py /path/to/scx
 ```
 
-The script copies source files into `scheds/rust/scx_pandemonium/`, renames the crate, strips `[profile.release]` (the workspace provides its own), registers the workspace member, and runs `cargo fmt`. It does not touch `build.rs` -- PANDEMONIUM's C23 keyword patching and BORE anonymous field renaming in vmlinux.h are specific to our build and not handled by `scx_cargo::BpfBuilder`.
+The script copies source files into `scheds/rust/scx_pandemonium/`, renames the crate, strips `[profile.release]` (the workspace provides its own), replaces `build.rs` with a `scx_cargo::BpfBuilder` version, swaps `libbpf-cargo` for `scx_cargo` in build dependencies, registers the workspace member, and runs `cargo fmt`.
 
 ## Attribution
 
