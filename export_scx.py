@@ -9,8 +9,10 @@
 #   1. COPIES SOURCE FILES INTO scheds/rust/scx_pandemonium/
 #   2. RENAMES CRATE: pandemonium -> scx_pandemonium
 #   3. STRIPS [profile.release] (WORKSPACE PROVIDES ITS OWN)
-#   4. REPLACES build.rs (USES MONOREPO BUNDLED vmlinux.h, NO bpftool)
-#   5. ADDS WORKSPACE MEMBER TO ROOT Cargo.toml IF MISSING
+#   4. REPLACES build.rs WITH scx_cargo::BpfBuilder (MATCHES OTHER SCHEDULERS)
+#   5. SWAPS libbpf-cargo FOR scx_cargo PATH+VERSION DEP
+#   6. PATCHES bpf_skel.rs INCLUDE PATH FOR BpfBuilder OUTPUT
+#   7. ADDS WORKSPACE MEMBER TO ROOT Cargo.toml IF MISSING
 #
 # WHAT IT DOES NOT DO:
 #   - DOES NOT COMMIT OR PUSH ANYTHING
@@ -139,86 +141,72 @@ def strip_profile_release(dst_root):
     return 0
 
 
-# MONOREPO build.rs: USES BUNDLED vmlinux.h FROM scheds/vmlinux/
-# NO bpftool DEPENDENCY, NO C23 PATCHING, NO BORE RENAMING.
-# CRATE LIVES AT scheds/rust/scx_pandemonium/, VMLINUX AT scheds/vmlinux/
-SCX_BUILD_RS = r'''// PANDEMONIUM BUILD SCRIPT (scx MONOREPO)
-// USES BUNDLED vmlinux.h FROM scheds/vmlinux/ -- NO bpftool REQUIRED
-
-use std::env;
-use std::path::PathBuf;
-
-use libbpf_cargo::SkeletonBuilder;
-
-const BPF_SRC: &str = "src/bpf/main.bpf.c";
-
+SCX_BUILD_RS = """\
 fn main() {
-    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-
-    // MONOREPO LAYOUT: scheds/rust/scx_pandemonium/ -> scheds/vmlinux/
-    let vmlinux_search = manifest_dir.join("../../vmlinux");
-    let vmlinux_dir = vmlinux_search.canonicalize().unwrap_or_else(|_| {
-        panic!(
-            "vmlinux directory not found at {:?} -- is this an scx monorepo checkout?",
-            vmlinux_search
-        )
-    });
-
-    // ARCHITECTURE-SPECIFIC vmlinux.h (x86 -> arch/x86/vmlinux.h)
-    let arch = if cfg!(target_arch = "x86_64") || cfg!(target_arch = "x86") {
-        "x86"
-    } else if cfg!(target_arch = "aarch64") {
-        "arm64"
-    } else if cfg!(target_arch = "arm") {
-        "arm"
-    } else if cfg!(target_arch = "riscv64") || cfg!(target_arch = "riscv32") {
-        "riscv"
-    } else if cfg!(target_arch = "s390x") {
-        "s390"
-    } else if cfg!(target_arch = "powerpc64") || cfg!(target_arch = "powerpc") {
-        "powerpc"
-    } else {
-        panic!("unsupported architecture for vmlinux.h")
-    };
-
-    let arch_vmlinux = vmlinux_dir.join("arch").join(arch).join("vmlinux.h");
-    if !arch_vmlinux.exists() {
-        panic!("vmlinux.h not found at {:?}", arch_vmlinux);
-    }
-
-    // INCLUDE PATHS: arch-specific vmlinux.h dir + monorepo scx headers
-    let scx_include = manifest_dir.join("include");
-    let arch_include = arch_vmlinux.parent().unwrap();
-
-    let skel_out = out_dir.join("bpf.skel.rs");
-
-    SkeletonBuilder::new()
-        .source(BPF_SRC)
-        .clang_args([
-            "-I",
-            arch_include.to_str().unwrap(),
-            "-I",
-            scx_include.to_str().unwrap(),
-            "-I",
-            vmlinux_dir.to_str().unwrap(),
-        ])
-        .build_and_generate(&skel_out)
+    scx_cargo::BpfBuilder::new()
+        .unwrap()
+        .enable_intf("src/bpf/intf.h", "bpf_intf.rs")
+        .enable_skel("src/bpf/main.bpf.c", "main")
+        .build()
         .unwrap();
-
-    println!("cargo:rerun-if-changed={BPF_SRC}");
-    println!("cargo:rerun-if-changed=src/bpf/intf.h");
-    println!("cargo:rerun-if-changed=include/scx");
 }
-'''
-
+"""
 
 def replace_build_rs(dst_root):
-    """Replace standalone build.rs with monorepo version using bundled vmlinux.h."""
+    """Replace standalone build.rs with scx_cargo::BpfBuilder version."""
     build_rs = os.path.join(dst_root, "build.rs")
-    open(build_rs, "w").write(SCX_BUILD_RS.lstrip("\n"))
-    print("  REPLACE: build.rs -> monorepo vmlinux.h (no bpftool)")
+    open(build_rs, "w").write(SCX_BUILD_RS)
+    print("  REPLACE: build.rs -> scx_cargo::BpfBuilder")
     return 1
+
+
+def read_scx_cargo_version(scx_root):
+    """Read scx_cargo version from the monorepo's rust/scx_cargo/Cargo.toml."""
+    cargo_path = os.path.join(scx_root, "rust", "scx_cargo", "Cargo.toml")
+    if not os.path.exists(cargo_path):
+        print(f"  WARNING: {cargo_path} not found, falling back to wildcard version")
+        return "*"
+    text = open(cargo_path).read()
+    m = re.search(r'^version\s*=\s*"([^"]+)"', text, re.MULTILINE)
+    if not m:
+        print(f"  WARNING: no version found in {cargo_path}, falling back to wildcard")
+        return "*"
+    return m.group(1)
+
+
+def swap_build_deps(dst_root, scx_root):
+    """Replace libbpf-cargo with scx_cargo path+version dep (version read from repo)."""
+    version = read_scx_cargo_version(scx_root)
+    scx_cargo_dep = f'scx_cargo = {{ path = "../../../rust/scx_cargo", version = "{version}" }}'
+
+    cargo_path = os.path.join(dst_root, "Cargo.toml")
+    text = open(cargo_path).read()
+    new_text = re.sub(
+        r'libbpf-cargo\s*=\s*"[^"]*"',
+        scx_cargo_dep,
+        text,
+    )
+    if new_text != text:
+        open(cargo_path, "w").write(new_text)
+        print(f"  SWAP: libbpf-cargo -> scx_cargo (version {version})")
+        return 1
+    print("  WARNING: libbpf-cargo not found in [build-dependencies]")
+    return 0
+
+
+def patch_bpf_skel_include(dst_root):
+    """Patch bpf_skel.rs include path for BpfBuilder output filename."""
+    skel_path = os.path.join(dst_root, "src", "bpf_skel.rs")
+    if not os.path.exists(skel_path):
+        print("  WARNING: src/bpf_skel.rs not found")
+        return 0
+    text = open(skel_path).read()
+    new_text = text.replace("/bpf.skel.rs", "/main_skel.rs")
+    if new_text != text:
+        open(skel_path, "w").write(new_text)
+        print("  PATCH: bpf_skel.rs include path (bpf.skel.rs -> main_skel.rs)")
+        return 1
+    return 0
 
 
 def add_workspace_member(scx_root):
@@ -313,9 +301,11 @@ def main():
     print("\n[3] STRIP RELEASE PROFILE")
     stripped = strip_profile_release(dst_root)
 
-    # STEP 4: REPLACE build.rs FOR MONOREPO
+    # STEP 4: BUILD SYSTEM (MATCH scx CONVENTION)
     print("\n[4] BUILD SYSTEM")
     replace_build_rs(dst_root)
+    swap_build_deps(dst_root, scx_root)
+    patch_bpf_skel_include(dst_root)
 
     # STEP 5: WORKSPACE REGISTRATION
     print("\n[5] WORKSPACE REGISTRATION")
