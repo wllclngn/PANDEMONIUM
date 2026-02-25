@@ -3622,13 +3622,13 @@ def _contention_phase_regime_sweep(nr_cpus, dmesg, sched_alive_fn, duration=30):
 
     for cycle in range(1, cycles + 1):
         if not sched_alive_fn():
-            return False
+            return {"survived": False, "cycles": cycle - 1}
 
         # LIGHT: IDLE
         log_info(f"  cycle {cycle}/{cycles}: LIGHT ({per_phase}s idle)")
         time.sleep(per_phase)
         if dmesg.check():
-            return False
+            return {"survived": False, "cycles": cycle - 1}
 
         # HEAVY: SATURATE ALL CPUS
         log_info(f"  cycle {cycle}/{cycles}: HEAVY ({per_phase}s saturated)")
@@ -3637,7 +3637,7 @@ def _contention_phase_regime_sweep(nr_cpus, dmesg, sched_alive_fn, duration=30):
         time.sleep(per_phase)
         if dmesg.check() or not sched_alive_fn():
             stress.stop()
-            return False
+            return {"survived": False, "cycles": cycle - 1}
 
         # MIXED: KILL HALF
         half = max(1, nr_cpus // 2)
@@ -3648,12 +3648,13 @@ def _contention_phase_regime_sweep(nr_cpus, dmesg, sched_alive_fn, duration=30):
         time.sleep(per_phase)
         if dmesg.check() or not sched_alive_fn():
             stress.stop()
-            return False
+            return {"survived": False, "cycles": cycle - 1}
 
         stress.stop()
 
     log_info(f"  regime-sweep: {cycles} cycles complete, scheduler alive")
-    return sched_alive_fn()
+    alive = sched_alive_fn()
+    return {"survived": alive, "cycles": cycles}
 
 
 def _contention_phase_deficit_storm(nr_cpus, dmesg, sched_alive_fn, duration=20):
@@ -3694,16 +3695,19 @@ def _contention_phase_deficit_storm(nr_cpus, dmesg, sched_alive_fn, duration=20)
             p.kill()
 
     if dmesg.check():
-        return False
+        return {"survived": False, "samples": 0}
 
+    result = {"survived": sched_alive_fn(), "samples": len(samples)}
     if samples:
         p99 = percentile(samples, 99)
         med = percentile(samples, 50)
+        result["median_us"] = med
+        result["p99_us"] = p99
         log_info(f"  deficit-storm: {len(samples)} samples, median={med:.0f}us P99={p99:.0f}us")
     else:
         log_info("  deficit-storm: no latency samples collected")
 
-    return sched_alive_fn()
+    return result
 
 
 def _contention_phase_sojourn_pressure(nr_cpus, dmesg, sched_alive_fn, duration=15):
@@ -3719,7 +3723,7 @@ def _contention_phase_sojourn_pressure(nr_cpus, dmesg, sched_alive_fn, duration=
 
     if dmesg.check() or not sched_alive_fn():
         runners.collect(timeout=5)
-        return False
+        return {"survived": False, "samples": 0}
 
     # PHASE B: ADD 4 INTERACTIVE PROBES INTO THE BATCH FLOOD (5S)
     log_info(f"  adding 4 interactive probes into batch flood")
@@ -3729,17 +3733,22 @@ def _contention_phase_sojourn_pressure(nr_cpus, dmesg, sched_alive_fn, duration=
     work = runners.collect(timeout=batch_duration + 10)
 
     if dmesg.check():
-        return False
+        return {"survived": False, "samples": 0}
 
     min_work = min(work) if work else 0
     max_work = max(work) if work else 0
+    result = {
+        "survived": sched_alive_fn(), "samples": len(samples),
+        "work_min": min_work, "work_max": max_work,
+    }
     if samples:
         p99 = percentile(samples, 99)
+        result["p99_us"] = p99
         log_info(f"  sojourn-pressure: P99={p99:.0f}us, batch_work=[{min_work}..{max_work}]")
     else:
         log_info(f"  sojourn-pressure: no latency samples, batch_work=[{min_work}..{max_work}]")
 
-    return sched_alive_fn()
+    return result
 
 
 def _contention_phase_longrun_interactive(nr_cpus, dmesg, sched_alive_fn, duration=20):
@@ -3754,7 +3763,7 @@ def _contention_phase_longrun_interactive(nr_cpus, dmesg, sched_alive_fn, durati
     time.sleep(3)
     if dmesg.check() or not sched_alive_fn():
         runners.collect(timeout=5)
-        return False
+        return {"survived": False, "samples": 0}
 
     # INTERACTIVE PROBE DURING LONGRUN MODE
     probe_duration = duration - 5
@@ -3764,21 +3773,27 @@ def _contention_phase_longrun_interactive(nr_cpus, dmesg, sched_alive_fn, durati
     work = runners.collect(timeout=duration + 10)
 
     if dmesg.check():
-        return False
+        return {"survived": False, "samples": 0}
 
     min_work = min(work) if work else 0
     max_work = max(work) if work else 0
     fairness = min_work / max_work if max_work > 0 else 0
 
+    result = {
+        "survived": sched_alive_fn(), "samples": len(samples),
+        "work_min": min_work, "work_max": max_work, "fairness": fairness,
+    }
     if samples:
         p99 = percentile(samples, 99)
         med = percentile(samples, 50)
+        result["median_us"] = med
+        result["p99_us"] = p99
         log_info(f"  longrun-interactive: median={med:.0f}us P99={p99:.0f}us "
                  f"work=[{min_work}..{max_work}] fairness={fairness:.2f}")
     else:
         log_info(f"  longrun-interactive: no samples, work=[{min_work}..{max_work}]")
 
-    return sched_alive_fn()
+    return result
 
 
 def _contention_phase_burst_recovery(nr_cpus, dmesg, sched_alive_fn):
@@ -3791,7 +3806,7 @@ def _contention_phase_burst_recovery(nr_cpus, dmesg, sched_alive_fn):
     baseline_probe.start()
     baseline_samples = baseline_probe.collect()
     if dmesg.check() or not sched_alive_fn():
-        return False
+        return {"survived": False}
 
     baseline_p99 = percentile(baseline_samples, 99) if baseline_samples else 0
     log_info(f"  baseline: P99={baseline_p99:.0f}us ({len(baseline_samples)} samples)")
@@ -3809,7 +3824,7 @@ def _contention_phase_burst_recovery(nr_cpus, dmesg, sched_alive_fn):
             p.kill()
 
     if dmesg.check() or not sched_alive_fn():
-        return False
+        return {"survived": False}
 
     burst_p99 = percentile(burst_samples, 99) if burst_samples else 0
     log_info(f"  burst: P99={burst_p99:.0f}us ({len(burst_samples)} samples)")
@@ -3820,14 +3835,20 @@ def _contention_phase_burst_recovery(nr_cpus, dmesg, sched_alive_fn):
     recovery_samples = recovery_probe.collect()
 
     if dmesg.check():
-        return False
+        return {"survived": False}
 
     recovery_p99 = percentile(recovery_samples, 99) if recovery_samples else 0
     within_2x = recovery_p99 <= max(baseline_p99 * 2, 500)
     log_info(f"  recovery: P99={recovery_p99:.0f}us "
              f"(baseline*2={baseline_p99*2:.0f}us) {'OK' if within_2x else 'ELEVATED'}")
 
-    return sched_alive_fn()
+    return {
+        "survived": sched_alive_fn(),
+        "baseline_p99_us": baseline_p99, "baseline_samples": len(baseline_samples),
+        "burst_p99_us": burst_p99, "burst_samples": len(burst_samples),
+        "recovery_p99_us": recovery_p99, "recovery_samples": len(recovery_samples),
+        "recovery_within_2x": within_2x,
+    }
 
 
 def _contention_phase_mixed_storm(nr_cpus, dmesg, sched_alive_fn, duration=30):
@@ -3890,7 +3911,7 @@ def _contention_phase_mixed_storm(nr_cpus, dmesg, sched_alive_fn, duration=30):
         for p in extras:
             p.kill()
         deadline_proc.kill()
-        return False
+        return {"survived": False}
 
     log_info(f"  firing {burst_size} burst into storm")
     burst_procs = _burst_processes(burst_size)
@@ -3919,36 +3940,52 @@ def _contention_phase_mixed_storm(nr_cpus, dmesg, sched_alive_fn, duration=30):
         deadline_proc.kill()
 
     if dmesg.check():
-        return False
+        return {"survived": False}
 
     # REPORT
     min_work = min(work) if work else 0
     max_work = max(work) if work else 0
+    result = {
+        "survived": sched_alive_fn(), "samples": len(samples),
+        "work_min": min_work, "work_max": max_work,
+    }
     if samples:
         p99 = percentile(samples, 99)
         med = percentile(samples, 50)
+        result["median_us"] = med
+        result["p99_us"] = p99
         log_info(f"  mixed-storm: median={med:.0f}us P99={p99:.0f}us "
                  f"work=[{min_work}..{max_work}]")
     else:
         log_info(f"  mixed-storm: no samples, work=[{min_work}..{max_work}]")
+
     if deadline_out.strip():
         log_info(f"  deadline: {deadline_out.strip()}")
+        try:
+            parts = deadline_out.strip().split("/")
+            result["deadline_misses"] = int(parts[0])
+            result["deadline_total"] = int(parts[1])
+            if int(parts[1]) > 0:
+                result["deadline_miss_ratio"] = int(parts[0]) / int(parts[1])
+        except (ValueError, IndexError):
+            pass
 
-    return sched_alive_fn()
+    return result
 
 
 # BENCH-CONTENTION ORCHESTRATOR
 
 def _contention_run_iteration(iteration, total, nr_cpus):
-    """Run one full contention iteration. Returns True if scheduler survived."""
+    """Run one full contention iteration. Returns (survived: bool, phase_results: dict)."""
     dmesg = DmesgMonitor()
+    phase_results = {}
 
     label = f"[{iteration}/{total}] " if total > 1 else ""
     log_info(f"{label}Starting scheduler")
 
     sched_proc = _trace_start_scheduler(nr_cpus=nr_cpus)
     if sched_proc is None:
-        return False
+        return False, phase_results
 
     def sched_alive():
         return sched_proc is not None and sched_proc.poll() is None
@@ -3966,8 +4003,9 @@ def _contention_run_iteration(iteration, total, nr_cpus):
 
     crashed = False
     for name, fn in phases:
-        alive = fn()
-        if not alive:
+        result = fn()
+        phase_results[name] = result
+        if not result.get("survived", False):
             crashed = True
             if dmesg.crashed:
                 log_error(f"{label}CRASH DETECTED during '{name}': {dmesg.crash_msg}")
@@ -3981,7 +4019,92 @@ def _contention_run_iteration(iteration, total, nr_cpus):
     _trace_stop_scheduler(sched_proc)
     dmesg.save()
 
-    return not crashed
+    return not crashed, phase_results
+
+
+def _write_contention_prometheus(version, git, stamp, max_cpus, iterations,
+                                  core_counts, results, all_phase_data) -> Path:
+    """Write Prometheus exposition format (.prom) for bench-contention."""
+    lines = []
+    emitted = set()
+
+    def gauge(name, help_text, value, labels=None):
+        if name not in emitted:
+            lines.append(f"# HELP {name} {help_text}")
+            lines.append(f"# TYPE {name} gauge")
+            emitted.add(name)
+        if labels:
+            label_str = ",".join(f'{k}="{v}"' for k, v in labels.items())
+            lines.append(f"{name}{{{label_str}}} {value}")
+        else:
+            lines.append(f"{name} {value}")
+
+    dirty = "true" if git["dirty"] else "false"
+    gauge("pandemonium_contention_info", "Build and run metadata", 1,
+          {"version": version, "git_commit": git["commit"], "git_dirty": dirty})
+    gauge("pandemonium_contention_timestamp_seconds", "Test start time",
+          int(datetime.strptime(stamp, "%Y%m%d-%H%M%S").timestamp()))
+    gauge("pandemonium_contention_iterations", "Iterations per core count", iterations)
+    gauge("pandemonium_contention_max_cpus", "Maximum CPUs available", max_cpus)
+
+    for nr_cpus in sorted(results.keys()):
+        s, c = results[nr_cpus]
+        cl = {"cores": str(nr_cpus)}
+        gauge("pandemonium_contention_survived", "Iterations survived", s, cl)
+        gauge("pandemonium_contention_crashed", "Iterations crashed", c, cl)
+
+        phases = all_phase_data.get(nr_cpus, {})
+        for phase_name, pd in phases.items():
+            pl = {"cores": str(nr_cpus), "phase": phase_name}
+            survived = 1 if pd.get("survived") else 0
+            gauge("pandemonium_contention_phase_survived",
+                  "Phase survived (1=OK, 0=CRASH)", survived, pl)
+
+            if "samples" in pd:
+                gauge("pandemonium_contention_phase_samples",
+                      "Latency samples collected", pd["samples"], pl)
+            if "p99_us" in pd:
+                gauge("pandemonium_contention_phase_p99_us",
+                      "P99 wakeup latency", pd["p99_us"], pl)
+            if "median_us" in pd:
+                gauge("pandemonium_contention_phase_median_us",
+                      "Median wakeup latency", pd["median_us"], pl)
+            if "work_min" in pd:
+                gauge("pandemonium_contention_phase_work_min",
+                      "Minimum work by any worker", pd["work_min"], pl)
+            if "work_max" in pd:
+                gauge("pandemonium_contention_phase_work_max",
+                      "Maximum work by any worker", pd["work_max"], pl)
+            if "fairness" in pd:
+                gauge("pandemonium_contention_phase_fairness",
+                      "Work fairness ratio (min/max)", f"{pd['fairness']:.4f}", pl)
+            if "baseline_p99_us" in pd:
+                gauge("pandemonium_contention_phase_baseline_p99_us",
+                      "Baseline P99 before burst", pd["baseline_p99_us"], pl)
+            if "burst_p99_us" in pd:
+                gauge("pandemonium_contention_phase_burst_p99_us",
+                      "P99 during burst", pd["burst_p99_us"], pl)
+            if "recovery_p99_us" in pd:
+                gauge("pandemonium_contention_phase_recovery_p99_us",
+                      "P99 during post-burst recovery", pd["recovery_p99_us"], pl)
+            if "recovery_within_2x" in pd:
+                gauge("pandemonium_contention_phase_recovery_ok",
+                      "Recovery within 2x baseline (1=OK, 0=ELEVATED)",
+                      1 if pd["recovery_within_2x"] else 0, pl)
+            if "deadline_misses" in pd:
+                gauge("pandemonium_contention_phase_deadline_misses",
+                      "Frame deadline misses", pd["deadline_misses"], pl)
+            if "deadline_total" in pd:
+                gauge("pandemonium_contention_phase_deadline_total",
+                      "Total frame cycles", pd["deadline_total"], pl)
+            if "deadline_miss_ratio" in pd:
+                gauge("pandemonium_contention_phase_deadline_miss_ratio",
+                      "Fraction of frames missed", f"{pd['deadline_miss_ratio']:.4f}", pl)
+
+    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    path = ARCHIVE_DIR / f"contention-{version}-{stamp}.prom"
+    path.write_text("\n".join(lines) + "\n")
+    return path
 
 
 def cmd_bench_contention(args) -> int:
@@ -4029,6 +4152,7 @@ def cmd_bench_contention(args) -> int:
     print()
 
     results = {}
+    all_phase_data = {}
     total_survived = 0
     total_crashed = 0
 
@@ -4045,20 +4169,24 @@ def cmd_bench_contention(args) -> int:
 
             survived = 0
             crashed = 0
+            core_phases = {}
 
             for i in range(1, args.iterations + 1):
                 if args.iterations > 1:
                     log_info(f"[{nr_cpus}C] ITERATION {i}/{args.iterations}")
-                ok = _contention_run_iteration(i, args.iterations, nr_cpus)
+                ok, phase_results = _contention_run_iteration(i, args.iterations, nr_cpus)
                 if ok:
                     survived += 1
                 else:
                     crashed += 1
+                # KEEP LAST ITERATION'S PHASE DATA FOR THIS CORE COUNT
+                core_phases = phase_results
                 if i < args.iterations:
                     log_info("Settling 3s before next iteration...")
                     time.sleep(3)
 
             results[nr_cpus] = (survived, crashed)
+            all_phase_data[nr_cpus] = core_phases
             log_info(f"[{nr_cpus}C] RESULTS: {survived}/{args.iterations} survived")
 
             if nr_cpus < max_cpus:
@@ -4081,7 +4209,48 @@ def cmd_bench_contention(args) -> int:
                 log_info(f"  {nr_cpus:>3}C: {s}/{s+c} survived  {status}")
             log_info(f"  TOTAL: {total_survived}/{total_survived+total_crashed}")
 
+        # WRITE PROMETHEUS .prom
+        prom_path = _write_contention_prometheus(
+            ver, git, stamp, max_cpus, args.iterations,
+            core_counts, results, all_phase_data,
+        )
+        log_info(f"Prometheus: {prom_path}")
+
+        # WRITE HUMAN-READABLE .log
         report_path = LOG_DIR / f"bench-contention-{stamp}.log"
+        report_lines = [f"bench-contention v{ver} [{git['commit']}]",
+                        f"cores: {core_counts}  iterations: {args.iterations}  host: {max_cpus}C",
+                        ""]
+        for nr_cpus in sorted(results.keys()):
+            s, c = results[nr_cpus]
+            status = "PASS" if c == 0 else "FAIL"
+            report_lines.append(f"{nr_cpus:>3}C: {s}/{s+c} survived  {status}")
+            phases = all_phase_data.get(nr_cpus, {})
+            for phase_name, pd in phases.items():
+                surv = "OK" if pd.get("survived") else "CRASH"
+                extras = []
+                if "p99_us" in pd:
+                    extras.append(f"P99={pd['p99_us']:.0f}us")
+                if "median_us" in pd:
+                    extras.append(f"med={pd['median_us']:.0f}us")
+                if "samples" in pd:
+                    extras.append(f"n={pd['samples']}")
+                if "work_min" in pd:
+                    extras.append(f"work=[{pd['work_min']}..{pd.get('work_max', 0)}]")
+                if "fairness" in pd:
+                    extras.append(f"fair={pd['fairness']:.2f}")
+                if "baseline_p99_us" in pd:
+                    extras.append(f"base={pd['baseline_p99_us']:.0f}us")
+                    extras.append(f"burst={pd.get('burst_p99_us', 0):.0f}us")
+                    extras.append(f"recov={pd.get('recovery_p99_us', 0):.0f}us")
+                if "deadline_misses" in pd:
+                    extras.append(f"dl={pd['deadline_misses']}/{pd['deadline_total']}")
+                detail = "  ".join(extras)
+                report_lines.append(f"    {phase_name}: {surv}  {detail}")
+        report_lines.append("")
+        report_lines.append(f"TOTAL: {total_survived}/{total_survived+total_crashed}")
+        report = "\n".join(report_lines) + "\n"
+        report_path.write_text(report)
         log_info(f"Report: {report_path}")
 
     return 0 if total_crashed == 0 else 1
