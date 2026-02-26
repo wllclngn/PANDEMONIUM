@@ -204,14 +204,16 @@ def patch_intf_types(dst_root):
 
     text = open(intf_path).read()
 
-    # Insert conditional typedefs after the include guard
+    # Insert unconditional typedefs after the include guard.
+    # C11+ (and C23 which PANDEMONIUM targets) allows duplicate compatible
+    # typedefs, so these coexist safely with vmlinux.h during BPF compilation.
+    # scx_utils defines __bpf__ during bindgen, so a #ifndef guard won't work.
     type_compat = (
-        "\n// BINDGEN COMPATIBILITY: vmlinux.h provides these in BPF context,\n"
-        "// but bindgen runs clang without BPF target, so we need typedefs.\n"
-        "#ifndef __bpf__\n"
+        "\n// BINDGEN/SCX COMPATIBILITY: provide kernel types unconditionally.\n"
+        "// vmlinux.h also typedefs these in BPF context; C11+ permits\n"
+        "// duplicate compatible typedefs, so no conflict.\n"
         "typedef unsigned long long u64;\n"
         "typedef unsigned char u8;\n"
-        "#endif\n"
     )
 
     anchor = "#define __INTF_H\n"
@@ -219,7 +221,7 @@ def patch_intf_types(dst_root):
         print("  WARNING: intf.h missing expected include guard, skipping type patch")
         return 0
 
-    if "#ifndef __bpf__" in text:
+    if "typedef unsigned long long u64;" in text:
         print("  PATCH: intf.h type compatibility already present")
         return 0
 
