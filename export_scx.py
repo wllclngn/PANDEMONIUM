@@ -12,7 +12,8 @@
 #   4. REPLACES build.rs WITH scx_cargo::BpfBuilder (MATCHES OTHER SCHEDULERS)
 #   5. SWAPS libbpf-cargo FOR scx_cargo PATH+VERSION DEP
 #   6. PATCHES bpf_skel.rs INCLUDE PATH FOR BpfBuilder OUTPUT
-#   7. ADDS WORKSPACE MEMBER TO ROOT Cargo.toml IF MISSING
+#   7. PATCHES intf.h WITH BINDGEN-COMPATIBLE TYPE DEFINITIONS
+#   8. ADDS WORKSPACE MEMBER TO ROOT Cargo.toml IF MISSING
 #
 # WHAT IT DOES NOT DO:
 #   - DOES NOT COMMIT OR PUSH ANYTHING
@@ -194,6 +195,40 @@ def swap_build_deps(dst_root, scx_root):
     return 0
 
 
+def patch_intf_types(dst_root):
+    """Add portable type definitions so bindgen can parse intf.h without vmlinux.h."""
+    intf_path = os.path.join(dst_root, "src", "bpf", "intf.h")
+    if not os.path.exists(intf_path):
+        print("  WARNING: src/bpf/intf.h not found")
+        return 0
+
+    text = open(intf_path).read()
+
+    # Insert conditional typedefs after the include guard
+    type_compat = (
+        "\n// BINDGEN COMPATIBILITY: vmlinux.h provides these in BPF context,\n"
+        "// but bindgen runs clang without BPF target, so we need typedefs.\n"
+        "#ifndef __bpf__\n"
+        "typedef unsigned long long u64;\n"
+        "typedef unsigned char u8;\n"
+        "#endif\n"
+    )
+
+    anchor = "#define __INTF_H\n"
+    if anchor not in text:
+        print("  WARNING: intf.h missing expected include guard, skipping type patch")
+        return 0
+
+    if "#ifndef __bpf__" in text:
+        print("  PATCH: intf.h type compatibility already present")
+        return 0
+
+    new_text = text.replace(anchor, anchor + type_compat)
+    open(intf_path, "w").write(new_text)
+    print("  PATCH: intf.h type compatibility (u64/u8 for bindgen)")
+    return 1
+
+
 def patch_bpf_skel_include(dst_root):
     """Patch bpf_skel.rs include path for BpfBuilder output filename."""
     skel_path = os.path.join(dst_root, "src", "bpf_skel.rs")
@@ -306,6 +341,7 @@ def main():
     replace_build_rs(dst_root)
     swap_build_deps(dst_root, scx_root)
     patch_bpf_skel_include(dst_root)
+    patch_intf_types(dst_root)
 
     # STEP 5: WORKSPACE REGISTRATION
     print("\n[5] WORKSPACE REGISTRATION")
