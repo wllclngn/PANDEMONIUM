@@ -38,7 +38,7 @@ struct Cli {
     #[command(subcommand)]
     command: Option<SubCmd>,
 
-    #[arg(long)]
+    #[arg(short, long)]
     verbose: bool,
 
     #[arg(long)]

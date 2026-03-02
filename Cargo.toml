@@ -1,6 +1,6 @@
 [package]
 name = "pandemonium"
-version = "5.4.9"
+version = "5.4.10"
 edition = "2021"
 
 [dependencies]
