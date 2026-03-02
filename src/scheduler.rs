@@ -103,28 +103,31 @@ impl<'a> Scheduler<'a> {
         // ATTACH STRUCT_OPS
         let link = skel.maps.pandemonium_ops.attach_struct_ops()?;
 
-        // PIN MAPS FOR USERSPACE ACCESS
+        // PIN MAPS FOR USERSPACE ACCESS (NON-FATAL: bpffs may not be mounted)
         let pin_dir = "/sys/fs/bpf/pandemonium";
-        std::fs::create_dir_all(pin_dir).ok();
+        let bpffs_ok = std::fs::create_dir_all(pin_dir).is_ok();
+        if bpffs_ok {
+            std::fs::remove_file(KNOBS_PIN).ok();
+            skel.maps.tuning_knobs_map.pin(KNOBS_PIN).ok();
 
-        std::fs::remove_file(KNOBS_PIN).ok();
-        skel.maps.tuning_knobs_map.pin(KNOBS_PIN)?;
+            let cache_pin = "/sys/fs/bpf/pandemonium/cache_domain";
+            std::fs::remove_file(cache_pin).ok();
+            skel.maps.cache_domain.pin(cache_pin).ok();
 
-        let cache_pin = "/sys/fs/bpf/pandemonium/cache_domain";
-        std::fs::remove_file(cache_pin).ok();
-        skel.maps.cache_domain.pin(cache_pin)?;
+            let observe_pin = "/sys/fs/bpf/pandemonium/task_class_observe";
+            std::fs::remove_file(observe_pin).ok();
+            skel.maps.task_class_observe.pin(observe_pin).ok();
 
-        let observe_pin = "/sys/fs/bpf/pandemonium/task_class_observe";
-        std::fs::remove_file(observe_pin).ok();
-        skel.maps.task_class_observe.pin(observe_pin)?;
+            let init_pin = "/sys/fs/bpf/pandemonium/task_class_init";
+            std::fs::remove_file(init_pin).ok();
+            skel.maps.task_class_init.pin(init_pin).ok();
 
-        let init_pin = "/sys/fs/bpf/pandemonium/task_class_init";
-        std::fs::remove_file(init_pin).ok();
-        skel.maps.task_class_init.pin(init_pin)?;
-
-        let compositor_pin = "/sys/fs/bpf/pandemonium/compositor_map";
-        std::fs::remove_file(compositor_pin).ok();
-        skel.maps.compositor_map.pin(compositor_pin)?;
+            let compositor_pin = "/sys/fs/bpf/pandemonium/compositor_map";
+            std::fs::remove_file(compositor_pin).ok();
+            skel.maps.compositor_map.pin(compositor_pin).ok();
+        } else {
+            log_warn!("BPFFS NOT AVAILABLE: map pinning skipped (scheduler still functional)");
+        }
 
         Ok(Self {
             skel,
