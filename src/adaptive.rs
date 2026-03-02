@@ -16,7 +16,7 @@ use anyhow::Result;
 
 use crate::procdb::ProcessDb;
 use crate::scheduler::{PandemoniumStats, Scheduler};
-use crate::tuning::{self, detect_regime, regime_knobs, Regime, TuningKnobs, HIST_BUCKETS};
+use crate::tuning::{self, detect_regime, scaled_regime_knobs, Regime, TuningKnobs, HIST_BUCKETS};
 
 // REGIME THRESHOLDS, PROFILES, AND KNOB COMPUTATION LIVE IN tuning.rs
 // (ZERO BPF DEPENDENCIES, TESTABLE OFFLINE)
@@ -59,7 +59,7 @@ pub fn monitor_loop(
     let mut tick_counter: u64 = 0;
     let mut tighten_events: u64 = 0;
     let mut prev_tighten_events: u64 = 0;
-    let sojourn_floor_ns: u64 = 5_000_000u64.max(1_000_000 * (nr_cpus / 2));
+    let sojourn_floor_ns: u64 = (nr_cpus * 1_000_000).clamp(2_000_000, 6_000_000);
     let sojourn_ceil_ns: u64 = sojourn_floor_ns * 2;
     let mut sojourn_thresh_ns: u64 = sojourn_floor_ns;
 
@@ -72,7 +72,7 @@ pub fn monitor_loop(
     };
 
     // APPLY INITIAL REGIME
-    sched.write_tuning_knobs(&regime_knobs(regime))?;
+    sched.write_tuning_knobs(&scaled_regime_knobs(regime, nr_cpus))?;
 
     while !shutdown.load(Ordering::Relaxed) && !sched.exited() {
         let tick_start = std::time::Instant::now();
@@ -203,7 +203,7 @@ pub fn monitor_loop(
             }
             if regime_hold >= 2 {
                 regime = detected;
-                sched.write_tuning_knobs(&regime_knobs(regime))?;
+                sched.write_tuning_knobs(&scaled_regime_knobs(regime, nr_cpus))?;
                 regime_changed_this_tick = true;
                 tightened = false;
                 relax_counter = 0;
@@ -243,7 +243,7 @@ pub fn monitor_loop(
         // GRADUATED RELAX: STEP SLICE TOWARD BASELINE (BATCH UNTOUCHED)
         if tightened && !regime_changed_this_tick {
             let ceiling = regime.p99_ceiling();
-            let baseline = regime_knobs(regime);
+            let baseline = scaled_regime_knobs(regime, nr_cpus);
             if p99_ns <= ceiling {
                 relax_counter += 1;
                 if relax_counter >= RELAX_HOLD_TICKS {
@@ -271,7 +271,7 @@ pub fn monitor_loop(
         }
 
         // SLEEP-INFORMED BATCH TUNING (EVERY TICK)
-        let baseline = regime_knobs(regime);
+        let baseline = scaled_regime_knobs(regime, nr_cpus);
         let longrun_active = stats.longrun_mode_active > 0;
 
         // LONGRUN OVERRIDE: DURING SUSTAINED BATCH PRESSURE (>2S),

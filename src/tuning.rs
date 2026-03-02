@@ -162,6 +162,34 @@ pub fn regime_knobs(r: Regime) -> TuningKnobs {
     }
 }
 
+// CORE-COUNT-AWARE REGIME KNOBS
+// AT LOW CORE COUNTS, TIME SLICES MUST BE SHORTER TO MAINTAIN ADEQUATE
+// DISPATCH FREQUENCY. HEAVY AT 2C WITH 4MS SLICES = 250 DISPATCHES/S/CORE,
+// TOO COARSE FOR DEADLINE AND IPC WORKLOADS.
+// SCALE: slice = min(BASE, nr_cpus * 500US), preempt = min(BASE, nr_cpus * 250US).
+// MIXED ALSO SCALES: BATCH_SLICE CAPS AT nr_cpus * 5MS (2C: 10MS VS 20MS BASE).
+
+pub fn scaled_regime_knobs(r: Regime, nr_cpus: u64) -> TuningKnobs {
+    let mut knobs = regime_knobs(r);
+    match r {
+        Regime::Heavy | Regime::Light => {
+            let slice_cap = nr_cpus * 500_000;
+            let preempt_cap = nr_cpus * 250_000;
+            knobs.slice_ns = knobs.slice_ns.min(slice_cap);
+            knobs.preempt_thresh_ns = knobs.preempt_thresh_ns.min(preempt_cap);
+        }
+        Regime::Mixed => {
+            let slice_cap = nr_cpus * 500_000;
+            let preempt_cap = nr_cpus * 500_000;
+            knobs.slice_ns = knobs.slice_ns.min(slice_cap);
+            knobs.preempt_thresh_ns = knobs.preempt_thresh_ns.min(preempt_cap);
+            let batch_cap = nr_cpus * 5_000_000;
+            knobs.batch_slice_ns = knobs.batch_slice_ns.min(batch_cap);
+        }
+    }
+    knobs
+}
+
 // REGIME DETECTION (SCHMITT TRIGGER)
 // DIRECTION-AWARE: CURRENT REGIME DETERMINES WHICH THRESHOLDS APPLY.
 // DEAD ZONES PREVENT OSCILLATION THAT SINGLE-BOUNDARY DETECTION CAUSED.

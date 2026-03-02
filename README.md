@@ -6,81 +6,78 @@ PANDEMONIUM is included in the [sched-ext/scx](https://github.com/sched-ext/scx)
 
 ## Performance
 
-Benchmarked on 12 AMD Zen CPUs, kernel 6.18.9-arch1-2, clang 21.1.6.
+Benchmarked on 12 AMD Zen CPUs, kernel 6.18.13-arch1-1, clang 21.1.6, 3 iterations.
 
 ### Burst P99 (fork/exec storm under CPU saturation)
 
 | Cores | EEVDF    | PANDEMONIUM (BPF) | PANDEMONIUM (ADAPTIVE) | scx_bpfland |
 |-------|----------|-------------------|------------------------|-------------|
-| 2     | 2,162us  | **69us**          | 81us                   | --          |
-| 4     | 4,000us  | **85us**          | 85us                   | 2,004us     |
-| 8     | 2,342us  | **73us**          | 81us                   | 2,004us     |
-| 12    | 1,999us  | **77us**          | 112us                  | 2,004us     |
+| 2     | 2,773us  | 1,228us           | **821us**              | 3,181us     |
+| 4     | 2,883us  | **1,285us**       | 1,594us                | 2,005us     |
+| 8     | 2,886us  | **1,092us**       | 1,239us                | 2,006us     |
+| 12    | 2,280us  | 1,231us           | **1,021us**            | 2,007us     |
 
-Overflow sojourn rescue and dual burst detection (CUSUM + wakeup rate) keep burst P99 at 69-112us. Interactive tasks are invisible to fork storms -- burst P99 is within 2x of steady-state baseline.
+Both modes beat EEVDF and scx_bpfland at every core count. Overflow sojourn rescue and dual burst detection (CUSUM + wakeup rate) keep burst response sub-2ms.
 
 ### P99 Wakeup Latency (interactive probe under CPU saturation)
 
 | Cores | EEVDF    | PANDEMONIUM (BPF) | PANDEMONIUM (ADAPTIVE) | scx_bpfland |
 |-------|----------|-------------------|------------------------|-------------|
-| 2     | 1,941us  | **69us**          | 81us                   | --          |
-| 4     | 1,167us  | 1,100us           | **151us**              | 2,006us     |
-| 8     | 56us     | 71us              | **70us**               | 2,005us     |
-| 12    | 59us     | 83us              | **73us**               | 2,004us     |
+| 2     | 1,953us  | 1,922us           | **929us**              | 3,060us     |
+| 4     | 1,358us  | **1,012us**       | 1,690us                | 2,011us     |
+| 8     | 1,711us  | **1,041us**       | 830us                  | 2,005us     |
+| 12    | **718us**| 909us             | 1,284us                | 2,007us     |
 
-ADAPTIVE P99 beats EEVDF at 4C, matches at 8C and 12C. BPF mode beats EEVDF at 2C. Both modes beat scx_bpfland at every core count.
+ADAPTIVE wins at 2C, BPF beats EEVDF at 4C and 8C. Both modes beat scx_bpfland at every core count.
 
 ### Longrun P99 (interactive latency with sustained CPU-bound long-runners)
 
 | Cores | EEVDF    | PANDEMONIUM (BPF) | PANDEMONIUM (ADAPTIVE) | scx_bpfland |
 |-------|----------|-------------------|------------------------|-------------|
-| 2     | 2,589us  | **161us**         | 77us                   | --          |
-| 4     | 1,014us  | **72us**          | 69us                   | 2,004us     |
-| 8     | 68us     | 71us              | **98us**               | 2,004us     |
-| 12    | 79us     | **74us**          | 75us                   | 2,002us     |
+| 2     | 2,295us  | **440us**         | 568us                  | 2,020us     |
+| 4     | 1,395us  | **912us**         | 1,338us                | 2,001us     |
+| 8     | **557us**| 1,009us           | 1,741us                | 2,005us     |
+| 12    | **418us**| 993us             | 1,957us                | 1,999us     |
 
-Longrun detection tightens deficit ratio from 4:1 to 1:1 under sustained batch pressure, keeping interactive latency sub-100us even with persistent CPU-bound processes.
+Longrun detection tightens deficit ratio to 1:1 under sustained batch pressure. BPF mode sub-1ms at 2C and 4C.
+
+### Mixed Latency P99 (interactive + batch concurrent)
+
+| Cores | EEVDF    | PANDEMONIUM (BPF) | PANDEMONIUM (ADAPTIVE) | scx_bpfland |
+|-------|----------|-------------------|------------------------|-------------|
+| 2     | 2,759us  | **520us**         | 1,026us                | 2,167us     |
+| 4     | **974us**| 1,075us           | 1,386us                | 1,999us     |
+| 8     | 2,183us  | **968us**         | 1,217us                | 2,004us     |
+| 12    | 2,100us  | **999us**         | 1,737us                | 2,000us     |
+
+BPF mode sub-1ms at 2C, 8C, and 12C under mixed interactive+batch workloads.
 
 ### Throughput (kernel build, vs EEVDF baseline, 3 iterations)
 
 | Cores | PANDEMONIUM (BPF) | PANDEMONIUM (ADAPTIVE) | scx_bpfland |
 |-------|-------------------|------------------------|-------------|
-| 2     | +5.3%             | +9.4%                  | +5.2%       |
-| 4     | +0.2%             | +0.7%                  | +0.2%       |
-| 8     | +2.6%             | +0.9%                  | +2.8%       |
-| 12    | +3.2%             | +1.2%                  | +3.3%       |
+| 2     | +2.6%             | +18.8%                 | +5.2%       |
+| 4     | +3.5%             | +2.7%                  | +0.4%       |
+| 8     | +3.9%             | +2.9%                  | +3.8%       |
+| 12    | +1.7%             | +0.6%                  | +1.9%       |
 
-### Deadline Jitter (16.6ms frame target)
+### Deadline Jitter (16.6ms frame target, miss ratio)
 
 | Cores | EEVDF   | PANDEMONIUM (BPF) | PANDEMONIUM (ADAPTIVE) | scx_bpfland |
 |-------|---------|-------------------|------------------------|-------------|
-| 8     | 12.4%   | **0.2%**          | **0.2%**               | 56.8%       |
-| 12    | 10.5%   | **7.1%**          | **6.9%**               | 58.6%       |
+| 8     | 11.3%   | **8.1%**          | **4.3%**               | 56.5%       |
+| 12    | 11.9%   | **4.4%**          | **6.8%**               | 56.3%       |
 
-At 8+ cores, PANDEMONIUM misses fewer than 1% of frame deadlines vs EEVDF's 10-12%. scx_bpfland misses 57%.
-
-### Contention Stress Test (bench-contention)
-
-6 phases targeting adaptive mechanisms, all core counts (2, 4, 8, 12):
-
-| Phase              |  2C P99 |  4C P99 |  8C P99 | 12C P99 | Status |
-|--------------------|---------|---------|---------|---------|--------|
-| deficit-storm      |   755us |   126us |   153us |    77us | PASS   |
-| sojourn-pressure   |    79us |    66us |    69us |    74us | PASS   |
-| longrun-interactive|    64us |    62us |    66us |    64us | PASS   |
-| burst-recovery     |    77us |    77us |    77us |    78us | PASS   |
-| mixed-storm        |   155us |    65us |    64us |    66us | PASS   |
-
-Zero crashes, zero deadline misses (0/1794 per core count), longrun fairness 0.94-1.00 across all core counts. Burst recovery P99 returns to baseline immediately.
+At 8+ cores, PANDEMONIUM ADAPTIVE misses 4.3% of frame deadlines at 8C. BPF mode hits 4.4% at 12C vs EEVDF's 11.9%. scx_bpfland misses 56%.
 
 ## Key Features
 
 ### Dispatch Order
 
-0. Overflow sojourn rescue (aging overflow DSQ tasks > 10ms, deficit-gated)
+0. Overflow sojourn rescue (aging overflow DSQ tasks > threshold, deficit-gated)
 1. Per-CPU DSQ (direct placement from enqueue, zero contention, counts toward deficit)
 2. Deficit counter (DRR: force batch if budget exhausted + starving; longrun tightens budget)
-3. Hard starvation rescue (absolute 500ms safety net, core-count-scaled)
+3. Hard starvation rescue (core-count-scaled absolute safety net)
 4. Node interactive overflow (LAT_CRITICAL + INTERACTIVE, vtime-ordered)
 5. Batch sojourn rescue (CoDel: rescue if oldest batch > threshold)
 6. Node batch overflow (normal fallback for batch tasks)
@@ -89,20 +86,20 @@ Zero crashes, zero deadline misses (0/1794 per core count), longrun fairness 0.9
 
 ### Three-Tier Enqueue
 
-- **Idle CPU Fast Path**: `select_cpu()` places wakeups directly to per-CPU DSQ with zero contention, kicks with `SCX_KICK_IDLE`
-- **Node-Local Placement with L2 Affinity**: `enqueue()` tries L2 sibling first (INTERACTIVE/BATCH with affinity_mode > 0), then falls back to any idle CPU within the NUMA node. LAT_CRITICAL and kernel threads (PF_KTHREAD) skip affinity for fastest-available placement
-- **Wakeup Preemption**: All wakeups get per-CPU DSQ dispatch with `SCX_KICK_PREEMPT`. A task waking from sleep has external input to deliver regardless of behavioral tier. The classifier operates on historical behavior; the wakeup is the real-time latency signal. LAT_CRITICAL also gets preemption on requeue (compositor guarantee). Batch requeues skip to overflow DSQ
+- **Idle CPU Fast Path**: `select_cpu()` places wakeups directly to per-CPU DSQ (depth-gated: 1 slot at <4 CPUs, 2 at 4+), kicks with `SCX_KICK_IDLE`
+- **Node-Local Placement with L2 Affinity**: `enqueue()` tries L2 sibling first (INTERACTIVE/BATCH with affinity_mode > 0), then falls back to any idle CPU within the NUMA node, always dispatching to the per-node shared DSQ. LAT_CRITICAL and kernel threads (PF_KTHREAD) skip affinity for fastest-available placement
+- **Wakeup Preemption**: All wakeups get node DSQ dispatch with `SCX_KICK_PREEMPT`. A task waking from sleep has external input to deliver regardless of behavioral tier. The classifier operates on historical behavior; the wakeup is the real-time latency signal. LAT_CRITICAL also gets preemption on requeue (compositor guarantee). Batch requeues skip to overflow DSQ
 - **NUMA-Scoped Overflow**: Per-node overflow DSQ with classification-gated routing. Immature INTERACTIVE tasks (`ewma_age < 2`) route to batch DSQ until EWMA classifies them. LAT_CRITICAL tasks are never redirected
 - **Event-Driven Preemption**: `tick()` checks `interactive_waiting` flag and preempts batch tasks above `preempt_thresh_ns`. During `burst_mode`, preempt threshold drops to 0 (immediate preemption). Zero polling -- no BPF timer
 
 ### Overflow Sojourn Rescue
 
-Per-CPU DSQ dominance under sustained load makes all downstream anti-starvation logic unreachable -- 90%+ of dispatches serve per-CPU DSQ while overflow tasks age indefinitely. Dispatch Step 0 checks both overflow DSQs for tasks aging past 10ms and serves them before per-CPU DSQ. CAS-based timestamp management prevents races across CPUs.
+Per-CPU DSQ dominance under sustained load makes all downstream anti-starvation logic unreachable -- 90%+ of dispatches serve per-CPU DSQ while overflow tasks age indefinitely. Dispatch Step 0 checks both overflow DSQs for tasks aging past `overflow_sojourn_rescue_ns` (core-count-scaled: 2ms per core, clamped 4-10ms) and serves them before per-CPU DSQ. CAS-based timestamp management prevents races across CPUs.
 
 ### Longrun Detection
 
 Tracks sustained batch DSQ pressure. When batch DSQ is non-empty for >2 seconds, `longrun_mode` activates:
-- Deficit ratio tightens from `nr_cpu_ids * 4` to `nr_cpu_ids * 1`, quadrupling batch dispatch share
+- Deficit ratio tightens from `nr_cpu_ids * ratio` to `nr_cpu_ids * 1`, quadrupling batch dispatch share
 - `task_slice()` uses `burst_slice_ns` (1ms) instead of regime slice (up to 4ms)
 - Rust adaptive layer: sleep-informed batch adjustment skipped, affinity forced to WEAK (spread batch across CPUs)
 
@@ -119,7 +116,7 @@ High-vtime daemons sort to the tail of the batch DSQ while fresh burst tasks tak
 
 ### Hard Starvation Rescue
 
-Absolute safety net: `starvation_rescue_ns = 500ms / (nr_cpu_ids/4)`, floor 50ms. Fires before the interactive DSQ and guarantees batch service regardless of interactive pressure. Catches cases where the deficit counter fails under contention or slow accumulation on high core counts.
+Absolute safety net. Computed as the minimum of two linear functions: `min(25ms * nr_cpus, 500ms / max(1, nr_cpus/4))`, clamped to 20-500ms. Short at low core counts (fast starvation: 2C = 50ms) and at high core counts (dispatch contention: 128C = 20ms), peaks in the middle (8C = 200ms). Fires before the interactive DSQ and guarantees batch service regardless of interactive pressure.
 
 ### Batch DSQ Separation
 
@@ -131,7 +128,7 @@ Batch tasks enqueue to dedicated per-node batch overflow DSQs instead of sharing
 
 ### Deficit Counter (DRR)
 
-After `interactive_budget` (nr_cpu_ids * 4, floor 8) consecutive interactive dispatches without batch service, forces one batch dispatch. Per-CPU DSQ dispatches count toward the deficit. During longrun mode, budget tightens to `nr_cpu_ids * 1`.
+After `interactive_budget` consecutive interactive dispatches without batch service, forces one batch dispatch. Budget scales with core count: `nr_cpus * ratio` where ratio = `min(4, 2 + nr_cpus/2)` (2C: 6, 4C+: same as nr_cpus * 4). Per-CPU DSQ dispatches count toward the deficit. During longrun mode, budget tightens to `nr_cpu_ids * 1`.
 
 ### Behavioral Classification
 
@@ -172,7 +169,7 @@ After `interactive_budget` (nr_cpu_ids * 4, floor 8) consecutive interactive dis
 - **Workload Regime Detection**: LIGHT (idle >50%), MIXED (10-50%), HEAVY (<10%) with Schmitt trigger hysteresis and 2-tick hold
 - **Regime Profiles**:
   - LIGHT: slice 2ms, preempt 1ms, batch 20ms, affinity WEAK
-  - MIXED: slice 1ms, preempt 1ms, batch 20ms, affinity STRONG
+  - MIXED: slice 1ms, preempt 1ms, batch 20ms (scaled: nr_cpus * 5ms cap), affinity STRONG
   - HEAVY: slice 4ms, preempt 2ms, batch 20ms, affinity WEAK
 - **Knob Adjustment Layering**:
   1. `regime_knobs()` sets baseline
@@ -181,14 +178,24 @@ After `interactive_budget` (nr_cpu_ids * 4, floor 8) consecutive interactive dis
   4. Tighten check: P99 above ceiling tightens slice_ns by 25% (MIXED only)
   5. Graduated relax: step back toward baseline by 500us/tick with 2-second hold
   6. Longrun override: force WEAK affinity, skip sleep adjustment
-- **Core-Count-Aware Sojourn**: Floor = max(5ms, 1ms * nr_cpus/2), ceiling = floor * 2. Dispatch rate normalized to actual elapsed time (not assumed 1s)
+- **Core-Count-Aware Sojourn**: Floor = `clamp(nr_cpus * 1ms, 2ms, 6ms)`, ceiling = floor * 2. Dispatch rate normalized to actual elapsed time (not assumed 1s)
 - **P99 Ceilings**: LIGHT 3ms, MIXED 5ms, HEAVY 10ms
 
 ### Core-Count Scaling
 
-- **Sojourn Floor**: max(5ms, 1ms * nr_cpus/2). A 64-core machine gets a 32ms floor; a 2-core machine stays at 5ms
-- **Starvation Rescue**: 500ms / (nr_cpu_ids/4), floor 50ms. More cores = more dispatch contention = shorter deadline
-- **Deficit Budget**: nr_cpu_ids * 4 (longrun: nr_cpu_ids * 1)
+All scheduling parameters scale dynamically with `nr_cpus` using clamped linear formulas. No special-casing, no lookup tables -- every value is a calculation.
+
+| Parameter | Formula | 2C | 4C | 8C | 12C |
+|-----------|---------|----|----|----|----|
+| Sojourn floor | `clamp(nr_cpus * 1ms, 2ms, 6ms)` | 2ms | 4ms | 6ms | 6ms |
+| Sojourn ceiling | `floor * 2` | 4ms | 8ms | 12ms | 12ms |
+| Overflow rescue | `clamp(nr_cpus * 2ms, 4ms, 10ms)` | 4ms | 8ms | 10ms | 10ms |
+| Starvation rescue | `clamp(min(25ms * N, 500ms / max(1,N/4)), 20ms, 500ms)` | 50ms | 100ms | 200ms | 167ms |
+| Deficit budget | `nr_cpus * min(4, 2 + nr_cpus/2)` | 6 | 16 | 32 | 48 |
+| Per-CPU DSQ depth | `nr_cpus < 4 ? 1 : 2` | 1 | 2 | 2 | 2 |
+| Mixed batch cap | `nr_cpus * 5ms` (no-op above base) | 10ms | 20ms | 20ms | 20ms |
+| Mixed slice cap | `nr_cpus * 500us` (no-op above base) | 1ms | 1ms | 1ms | 1ms |
+
 - **CPU Hotplug**: `cpu_online`/`cpu_offline` callbacks prevent sched_ext auto-exit during CPU restriction
 - **Topology Detection**: Parses sysfs for physical packages, L2/L3 cache domains, NUMA nodes
 - **BPF-Verifier Safe**: All EWMA uses bit shifts, no floats. All shared state uses GCC __sync builtins (CAS, atomic add, test-and-set)
@@ -227,7 +234,8 @@ src/
     death_pipe.rs      Orphan detection via pipe POLLHUP
 build.rs               vmlinux.h generation + C23 patching + BPF compilation
 tests/
-  pandemonium-tests.py Test orchestrator (bench-scale, bench-trace, bench-contention)
+  pandemonium-tests.py Test orchestrator (bench-scale, bench-trace, bench-contention,
+                         bench-pcpu, bench-scx)
   contention.rs        Contention stress tests (44 tests: sojourn, relax, tighten,
                          longrun, sleep-informed batch, regime hold, P99 histogram)
   adaptive.rs          Adaptive layer tests (29 tests: regime, stability, sleep, telemetry)
@@ -241,13 +249,13 @@ include/
 ### BPF Scheduler (main.bpf.c)
 
 ```
-select_cpu()  ->  Idle CPU found?  ->  Per-CPU DSQ (fast path, KICK_IDLE)
-                      |
+select_cpu()  ->  Idle CPU found?  ->  Per-CPU DSQ (depth-gated, KICK_IDLE)
+                      |                  (depth: 1 at <4C, 2 at 4C+)
                       v (no)
-enqueue()     ->  L2 sibling idle?  ->  Per-CPU DSQ (L2-affine placement)
+enqueue()     ->  L2 sibling idle?  ->  Node DSQ + kick (L2-affine placement)
                   (skip for LAT_CRITICAL    |
                    and kernel threads)      v (no)
-              ->  Wakeup or          ->  Per-CPU DSQ + KICK_PREEMPT
+              ->  Wakeup or          ->  Node DSQ + KICK_PREEMPT
                   LAT_CRITICAL?          (all wakeups, any tier)
                       |
                       v (batch requeue)
@@ -257,10 +265,10 @@ enqueue()     ->  L2 sibling idle?  ->  Per-CPU DSQ (L2-affine placement)
                    >=8 cores)             v (classified INTERACTIVE)
               ->  Per-node interactive overflow DSQ
 
-dispatch()    ->  Overflow sojourn rescue (>10ms aging, deficit-gated)
+dispatch()    ->  Overflow sojourn rescue (core-count-scaled threshold, deficit-gated)
               ->  Per-CPU DSQ (direct placement, counts toward deficit)
               ->  Deficit counter (DRR: force batch if budget + starving, longrun tightens)
-              ->  Hard starvation rescue (500ms absolute safety net)
+              ->  Hard starvation rescue (core-count-scaled safety net)
               ->  Node interactive overflow (LAT_CRITICAL + INTERACTIVE)
               ->  Batch sojourn rescue (CoDel: rescue if oldest > threshold)
               ->  Node batch overflow (normal fallback)
@@ -449,14 +457,21 @@ d/s: 180000  idle: 2% shared: 170000  preempt: 8  keep: 0  kick: H=6000 S=18000 
 
 # Crash-detection stress test with BPF trace capture
 ./pandemonium.py bench-trace
-./pandemonium.py bench-scale --iterations 3
 ./pandemonium.py bench-trace --iterations 3 --core-counts 4,8,12
 
 # Contention stress test (6 phases targeting adaptive features)
 ./pandemonium.py bench-contention
-./pandemonium.py bench-scale --iterations 3
 ./pandemonium.py bench-contention --iterations 3 --core-counts 4,8,12
 ./pandemonium.py bench-contention --phase regime-sweep   # Single phase
+
+# Per-CPU DSQ correctness (burst, steal balance, sojourn rescue)
+./pandemonium.py bench-pcpu
+./pandemonium.py bench-pcpu --core-counts 4,8,12
+
+# sched-ext/scx CI compatibility (functional + stress-ng)
+./pandemonium.py bench-scx
+./pandemonium.py bench-scx --core-counts 2
+./pandemonium.py bench-scx --duration 60 --stress-duration 60
 ```
 
 All benchmarks compare across core counts via CPU hotplug (2, 4, 8, ..., max). Results are archived to `~/.cache/pandemonium/` in Prometheus exposition format (.prom) for cross-build regression tracking. Human-readable reports are saved as .log files.
