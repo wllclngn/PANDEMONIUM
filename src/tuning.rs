@@ -71,6 +71,7 @@ pub struct TuningKnobs {
     pub lat_cri_thresh_low: u64,
     pub affinity_mode: u64,
     pub sojourn_thresh_ns: u64,
+    pub burst_slice_ns: u64,
 }
 
 impl Default for TuningKnobs {
@@ -85,6 +86,7 @@ impl Default for TuningKnobs {
             lat_cri_thresh_low: DEFAULT_LAT_CRI_THRESH_LOW,
             affinity_mode: AFFINITY_OFF,
             sojourn_thresh_ns: 5_000_000,
+            burst_slice_ns: 1_000_000,
         }
     }
 }
@@ -131,6 +133,7 @@ pub fn regime_knobs(r: Regime) -> TuningKnobs {
             lat_cri_thresh_low: DEFAULT_LAT_CRI_THRESH_LOW,
             affinity_mode: AFFINITY_WEAK,
             sojourn_thresh_ns: 5_000_000,
+            burst_slice_ns: 1_000_000,
         },
         Regime::Mixed => TuningKnobs {
             slice_ns: MIXED_SLICE_NS,
@@ -142,6 +145,7 @@ pub fn regime_knobs(r: Regime) -> TuningKnobs {
             lat_cri_thresh_low: DEFAULT_LAT_CRI_THRESH_LOW,
             affinity_mode: AFFINITY_STRONG,
             sojourn_thresh_ns: 5_000_000,
+            burst_slice_ns: 1_000_000,
         },
         Regime::Heavy => TuningKnobs {
             slice_ns: HEAVY_SLICE_NS,
@@ -153,8 +157,37 @@ pub fn regime_knobs(r: Regime) -> TuningKnobs {
             lat_cri_thresh_low: DEFAULT_LAT_CRI_THRESH_LOW,
             affinity_mode: AFFINITY_WEAK,
             sojourn_thresh_ns: 5_000_000,
+            burst_slice_ns: 1_000_000,
         },
     }
+}
+
+// CORE-COUNT-AWARE REGIME KNOBS
+// AT LOW CORE COUNTS, TIME SLICES MUST BE SHORTER TO MAINTAIN ADEQUATE
+// DISPATCH FREQUENCY. HEAVY AT 2C WITH 4MS SLICES = 250 DISPATCHES/S/CORE,
+// TOO COARSE FOR DEADLINE AND IPC WORKLOADS.
+// SCALE: slice = min(BASE, nr_cpus * 500US), preempt = min(BASE, nr_cpus * 250US).
+// MIXED ALSO SCALES: BATCH_SLICE CAPS AT nr_cpus * 5MS (2C: 10MS VS 20MS BASE).
+
+pub fn scaled_regime_knobs(r: Regime, nr_cpus: u64) -> TuningKnobs {
+    let mut knobs = regime_knobs(r);
+    match r {
+        Regime::Heavy | Regime::Light => {
+            let slice_cap = nr_cpus * 500_000;
+            let preempt_cap = nr_cpus * 250_000;
+            knobs.slice_ns = knobs.slice_ns.min(slice_cap);
+            knobs.preempt_thresh_ns = knobs.preempt_thresh_ns.min(preempt_cap);
+        }
+        Regime::Mixed => {
+            let slice_cap = nr_cpus * 500_000;
+            let preempt_cap = nr_cpus * 500_000;
+            knobs.slice_ns = knobs.slice_ns.min(slice_cap);
+            knobs.preempt_thresh_ns = knobs.preempt_thresh_ns.min(preempt_cap);
+            let batch_cap = nr_cpus * 5_000_000;
+            knobs.batch_slice_ns = knobs.batch_slice_ns.min(batch_cap);
+        }
+    }
+    knobs
 }
 
 // REGIME DETECTION (SCHMITT TRIGGER)

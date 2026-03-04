@@ -50,11 +50,13 @@ pub struct PandemoniumStats {
     pub nr_reenqueue: u64,
     pub batch_sojourn_ns: u64,
     pub burst_mode_active: u64,
+    pub longrun_mode_active: u64,
+    pub nr_overflow_rescue: u64,
 }
 
 // COMPILE-TIME ABI SAFETY: MUST MATCH STRUCT LAYOUTS IN intf.h
-const _: () = assert!(std::mem::size_of::<PandemoniumStats>() == 208);
-const _: () = assert!(std::mem::size_of::<TuningKnobs>() == 72);
+const _: () = assert!(std::mem::size_of::<PandemoniumStats>() == 224);
+const _: () = assert!(std::mem::size_of::<TuningKnobs>() == 80);
 
 // TuningKnobs lives in tuning.rs (zero BPF dependencies, testable offline)
 
@@ -101,28 +103,31 @@ impl<'a> Scheduler<'a> {
         // ATTACH STRUCT_OPS
         let link = skel.maps.pandemonium_ops.attach_struct_ops()?;
 
-        // PIN MAPS FOR USERSPACE ACCESS
+        // PIN MAPS FOR USERSPACE ACCESS (NON-FATAL: bpffs may not be mounted)
         let pin_dir = "/sys/fs/bpf/pandemonium";
-        std::fs::create_dir_all(pin_dir).ok();
+        let bpffs_ok = std::fs::create_dir_all(pin_dir).is_ok();
+        if bpffs_ok {
+            std::fs::remove_file(KNOBS_PIN).ok();
+            skel.maps.tuning_knobs_map.pin(KNOBS_PIN).ok();
 
-        std::fs::remove_file(KNOBS_PIN).ok();
-        skel.maps.tuning_knobs_map.pin(KNOBS_PIN)?;
+            let cache_pin = "/sys/fs/bpf/pandemonium/cache_domain";
+            std::fs::remove_file(cache_pin).ok();
+            skel.maps.cache_domain.pin(cache_pin).ok();
 
-        let cache_pin = "/sys/fs/bpf/pandemonium/cache_domain";
-        std::fs::remove_file(cache_pin).ok();
-        skel.maps.cache_domain.pin(cache_pin)?;
+            let observe_pin = "/sys/fs/bpf/pandemonium/task_class_observe";
+            std::fs::remove_file(observe_pin).ok();
+            skel.maps.task_class_observe.pin(observe_pin).ok();
 
-        let observe_pin = "/sys/fs/bpf/pandemonium/task_class_observe";
-        std::fs::remove_file(observe_pin).ok();
-        skel.maps.task_class_observe.pin(observe_pin)?;
+            let init_pin = "/sys/fs/bpf/pandemonium/task_class_init";
+            std::fs::remove_file(init_pin).ok();
+            skel.maps.task_class_init.pin(init_pin).ok();
 
-        let init_pin = "/sys/fs/bpf/pandemonium/task_class_init";
-        std::fs::remove_file(init_pin).ok();
-        skel.maps.task_class_init.pin(init_pin)?;
-
-        let compositor_pin = "/sys/fs/bpf/pandemonium/compositor_map";
-        std::fs::remove_file(compositor_pin).ok();
-        skel.maps.compositor_map.pin(compositor_pin)?;
+            let compositor_pin = "/sys/fs/bpf/pandemonium/compositor_map";
+            std::fs::remove_file(compositor_pin).ok();
+            skel.maps.compositor_map.pin(compositor_pin).ok();
+        } else {
+            log_warn!("BPFFS NOT AVAILABLE: map pinning skipped (scheduler still functional)");
+        }
 
         Ok(Self {
             skel,
@@ -180,8 +185,9 @@ impl<'a> Scheduler<'a> {
                 if stats.batch_sojourn_ns > total.batch_sojourn_ns {
                     total.batch_sojourn_ns = stats.batch_sojourn_ns;
                 }
-                if stats.burst_mode_active > total.burst_mode_active {
-                    total.burst_mode_active = stats.burst_mode_active;
+                total.burst_mode_active += stats.burst_mode_active;
+                if stats.longrun_mode_active > total.longrun_mode_active {
+                    total.longrun_mode_active = stats.longrun_mode_active;
                 }
             }
         }

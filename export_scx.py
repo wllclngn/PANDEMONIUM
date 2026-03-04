@@ -11,8 +11,10 @@
 #   3. STRIPS [profile.release] (WORKSPACE PROVIDES ITS OWN)
 #   4. REPLACES build.rs WITH scx_cargo::BpfBuilder (MATCHES OTHER SCHEDULERS)
 #   5. SWAPS libbpf-cargo FOR scx_cargo PATH+VERSION DEP
-#   6. PATCHES bpf_skel.rs INCLUDE PATH FOR BpfBuilder OUTPUT
-#   7. ADDS WORKSPACE MEMBER TO ROOT Cargo.toml IF MISSING
+#   6. STRIPS default-features=false FROM libbpf-rs (ENABLES VENDORED LIBBPF FOR CI)
+#   7. PATCHES bpf_skel.rs INCLUDE PATH FOR BpfBuilder OUTPUT
+#   8. PATCHES intf.h WITH BINDGEN-COMPATIBLE TYPE DEFINITIONS
+#   9. ADDS WORKSPACE MEMBER TO ROOT Cargo.toml IF MISSING
 #
 # WHAT IT DOES NOT DO:
 #   - DOES NOT COMMIT OR PUSH ANYTHING
@@ -194,6 +196,65 @@ def swap_build_deps(dst_root, scx_root):
     return 0
 
 
+def fix_libbpf_vendoring(dst_root):
+    """Enable libbpf vendoring by stripping default-features = false from libbpf-rs.
+
+    Standalone builds use system libbpf (default-features = false).
+    scx CI doesn't have system libbpf on the linker path -- needs vendored build.
+    Removing default-features = false re-enables libbpf-sys's vendored-libbpf
+    feature, so libbpf.a gets built from source and linked statically.
+    """
+    cargo_path = os.path.join(dst_root, "Cargo.toml")
+    text = open(cargo_path).read()
+    new_text = re.sub(
+        r'(libbpf-rs\s*=\s*\{[^}]*),\s*default-features\s*=\s*false',
+        r'\1',
+        text,
+    )
+    if new_text != text:
+        open(cargo_path, "w").write(new_text)
+        print("  FIX: libbpf-rs default-features = false stripped (enables vendored libbpf)")
+        return 1
+    print("  FIX: libbpf-rs already uses default features")
+    return 0
+
+
+def patch_intf_types(dst_root):
+    """Add portable type definitions so bindgen can parse intf.h without vmlinux.h."""
+    intf_path = os.path.join(dst_root, "src", "bpf", "intf.h")
+    if not os.path.exists(intf_path):
+        print("  WARNING: src/bpf/intf.h not found")
+        return 0
+
+    text = open(intf_path).read()
+
+    # Insert unconditional typedefs after the include guard.
+    # C11+ (and C23 which PANDEMONIUM targets) allows duplicate compatible
+    # typedefs, so these coexist safely with vmlinux.h during BPF compilation.
+    # scx_utils defines __bpf__ during bindgen, so a #ifndef guard won't work.
+    type_compat = (
+        "\n// BINDGEN/SCX COMPATIBILITY: provide kernel types unconditionally.\n"
+        "// vmlinux.h also typedefs these in BPF context; C11+ permits\n"
+        "// duplicate compatible typedefs, so no conflict.\n"
+        "typedef unsigned long long u64;\n"
+        "typedef unsigned char u8;\n"
+    )
+
+    anchor = "#define __INTF_H\n"
+    if anchor not in text:
+        print("  WARNING: intf.h missing expected include guard, skipping type patch")
+        return 0
+
+    if "typedef unsigned long long u64;" in text:
+        print("  PATCH: intf.h type compatibility already present")
+        return 0
+
+    new_text = text.replace(anchor, anchor + type_compat)
+    open(intf_path, "w").write(new_text)
+    print("  PATCH: intf.h type compatibility (u64/u8 for bindgen)")
+    return 1
+
+
 def patch_bpf_skel_include(dst_root):
     """Patch bpf_skel.rs include path for BpfBuilder output filename."""
     skel_path = os.path.join(dst_root, "src", "bpf_skel.rs")
@@ -305,7 +366,9 @@ def main():
     print("\n[4] BUILD SYSTEM")
     replace_build_rs(dst_root)
     swap_build_deps(dst_root, scx_root)
+    fix_libbpf_vendoring(dst_root)
     patch_bpf_skel_include(dst_root)
+    patch_intf_types(dst_root)
 
     # STEP 5: WORKSPACE REGISTRATION
     print("\n[5] WORKSPACE REGISTRATION")

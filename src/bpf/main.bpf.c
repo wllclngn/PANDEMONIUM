@@ -5,12 +5,12 @@
 // RUST: ADAPTIVE CONTROL LOOP + REAL-TIME TELEMETRY
 //
 // ARCHITECTURE:
-//   SELECT_CPU IDLE FAST PATH -> PER-CPU DSQ (ZERO CONTENTION)
-//   ENQUEUE IDLE FOUND -> PER-CPU DSQ DIRECT PLACEMENT (ZERO CONTENTION)
-//   ENQUEUE INTERACTIVE PREEMPT -> PER-CPU DSQ + HARD KICK
+//   SELECT_CPU IDLE FAST PATH -> PER-CPU DSQ (DEPTH-GATED, VISIBLE, STEALABLE)
+//   ENQUEUE IDLE FOUND -> NODE DSQ (SHARED, ANY CPU DRAINS)
+//   ENQUEUE INTERACTIVE PREEMPT -> NODE DSQ (SHARED, KICKED CPU DRAINS)
 //   ENQUEUE FALLBACK -> PER-NODE OVERFLOW DSQ (VTIME-ORDERED)
-//   DISPATCH -> PER-CPU DSQ, NODE OVERFLOW, CROSS-NODE STEAL, KEEP_RUNNING
-//   TICK -> EVENT-DRIVEN BATCH PREEMPTION (ZERO POLLING)
+//   DISPATCH -> OWN PER-CPU, L2 WORK STEAL, NODE OVERFLOW, CROSS-NODE, KEEP
+//   TICK -> PER-CPU SOJOURN (LOCAL + ROTATING SCAN) + BATCH PREEMPTION
 //
 // BEHAVIORAL CLASSIFICATION (FROM v0.9.4):
 //   LAT_CRI SCORE = (WAKEUP_FREQ * CSW_RATE) / AVG_RUNTIME
@@ -58,7 +58,8 @@ const volatile u64 nr_cpu_ids = 1;
 
 #define SLICE_MIN_NS 100000     // 100US FLOOR
 #define STARVATION_RESCUE_NS (500ULL * 1000000ULL) // 500MS HARD LIMIT
-#define OVERFLOW_SOJOURN_RESCUE_NS (10ULL * 1000000ULL) // 10MS
+// OVERFLOW SOJOURN RESCUE: COMPUTED IN init() FROM nr_cpu_ids
+// 2C: 4MS, 4C: 8MS, 5C+: 10MS. SEE pandemonium_init().
 
 
 // GLOBALS
@@ -73,19 +74,26 @@ static bool interactive_waiting;
 
 // SOJOURN TRACKERS: RECORD WHEN OVERFLOW DSQs TRANSITION FROM EMPTY.
 // DISPATCH STEP 0 CHECKS THESE TO RESCUE OVERFLOW TASKS AGING PAST
-// OVERFLOW_SOJOURN_RESCUE_NS. WITHOUT THIS, PER-CPU DSQ DOMINANCE
+// overflow_sojourn_rescue_ns. WITHOUT THIS, PER-CPU DSQ DOMINANCE
 // UNDER SUSTAINED LOAD MAKES ALL DOWNSTREAM ANTI-STARVATION LOGIC
 // (DEFICIT, SOJOURN, STARVATION_RESCUE) UNREACHABLE.
 static u64 batch_enqueue_ns;
 static u64 interactive_enqueue_ns;
 
+// PER-CPU DSQ SOJOURN: TRACKS WHEN EACH PER-CPU DSQ TRANSITIONS
+// FROM EMPTY. DISPATCH AND TICK CHECK THESE TO DETECT STALE TASKS.
+// WORK STEALING + DEPTH GATE HANDLE MOST CASES; THIS IS THE SAFETY NET.
+static u64 pcpu_enqueue_ns[MAX_CPUS];
+
 // DEFICIT COUNTER: ANTI-STARVATION INTERLEAVE (DRR)
 // COUNTS DISPATCHES SINCE LAST BATCH SERVICE. WHEN interactive_run
 // EXCEEDS interactive_budget AND BATCH IS STARVING, FORCE ONE BATCH
-// DISPATCH. PROPORTIONAL: BUDGET = nr_cpu_ids * 4.
+// DISPATCH. PROPORTIONAL: BUDGET = nr_cpu_ids * ratio (RATIO SCALES 2-4).
 static u64 interactive_run;
 static u64 interactive_budget;
 static u64 starvation_rescue_ns;
+static u64 overflow_sojourn_rescue_ns;
+static u32 pcpu_depth_base;
 
 // CUSUM BURST DETECTION (TOTAL-ENQUEUE)
 // MONITORS ENQUEUE RATE TO DETECT FORK/EXEC STORMS.
@@ -505,11 +513,11 @@ static __always_inline u64 task_slice(const struct task_ctx *tctx,
 
 // SCHEDULING CALLBACKS
 
-// SELECT_CPU: FAST-PATH IDLE CPU DISPATCH
-// DISPATCHES TO PER-CPU DSQ (NOT SCX_DSQ_LOCAL).
-// PER-CPU DSQ IS CONSUMED BY OUR dispatch() CALLBACK. SCX_DSQ_LOCAL
-// BYPASSES dispatch() ENTIRELY, MAKING TASKS INVISIBLE TO OUR TIERED
-// DSQ SYSTEM AND STARVING THE SCHEDULER UNDER SUSTAINED LOAD.
+// SELECT_CPU: FAST-PATH IDLE CPU DISPATCH TO PER-CPU DSQ
+// DISPATCHES TO NAMED PER-CPU DSQ (u64)cpu -- VISIBLE TO WORK STEALING
+// AND SOJOURN RESCUE. DEPTH-GATED: IF PER-CPU DSQ ALREADY HAS TASKS,
+// SPILL TO SHARED NODE DSQ SO ANY CPU CAN GRAB IT.
+// THE CPU IS IDLE SO IT ENTERS dispatch() IMMEDIATELY AND DRAINS.
 s32 BPF_STRUCT_OPS(pandemonium_select_cpu, struct task_struct *p,
 		   s32 prev_cpu, u64 wake_flags)
 {
@@ -521,21 +529,32 @@ s32 BPF_STRUCT_OPS(pandemonium_select_cpu, struct task_struct *p,
 		struct tuning_knobs *knobs = get_knobs();
 		u64 sl = tctx ? task_slice(tctx, knobs) : 1000000;
 
-		// PER-CPU DSQ: CONSUMED BY dispatch() CALLBACK.
-		// ON AN IDLE CPU THE PER-CPU DSQ IS EMPTY, SO THIS TASK
-		// IS THE ONLY ENTRY AND GETS PICKED UP IMMEDIATELY.
-		s32 node = __COMPAT_scx_bpf_cpu_node(cpu);
-		if (node < 0 || (u32)node >= nr_nodes) node = 0;
-		u64 node_dsq = nr_cpu_ids + (u64)node;
-		u64 dl = tctx ? task_deadline(p, tctx, node_dsq, knobs)
-			      : vtime_now;
-		scx_bpf_dsq_insert_vtime(p, (u64)cpu, sl, dl, 0);
+		u32 depth_thresh = burst_mode ? 1 : pcpu_depth_base;
+		if ((u64)cpu < nr_cpu_ids &&
+		    scx_bpf_dsq_nr_queued((u64)cpu) < depth_thresh) {
+			// PER-CPU DSQ: CACHE-HOT, VISIBLE, STEALABLE
+			u64 dl = tctx ? task_deadline(p, tctx, (u64)cpu, knobs)
+				      : vtime_now;
+			scx_bpf_dsq_insert_vtime(p, (u64)cpu, sl, dl, 0);
+			if ((u32)cpu < MAX_CPUS)
+				__sync_val_compare_and_swap(
+					&pcpu_enqueue_ns[cpu], 0,
+					bpf_ktime_get_ns());
+		} else {
+			// DEPTH EXCEEDED: SPILL TO SHARED NODE DSQ
+			s32 node = __COMPAT_scx_bpf_cpu_node(cpu);
+			if (node < 0 || (u32)node >= nr_nodes) node = 0;
+			u64 node_dsq = nr_cpu_ids + (u64)node;
+			u64 dl = tctx ? task_deadline(p, tctx, node_dsq, knobs)
+				      : vtime_now;
+			scx_bpf_dsq_insert_vtime(p, node_dsq, sl, dl, 0);
+			__sync_val_compare_and_swap(
+				&interactive_enqueue_ns, 0,
+				bpf_ktime_get_ns());
+		}
 
-		// KICK: WAKE HALTED IDLE CPU TO PROCESS PER-CPU DSQ.
-		// SCX_KICK_IDLE FOR ALL: CPU IS ALREADY BEING WOKEN BY THE
-		// SCHEDULER (select_cpu_dfl FOUND IT IDLE). PREEMPT IPI IS
-		// REDUNDANT -- IDLE CPUS HAVE NOTHING TO PREEMPT.
 		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+		__sync_fetch_and_add(&interactive_run, 1);
 
 		if (tctx)
 			tctx->dispatch_path = 0;
@@ -550,7 +569,7 @@ s32 BPF_STRUCT_OPS(pandemonium_select_cpu, struct task_struct *p,
 
 #if TRACE_SCHED
 		if (is_sched_task(p))
-			bpf_printk("PAND: select_cpu idle cpu=%d", cpu);
+			bpf_printk("PAND: select_cpu pid=%d cpu=%d", p->pid, cpu);
 #endif
 	}
 
@@ -558,9 +577,9 @@ s32 BPF_STRUCT_OPS(pandemonium_select_cpu, struct task_struct *p,
 }
 
 // ENQUEUE: THREE-TIER PLACEMENT WITH BEHAVIORAL PREEMPTION
-// TIER 1: IDLE CPU ON NODE -> DIRECT PER-CPU DSQ (ZERO CONTENTION)
-// TIER 2: INTERACTIVE/LAT_CRITICAL -> DIRECT PER-CPU DSQ + HARD PREEMPT
-// TIER 3: FALLBACK -> NODE OVERFLOW DSQ + SELECTIVE KICK
+// TIER 1: IDLE CPU ON NODE -> PER-CPU DSQ (DEPTH-GATED) + KICK
+// TIER 2: INTERACTIVE/LAT_CRITICAL -> PER-CPU DSQ (DEPTH-GATED) + HARD PREEMPT
+// TIER 3: FALLBACK -> PER-NODE OVERFLOW DSQ + SELECTIVE KICK
 void BPF_STRUCT_OPS(pandemonium_enqueue, struct task_struct *p,
 		    u64 enq_flags)
 {
@@ -576,11 +595,10 @@ void BPF_STRUCT_OPS(pandemonium_enqueue, struct task_struct *p,
 	// CLASSIFY: WAKEUP VS RE-ENQUEUE
 	bool is_wakeup = tctx && tctx->awake_vtime == 0;
 
-	// TIER 1: IDLE CPU -> DIRECT PER-CPU DSQ
+	// TIER 1: IDLE CPU -> NODE DSQ + KICK
 	// L2 PLACEMENT: TRY IDLE SIBLING IN SAME L2 DOMAIN FIRST.
 	// LAT_CRITICAL AND KERNEL THREADS SKIP AFFINITY -- FASTEST CPU WINS.
-	// KWORKERS/KSOFTIRQD ARE INFRASTRUCTURE; NEVER L2-STEER THEM.
-	// GUARD: CPU MUST BE < nr_cpu_ids SO ITS PER-CPU DSQ EXISTS.
+	// TASK GOES TO SHARED NODE DSQ SO ANY CPU ON THE NODE CAN DRAIN IT.
 	s32 cpu = -1;
 	if (knobs && knobs->affinity_mode > 0 && tctx &&
 	    tctx->tier != TIER_LAT_CRITICAL &&
@@ -592,14 +610,8 @@ void BPF_STRUCT_OPS(pandemonium_enqueue, struct task_struct *p,
 	if (cpu >= 0 && (u64)cpu < nr_cpu_ids) {
 		dl = tctx ? task_deadline(p, tctx, node_dsq, knobs)
 			  : vtime_now;
-		scx_bpf_dsq_insert_vtime(p, (u64)cpu, sl, dl, enq_flags);
+		scx_bpf_dsq_insert_vtime(p, node_dsq, sl, dl, enq_flags);
 
-		// NON-BATCH: USE PREEMPT KICK TO GUARANTEE IMMEDIATE PICKUP.
-		// SCX_KICK_IDLE IS A NO-OP ON BUSY CPUs -- IF THE "IDLE" CPU
-		// BECAME BUSY BETWEEN pick_idle AND kick, THE TASK SITS IN
-		// THE PER-CPU DSQ FOR UP TO batch_slice_ns (20MS). PREEMPT
-		// SENDS AN IPI THAT FORCES IMMEDIATE RESCHEDULE.
-		// BATCH TASKS CAN WAIT -- THEY'RE NOT LATENCY-SENSITIVE.
 		u64 kick_flag = (tctx && tctx->tier != TIER_BATCH)
 			      ? SCX_KICK_PREEMPT : SCX_KICK_IDLE;
 		scx_bpf_kick_cpu(cpu, kick_flag);
@@ -620,24 +632,19 @@ void BPF_STRUCT_OPS(pandemonium_enqueue, struct task_struct *p,
 		}
 #if TRACE_SCHED
 		if (is_sched_task(p))
-			bpf_printk("PAND: enq tier1 cpu=%d", cpu);
+			bpf_printk("PAND: enq tier1 pid=%d cpu=%d", p->pid, cpu);
 #endif
 		return;
 	}
 
-	// TIER 2: WAKEUP PREEMPTION -- PER-CPU DSQ + SELECTIVE KICK
-	// ALL WAKEUPS GET DIRECT PER-CPU DISPATCH: A TASK WAKING FROM SLEEP
+	// TIER 2: WAKEUP PREEMPTION -- NODE DSQ + SELECTIVE KICK
+	// ALL WAKEUPS GET NODE DSQ DISPATCH: A TASK WAKING FROM SLEEP
 	// HAS EXTERNAL INPUT TO DELIVER (TIMER, IO, USER) REGARDLESS OF
 	// BEHAVIORAL TIER. THE CLASSIFIER OPERATES ON HISTORICAL BEHAVIOR;
 	// THE WAKEUP IS THE REAL-TIME LATENCY SIGNAL.
 	// LAT_CRITICAL ALSO GETS PREEMPTION ON REQUEUE (COMPOSITOR GUARANTEE).
-	// BATCH REQUEUES SKIP TIER 2: CPU-BOUND TASKS CYCLING THROUGH THE
-	// SCHEDULER CAN WAIT FOR dispatch() OR tick() (1-4MS WORST).
 	// ONLINE GUARD: pick_any_cpu_node() CAN RETURN OFFLINE CPUs DURING
 	// HOTPLUG. OFFLINE CPUs HAVE NO CURRENT TASK (cpu_curr == NULL).
-	// IF OFFLINE, FALL THROUGH TO TIER 3 (OVERFLOW DSQ + TICK RESCUE).
-	// KICK POLICY: WAKEUPS GET SCX_KICK_PREEMPT (IMMEDIATE IPI).
-	// REQUEUES (LAT_CRITICAL ONLY) GET SCX_KICK_IDLE.
 	if (tctx &&
 	    (tctx->tier == TIER_LAT_CRITICAL || is_wakeup)) {
 		cpu = __COMPAT_scx_bpf_pick_any_cpu_node(
@@ -645,8 +652,9 @@ void BPF_STRUCT_OPS(pandemonium_enqueue, struct task_struct *p,
 		if (cpu >= 0 && (u64)cpu < nr_cpu_ids &&
 		    __COMPAT_scx_bpf_cpu_curr(cpu)) {
 			dl = task_deadline(p, tctx, node_dsq, knobs);
-			scx_bpf_dsq_insert_vtime(p, (u64)cpu, sl, dl,
+			scx_bpf_dsq_insert_vtime(p, node_dsq, sl, dl,
 						  enq_flags);
+
 			u64 kick_flag = (is_wakeup ||
 				 tctx->tier == TIER_LAT_CRITICAL)
 				? SCX_KICK_PREEMPT : SCX_KICK_IDLE;
@@ -665,24 +673,20 @@ void BPF_STRUCT_OPS(pandemonium_enqueue, struct task_struct *p,
 			}
 #if TRACE_SCHED
 			if (is_sched_task(p))
-				bpf_printk("PAND: enq tier2 cpu=%d kick=%llu", cpu, kick_flag);
+				bpf_printk("PAND: enq tier2 pid=%d cpu=%d", p->pid, cpu);
 #endif
 			return;
 		}
 	}
 
 	// TIER 3: NODE OVERFLOW DSQ + SELECTIVE KICK
-	// CLASSIFICATION-GATED ROUTING: INTERACTIVE DSQ IS A PRIVILEGE.
-	// IMMATURE TASKS ROUTE TO BATCH DSQ UNTIL EWMA CLASSIFIES THEM.
+	// ONLY BATCH-CLASSIFIED TASKS GO TO BATCH DSQ.
+	// IMMATURE TASKS (ewma_age < 2) STAY IN INTERACTIVE DSQ TO PREVENT
+	// STARVATION DURING BURST SPAWNS -- NEW THREADS STARTING WITH
+	// ewma_age=0 WOULD FLOOD THE BATCH DSQ AND STARVE FOR 30-40S
+	// WAITING FOR SOJOURN RESCUE THAT NEVER REACHES THE TAIL.
 	// LAT_CRITICAL (COMPOSITORS) ARE NEVER REDIRECTED.
-	// SPLIT DSQ ROUTING: ALWAYS ACTIVE. DSQ COLLAPSE (ALL TO INTERACTIVE)
-	// WAS REMOVED IN v5.4.4 -- SINGLE-QUEUE CONTENTION IS WORSE THAN
-	// SPLIT ROUTING. BURST IS HANDLED VIA SLICE REDUCTION (burst_slice_ns)
-	// AND PREEMPT THRESHOLD OVERRIDE, NOT DSQ REORGANIZATION.
-	u32 age_thresh = 2;
-	u64 target_dsq = (tctx && (tctx->tier == TIER_BATCH ||
-		(tctx->tier == TIER_INTERACTIVE &&
-		 tctx->ewma_age < age_thresh)))
+	u64 target_dsq = (tctx && tctx->tier == TIER_BATCH)
 		? (nr_cpu_ids + nr_nodes + (u64)node)
 		: node_dsq;
 
@@ -714,7 +718,7 @@ void BPF_STRUCT_OPS(pandemonium_enqueue, struct task_struct *p,
 
 #if TRACE_SCHED
 	if (is_sched_task(p))
-		bpf_printk("PAND: enq tier3 dsq=%llu tier=%d", target_dsq, tctx ? tctx->tier : -1);
+		bpf_printk("PAND: enq tier3 pid=%d dsq=%llu tier=%d", p->pid, target_dsq, tctx ? tctx->tier : -1);
 #endif
 
 	// ARM TICK SAFETY NET: SIGNAL THAT INTERACTIVE TASKS ARE WAITING IN OVERFLOW.
@@ -778,14 +782,20 @@ void BPF_STRUCT_OPS(pandemonium_enqueue, struct task_struct *p,
 }
 
 // DISPATCH: CPU IS IDLE AND NEEDS WORK
-// 0. OVERFLOW SOJOURN AMPLIFICATION (RESCUE AGING OVERFLOW DSQ TASKS)
-// 1. OWN PER-CPU DSQ (DIRECT PLACEMENT FROM ENQUEUE -- ZERO CONTENTION)
-// 2. DEFICIT CHECK (DRR: FORCE BATCH RESCUE AFTER BUDGET EXHAUSTED)
-// 3. NODE INTERACTIVE OVERFLOW (LATCRIT + INTERACTIVE, VTIME-ORDERED)
-// 4. BATCH SOJOURN RESCUE (CODEL: RESCUE IF OLDEST BATCH TASK > THRESHOLD)
-// 5. NODE BATCH OVERFLOW (NORMAL FALLBACK FOR BATCH TASKS)
-// 6. CROSS-NODE STEAL (BOTH INTERACTIVE AND BATCH PER REMOTE NODE)
-// 7. KEEP_RUNNING IF PREV STILL WANTS CPU AND NOTHING QUEUED
+// HYBRID PER-CPU + NODE DSQ DESIGN (v5.4.8):
+//   SELECT_CPU -> PER-CPU DSQ (DEPTH-GATED, VISIBLE, STEALABLE)
+//   ENQUEUE TIER 1/2 -> NODE DSQ (SHARED, ANY CPU DRAINS)
+//   ENQUEUE TIER 3 -> PER-NODE BATCH/INTERACTIVE DSQ
+//
+// 0. OWN PER-CPU DSQ (CACHE-HOT, ZERO CONTENTION)
+// 1. L2 WORK STEALING (SIBLING PER-CPU DSQs, SAME CACHE DOMAIN)
+// 2. DEFICIT GATE + OVERFLOW SOJOURN RESCUE (AGING OVERFLOW DSQ TASKS)
+// 3. DEFICIT CHECK (DRR: FORCE BATCH RESCUE AFTER BUDGET EXHAUSTED)
+// 4. HARD STARVATION RESCUE (ABSOLUTE SAFETY NET FOR BATCH)
+// 5. NODE INTERACTIVE OVERFLOW (ALL INTERACTIVE TASKS, VTIME-ORDERED)
+// 6. BATCH SOJOURN RESCUE + NODE BATCH OVERFLOW
+// 7. CROSS-NODE STEAL (BOTH INTERACTIVE AND BATCH PER REMOTE NODE)
+// 8. KEEP_RUNNING IF PREV STILL WANTS CPU AND NOTHING QUEUED
 void BPF_STRUCT_OPS(pandemonium_dispatch, s32 cpu, struct task_struct *prev)
 {
 	s32 node = __COMPAT_scx_bpf_cpu_node(cpu);
@@ -795,8 +805,73 @@ void BPF_STRUCT_OPS(pandemonium_dispatch, s32 cpu, struct task_struct *prev)
 	struct pandemonium_stats *s;
 	u64 now = bpf_ktime_get_ns();
 
-	// SHARED STATE: BATCH STARVATION + DEFICIT BUDGET
-	// HOISTED BEFORE STEP 0 SO THE SKIP GATE CAN USE THEM.
+	// STEP 0: OWN PER-CPU DSQ -- HIGHEST PRIORITY, CACHE-HOT
+	if ((u64)cpu < nr_cpu_ids &&
+	    scx_bpf_dsq_move_to_local((u64)cpu)) {
+		if ((u32)cpu < MAX_CPUS &&
+		    scx_bpf_dsq_nr_queued((u64)cpu) == 0) {
+			u64 old = pcpu_enqueue_ns[cpu];
+			if (old > 0)
+				__sync_val_compare_and_swap(
+					&pcpu_enqueue_ns[cpu], old, 0);
+		}
+		__sync_fetch_and_add(&interactive_run, 1);
+		s = get_stats();
+		if (s)
+			s->nr_dispatches += 1;
+		// SOJOURN GATE: ONLY RETURN IF SHARED DSQs ARE NOT STARVING.
+		// IF EITHER OVERFLOW DSQ HAS TASKS AGING PAST THRESHOLD,
+		// FALL THROUGH SO DOWNSTREAM RESCUE LOGIC CAN FIRE.
+		{
+			u64 ie = interactive_enqueue_ns;
+			u64 be = batch_enqueue_ns;
+			if ((ie == 0 || (now - ie) <= overflow_sojourn_rescue_ns) &&
+			    (be == 0 || (now - be) <= overflow_sojourn_rescue_ns))
+				return;
+		}
+	}
+
+	// STEP 1: L2 WORK STEALING -- PULL FROM SIBLING PER-CPU DSQs
+	// SAME L2 CACHE DOMAIN = MINIMAL CACHE PENALTY ON STEAL.
+	// BOUNDED LOOP (MAX_L2_SIBLINGS), SAME PATTERN AS find_idle_l2_sibling.
+	u32 my_cpu = (u32)cpu;
+	u32 *group = bpf_map_lookup_elem(&cache_domain, &my_cpu);
+	if (group) {
+		u32 base = *group * MAX_L2_SIBLINGS;
+		for (int i = 0; i < MAX_L2_SIBLINGS; i++) {
+			u32 key = base + i;
+			u32 *val = bpf_map_lookup_elem(&l2_siblings, &key);
+			if (!val || *val == (u32)-1)
+				break;
+			u32 sibling = *val;
+			if (sibling == my_cpu || sibling >= nr_cpu_ids)
+				continue;
+			if (scx_bpf_dsq_move_to_local((u64)sibling)) {
+				if (sibling < MAX_CPUS &&
+				    scx_bpf_dsq_nr_queued((u64)sibling) == 0) {
+					u64 old = pcpu_enqueue_ns[sibling];
+					if (old > 0)
+						__sync_val_compare_and_swap(
+							&pcpu_enqueue_ns[sibling],
+							old, 0);
+				}
+				__sync_fetch_and_add(&interactive_run, 1);
+				s = get_stats();
+				if (s)
+					s->nr_dispatches += 1;
+				// SOJOURN GATE: SAME CHECK AS STEP 0.
+				{
+					u64 ie = interactive_enqueue_ns;
+					u64 be = batch_enqueue_ns;
+					if ((ie == 0 || (now - ie) <= overflow_sojourn_rescue_ns) &&
+					    (be == 0 || (now - be) <= overflow_sojourn_rescue_ns))
+						return;
+				}
+				break;
+			}
+		}
+	}
+
 	struct tuning_knobs *knobs = get_knobs();
 	u64 sojourn_thresh = knobs ? knobs->sojourn_thresh_ns : 5000000;
 	u64 oldest = batch_enqueue_ns;
@@ -804,23 +879,16 @@ void BPF_STRUCT_OPS(pandemonium_dispatch, s32 cpu, struct task_struct *prev)
 	u64 effective_budget = longrun_mode ? nr_cpu_ids : interactive_budget;
 
 	// DEFICIT GATE: WHEN INTERACTIVE HAS EXCEEDED ITS BUDGET AND BATCH
-	// IS STARVING, SKIP INTERACTIVE OVERFLOW RESCUE (STEP 0) SO BATCH
+	// IS STARVING, SKIP INTERACTIVE OVERFLOW RESCUE SO BATCH
 	// GETS SERVED VIA DEFICIT CHECK OR STARVATION RESCUE INSTEAD.
 	if (interactive_run >= effective_budget && batch_starving)
 		goto skip_interactive_rescue;
 
-	// STEP 0: OVERFLOW SOJOURN AMPLIFICATION
-	// WHEN OVERFLOW DSQs HAVE TASKS AGING PAST 10MS, SERVE THEM BEFORE
-	// THE PER-CPU DSQ FAST PATH. WITHOUT THIS, PER-CPU DSQ DOMINANCE
-	// UNDER SUSTAINED LOAD MAKES ALL DOWNSTREAM ANTI-STARVATION LOGIC
-	// UNREACHABLE. NO PER-CPU DSQ GUARD: ON MACHINES WITH LOW DISPATCH
-	// THROUGHPUT, PER-CPU DSQs STAY CONTINUOUSLY LOADED AND THE RESCUE
-	// WINDOW NEVER OPENS. COST IS ONE RESCUE PER 10MS WINDOW -- AT 10K
-	// DISPATCH/S THAT IS 1 IN 100 DISPATCHES. PER-CPU DSQ TASK WAITS
-	// ONE EXTRA CYCLE (APPROXIMATELY 0.1MS). NEGLIGIBLE.
+	// STEP 2: OVERFLOW SOJOURN AMPLIFICATION
+	// WHEN OVERFLOW DSQs HAVE TASKS AGING PAST 10MS, SERVE THEM.
 	u64 int_oldest = interactive_enqueue_ns;
 	if (int_oldest > 0 &&
-	    (now - int_oldest) > OVERFLOW_SOJOURN_RESCUE_NS) {
+	    (now - int_oldest) > overflow_sojourn_rescue_ns) {
 		if (scx_bpf_dsq_move_to_local(node_dsq)) {
 			if (scx_bpf_dsq_nr_queued(node_dsq) == 0) {
 				u64 old_iens = interactive_enqueue_ns;
@@ -847,7 +915,7 @@ skip_interactive_rescue:;
 	// BATCH OVERFLOW RESCUE
 	u64 bat_oldest = batch_enqueue_ns;
 	if (bat_oldest > 0 &&
-	    (now - bat_oldest) > OVERFLOW_SOJOURN_RESCUE_NS) {
+	    (now - bat_oldest) > overflow_sojourn_rescue_ns) {
 		if (scx_bpf_dsq_move_to_local(batch_dsq)) {
 			if (scx_bpf_dsq_nr_queued(batch_dsq) == 0) {
 				u64 old_bens = batch_enqueue_ns;
@@ -867,18 +935,6 @@ skip_interactive_rescue:;
 		u64 old_bens = batch_enqueue_ns;
 		if (old_bens > 0)
 			__sync_val_compare_and_swap(&batch_enqueue_ns, old_bens, 0);
-	}
-
-	// PER-CPU DSQ: DIRECT PLACEMENT FROM ENQUEUE
-	// COUNTS TOWARD DEFICIT: PER-CPU DSQ IS 90%+ OF DISPATCHES UNDER LOAD.
-	// WITHOUT THIS, THE DEFICIT COUNTER ONLY SEES OVERFLOW DISPATCHES AND
-	// NEVER REACHES interactive_budget, MAKING BATCH RESCUE DEAD CODE.
-	if (scx_bpf_dsq_move_to_local((u64)cpu)) {
-		__sync_fetch_and_add(&interactive_run, 1);
-		s = get_stats();
-		if (s)
-			s->nr_dispatches += 1;
-		return;
 	}
 
 	// DEFICIT COUNTER: ANTI-STARVATION INTERLEAVE (DRR)
@@ -1083,7 +1139,7 @@ void BPF_STRUCT_OPS(pandemonium_running, struct task_struct *p)
 {
 #if TRACE_SCHED
 	if (is_sched_task(p))
-		bpf_printk("PAND: running cpu=%d", bpf_get_smp_processor_id());
+		bpf_printk("PAND: running pid=%d cpu=%d", p->pid, bpf_get_smp_processor_id());
 #endif
 	u64 cur = vtime_now;
 	for (int i = 0; i < 4; i++) {
@@ -1276,6 +1332,47 @@ void BPF_STRUCT_OPS(pandemonium_tick, struct task_struct *p)
 			s->batch_sojourn_ns = 0;
 	}
 
+	// PER-CPU DSQ SOJOURN: CHECK OWN DSQ + ROTATING GLOBAL SCAN.
+	// LOCAL CHECK: CATCHES STALE TASKS ON THIS CPU.
+	// GLOBAL SCAN: CATCHES STALE TASKS ON IDLE CPUS WHERE tick() NEVER
+	// FIRES. ROTATES 4 CPUS PER TICK SO ALL CPUS GET COVERED OVER TIME.
+	{
+		u32 this_cpu = bpf_get_smp_processor_id();
+		u64 now2 = bpf_ktime_get_ns();
+		u64 pcpu_sojourn_thresh = knobs
+			? knobs->sojourn_thresh_ns : 5000000;
+
+		// LOCAL: OWN PER-CPU DSQ
+		if (this_cpu < MAX_CPUS) {
+			u64 pcpu_oldest = pcpu_enqueue_ns[this_cpu];
+			if (pcpu_oldest > 0 &&
+			    (now2 - pcpu_oldest) > pcpu_sojourn_thresh) {
+				scx_bpf_kick_cpu(this_cpu,
+						 SCX_KICK_PREEMPT);
+				return;
+			}
+		}
+
+		// GLOBAL: ROTATING SCAN OF REMOTE PER-CPU DSQs
+		// SHIFT BY 20 (~1ms ROTATION) TO AVOID u64 DIVISION.
+		// CONSTANT MODULO (MAX_CPUS) + MASK FOR VERIFIER SAFETY.
+		u32 scan_base = (u32)(now2 >> 20);
+		for (int i = 0; i < 4; i++) {
+			u32 scan_cpu = (scan_base + (u32)i) &
+				       (MAX_CPUS - 1);
+			if (scan_cpu == this_cpu)
+				continue;
+			if (scan_cpu >= nr_cpu_ids)
+				continue;
+			u64 remote_stamp =
+				pcpu_enqueue_ns[scan_cpu & (MAX_CPUS - 1)];
+			if (remote_stamp > 0 &&
+			    (now2 - remote_stamp) > pcpu_sojourn_thresh)
+				scx_bpf_kick_cpu(scan_cpu,
+						 SCX_KICK_PREEMPT);
+		}
+	}
+
 	if (!interactive_waiting)
 		return;
 
@@ -1345,7 +1442,13 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(pandemonium_init)
 	if (nr_nodes > nr_cpu_ids)
 		nr_nodes = nr_cpu_ids;
 
-	// CREATE PER-CPU DSQs (DSQ ID = CPU ID, 0..nr_cpu_ids-1)
+	// PER-CPU DSQs: USED BY SELECT_CPU ONLY (v5.4.8)
+	// SELECT_CPU DISPATCHES TO PER-CPU DSQ (CACHE-HOT, VISIBLE, STEALABLE).
+	// ENQUEUE ALWAYS USES SHARED NODE DSQ (EVEN DISTRIBUTION).
+	// VISIBILITY LAYERS:
+	//   1. L2 WORK STEALING IN DISPATCH -- IDLE CPUs PULL FROM SIBLINGS
+	//   2. ROTATING TICK SCAN -- CATCHES STALE TASKS ON IDLE CPUs
+	//   3. PER-CPU SOJOURN RESCUE -- THRESHOLD CEILING ON INVISIBILITY
 	for (u32 i = 0; i < nr_cpu_ids && i < MAX_CPUS; i++)
 		scx_bpf_create_dsq(i, -1);
 
@@ -1357,19 +1460,42 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(pandemonium_init)
 	for (u32 i = 0; i < nr_nodes && i < MAX_NODES; i++)
 		scx_bpf_create_dsq(nr_cpu_ids + nr_nodes + i, (s32)i);
 
-	// ANTI-STARVATION BUDGET: PROPORTIONAL TO CORE COUNT
-	interactive_budget = nr_cpu_ids * 4;
-	if (interactive_budget < 8)
-		interactive_budget = 8;
+	// ANTI-STARVATION BUDGET: SCALE RATIO WITH CORE COUNT
+	// 2C: RATIO=3 (BUDGET=6), 4C+: RATIO=4 (SAME AS BEFORE)
+	{
+		u64 ratio = 2 + (nr_cpu_ids >> 1);
+		if (ratio > 4) ratio = 4;
+		interactive_budget = nr_cpu_ids * ratio;
+		if (interactive_budget < 2) interactive_budget = 2;
+	}
 
-	// STARVATION RESCUE: SCALE WITH CORE COUNT
-	// MORE CORES = MORE DISPATCH CONTENTION = SHORTER DEADLINE.
-	// FLOOR AT 50MS TO AVOID OVER-PREEMPTION ON VERY HIGH CORE COUNTS.
-	u64 divisor = nr_cpu_ids / 4;
-	if (divisor < 1) divisor = 1;
-	starvation_rescue_ns = 500000000ULL / divisor;
-	if (starvation_rescue_ns < 50000000ULL)
-		starvation_rescue_ns = 50000000ULL;
+	// STARVATION RESCUE: MIN OF TWO LINEAR FUNCTIONS
+	// linear_up: SHORT AT LOW CORES (FAST STARVATION)
+	// linear_down: SHORT AT HIGH CORES (DISPATCH CONTENTION)
+	// 2C: 50MS, 4C: 100MS, 8C: 200MS, 12C: 167MS, 128C: 20MS
+	{
+		u64 linear_up = nr_cpu_ids * 25000000ULL;
+		u64 sr_divisor = nr_cpu_ids / 4;
+		if (sr_divisor < 1) sr_divisor = 1;
+		u64 linear_down = 500000000ULL / sr_divisor;
+		starvation_rescue_ns = linear_up < linear_down
+			? linear_up : linear_down;
+		if (starvation_rescue_ns < 20000000ULL)
+			starvation_rescue_ns = 20000000ULL;
+		if (starvation_rescue_ns > 500000000ULL)
+			starvation_rescue_ns = 500000000ULL;
+	}
+
+	// OVERFLOW SOJOURN RESCUE: SCALE WITH CORE COUNT
+	// 2C: 4MS, 4C: 8MS, 5C+: 10MS (CAPPED AT OLD STATIC VALUE)
+	overflow_sojourn_rescue_ns = nr_cpu_ids * 2000000ULL;
+	if (overflow_sojourn_rescue_ns < 4000000ULL)
+		overflow_sojourn_rescue_ns = 4000000ULL;
+	if (overflow_sojourn_rescue_ns > 10000000ULL)
+		overflow_sojourn_rescue_ns = 10000000ULL;
+
+	// PER-CPU DSQ DEPTH GATE: 1 BELOW 4 CPUS, 2 AT 4+
+	pcpu_depth_base = (nr_cpu_ids < 4) ? 1 : 2;
 
 	// CUSUM BURST DETECTION: CALIBRATES ON FIRST 64 ENQUEUES
 	cusum_last_check_ns = bpf_ktime_get_ns();

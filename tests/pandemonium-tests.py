@@ -11,8 +11,8 @@ Usage:
 """
 
 import argparse
-import math
 import os
+import threading
 import traceback
 import re
 import signal
@@ -29,81 +29,253 @@ from pandemonium_common import (
     get_version, get_git_info,
     log_info, log_warn, log_error, run_cmd,
     has_root_owned_files, clean_root_files, check_sources_changed, build,
+    SCX_OPS, is_scx_active, scx_scheduler_name,
+    wait_for_activation, wait_for_deactivation, wait_for_no_scheduler,
+    set_cpu_online, restrict_cpus, restore_all_cpus, CpuGuard,
+    get_possible_cpus, get_online_cpus, compute_core_counts,
+    mean_stdev, percentile,
+    find_trace_pipe,
 )
 
 
 # CONFIGURATION
 
-SCX_OPS = Path("/sys/kernel/sched_ext/root/ops")
 DEFAULT_EXTERNALS = ["scx_bpfland"]
 
 
-# DMESG CAPTURE
+# DMESG MONITORING
 
-def dmesg_baseline() -> int:
-    """Snapshot current dmesg line count for later diffing."""
-    r = subprocess.run(["sudo", "dmesg"], capture_output=True, text=True)
-    if r.returncode != 0:
-        return 0
-    return len(r.stdout.splitlines())
+class DmesgMonitor:
+    """Active crash detection via dmesg polling.
 
+    Snapshots dmesg at construction, .check() polls for crash patterns,
+    .save() writes new lines to log file with keyword-filtered summary.
+    """
 
-def capture_dmesg(baseline: int, stamp: str) -> None:
-    """Capture new dmesg lines since baseline, save to file, print summary."""
-    r = subprocess.run(["sudo", "dmesg"], capture_output=True, text=True)
-    if r.returncode != 0:
-        log_warn("Could not capture dmesg")
-        return
-
-    lines = r.stdout.splitlines()
-    new_lines = lines[baseline:] if baseline < len(lines) else lines
-
-    if not new_lines:
-        log_info("dmesg: no new kernel messages")
-        return
-
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    dmesg_path = LOG_DIR / f"dmesg-{stamp}.log"
-    dmesg_path.write_text("\n".join(new_lines) + "\n")
-
-    keywords = ["sched_ext", "pandemonium", "non-existent DSQ", "zero slice",
+    CRASH_PATTERNS = [
+        "failed to run for",
+        "runnable task stall",
+    ]
+    KEYWORDS = ["sched_ext", "pandemonium", "non-existent DSQ", "zero slice",
                 "panic", "BUG:", "RIP:", "Oops", "Call Trace"]
-    filtered = [l for l in new_lines
-                if any(kw in l for kw in keywords)]
 
-    if not filtered:
-        log_info(f"dmesg: {len(new_lines)} messages, no scheduler issues")
-        return
+    def __init__(self):
+        r = subprocess.run(["sudo", "dmesg"], capture_output=True, text=True)
+        self.baseline = len(r.stdout.splitlines()) if r.returncode == 0 else 0
+        self.crashed = False
+        self.crash_msg = ""
 
-    crashes = sum(1 for l in filtered
-                  if "non-existent DSQ" in l or "runtime error" in l)
-    zero_slices = sum(1 for l in filtered if "zero slice" in l)
-    panics = sum(1 for l in filtered
-                 if "panic" in l or "BUG:" in l or "RIP:" in l)
+    def _new_lines(self) -> list[str]:
+        r = subprocess.run(["sudo", "dmesg"], capture_output=True, text=True)
+        if r.returncode != 0:
+            return []
+        lines = r.stdout.splitlines()
+        return lines[self.baseline:] if self.baseline < len(lines) else []
 
-    if panics:
-        log_error(f"dmesg: KERNEL PANIC/BUG -- see {dmesg_path}")
-    if crashes:
-        log_warn(f"dmesg: {crashes} scheduler crash(es)")
-    if zero_slices:
-        log_warn(f"dmesg: {zero_slices} zero-slice warning(s)")
+    def check(self) -> bool:
+        """Poll for crash patterns. Returns True if crash detected."""
+        for line in self._new_lines():
+            if "sched_ext" in line:
+                log_info(f"  dmesg: {line.strip()}")
+            for pattern in self.CRASH_PATTERNS:
+                if pattern in line:
+                    self.crashed = True
+                    self.crash_msg = line.strip()
+                    return True
+            if "disabled" in line and "sched_ext" in line:
+                self.crashed = True
+                self.crash_msg = line.strip()
+                return True
+        return False
 
-    for line in filtered:
-        log_info(f"  {line.strip()}")
+    def save(self, stamp: str | None = None) -> None:
+        """Save new dmesg lines to log file, print keyword-filtered summary."""
+        new_lines = self._new_lines()
+        if not new_lines:
+            log_info("dmesg: no new kernel messages")
+            return
 
-    log_info(f"dmesg: {len(new_lines)} messages saved to {dmesg_path}")
+        if stamp is None:
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        dmesg_path = LOG_DIR / f"dmesg-{stamp}.log"
+        dmesg_path.write_text("\n".join(new_lines) + "\n")
+
+        filtered = [l for l in new_lines
+                    if any(kw in l for kw in self.KEYWORDS)]
+
+        if not filtered:
+            log_info(f"dmesg: {len(new_lines)} messages, no scheduler issues")
+            return
+
+        crashes = sum(1 for l in filtered
+                      if "non-existent DSQ" in l or "runtime error" in l)
+        zero_slices = sum(1 for l in filtered if "zero slice" in l)
+        panics = sum(1 for l in filtered
+                     if "panic" in l or "BUG:" in l or "RIP:" in l)
+
+        if panics:
+            log_error(f"dmesg: KERNEL PANIC/BUG -- see {dmesg_path}")
+        if crashes:
+            log_warn(f"dmesg: {crashes} scheduler crash(es)")
+        if zero_slices:
+            log_warn(f"dmesg: {zero_slices} zero-slice warning(s)")
+
+        for line in filtered:
+            log_info(f"  {line.strip()}")
+
+        log_info(f"dmesg: {len(new_lines)} messages saved to {dmesg_path}")
+
+
+# TRACE CAPTURE
+
+class TraceCapture:
+    """Background thread reading trace_pipe, filtering for PAND: lines."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.proc = None
+        self.outfile = None
+        self.count = 0
+        self.error = None
+
+    def start(self) -> bool:
+        pipe = find_trace_pipe()
+        if not pipe.exists():
+            log_info("tracefs not found, attempting mounts...")
+            subprocess.run(
+                ["mount", "-t", "tracefs", "none", "/sys/kernel/tracing"],
+                capture_output=True, text=True,
+            )
+            subprocess.run(
+                ["mount", "-t", "debugfs", "none", "/sys/kernel/debug"],
+                capture_output=True, text=True,
+            )
+            pipe = find_trace_pipe()
+            if not pipe.exists():
+                self.error = "trace_pipe not found at any known path"
+                log_error(self.error)
+                return False
+            log_info(f"Found trace_pipe at {pipe}")
+
+        try:
+            fd = os.open(str(pipe), os.O_RDONLY | os.O_NONBLOCK)
+            os.close(fd)
+        except OSError as e:
+            self.error = f"trace_pipe not readable: {e}"
+            log_error(self.error)
+            return False
+
+        tracedir = pipe.parent
+
+        tracing_on = tracedir / "tracing_on"
+        try:
+            val = tracing_on.read_text().strip()
+            if val != "1":
+                tracing_on.write_text("1")
+                log_info("tracing_on set to 1")
+        except (PermissionError, OSError) as e:
+            log_warn(f"could not enable tracing_on: {e}")
+
+        buf_size = tracedir / "buffer_size_kb"
+        try:
+            buf_size.write_text("16384")
+        except (PermissionError, OSError) as e:
+            log_warn(f"could not set buffer_size_kb: {e}")
+
+        trace_file = tracedir / "trace"
+        try:
+            trace_file.write_text("")
+        except (PermissionError, OSError):
+            pass
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.outfile = open(self.path, "w")
+        self.proc = subprocess.Popen(
+            ["cat", str(pipe)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self._thread = threading.Thread(target=self._reader, daemon=True)
+        self._thread.start()
+        time.sleep(0.3)
+        if self.proc.poll() is not None:
+            err = self.proc.stderr.read()
+            self.error = f"trace_pipe reader exited immediately: {err.strip()}"
+            log_error(self.error)
+            return False
+        log_info(f"Trace capture started -> {self.path}")
+        return True
+
+    def _reader(self):
+        try:
+            for line in self.proc.stdout:
+                if "PAND:" in line:
+                    self.outfile.write(line)
+                    self.outfile.flush()
+                    self.count += 1
+        except (ValueError, OSError):
+            pass
+
+    def stop(self):
+        if self.proc:
+            self.proc.kill()
+            self.proc.wait()
+        if self.outfile:
+            self.outfile.close()
+        log_info(f"Trace capture stopped: {self.count} PAND events")
 
 
 # BUILD HELPERS
 
+BPF_SRC = SCRIPT_DIR / "src" / "bpf" / "main.bpf.c"
+
+
+def patch_bpf_trace_filter(target: str) -> str | None:
+    """Patch is_sched_task() in main.bpf.c to trace `target` instead of 'pand'.
+    Returns the original content for restoration, or None on error."""
+    original = BPF_SRC.read_text()
+
+    # Match the exact two-line return statement in is_sched_task():
+    #   \treturn p->comm[0] == 'p' && p->comm[1] == 'a' &&
+    #   \t       p->comm[2] == 'n' && p->comm[3] == 'd';
+    old_body = ("\treturn p->comm[0] == 'p' && p->comm[1] == 'a' &&\n"
+                "\t       p->comm[2] == 'n' && p->comm[3] == 'd';")
+
+    if old_body not in original:
+        log_error("Could not find is_sched_task() trace filter in main.bpf.c")
+        return None
+
+    checks = [f"p->comm[{i}] == '{c}'" for i, c in enumerate(target)]
+    if len(checks) <= 2:
+        new_body = "\treturn " + " && ".join(checks) + ";"
+    else:
+        line1 = checks[:2]
+        line2 = checks[2:]
+        new_body = ("\treturn " + " && ".join(line1) + " &&\n"
+                    "\t       " + " && ".join(line2) + ";")
+
+    patched = original.replace(old_body, new_body, 1)
+    BPF_SRC.write_text(patched)
+    log_info(f"Patched trace filter: 'pand' -> '{target}'")
+    return original
+
+
+def restore_bpf_source(original: str):
+    """Restore main.bpf.c to its original content."""
+    BPF_SRC.write_text(original)
+    log_info("Restored main.bpf.c")
+
+
 def fix_ownership():
-    uid = os.getuid()
-    gid = os.getgid()
+    uid = os.environ.get("SUDO_UID", str(os.getuid()))
+    gid = os.environ.get("SUDO_GID", str(os.getgid()))
     log_info(f"Fixing ownership to {uid}:{gid}...")
-    for d in [TARGET_DIR, LOG_DIR, ARCHIVE_DIR]:
+    for d in [TARGET_DIR, LOG_DIR]:
         if d.exists():
             subprocess.run(
-                ["sudo", "chown", "-R", f"{uid}:{gid}", str(d)],
+                ["chown", "-R", f"{uid}:{gid}", str(d)],
                 capture_output=True,
             )
 
@@ -129,38 +301,6 @@ def nuke_stale_build():
 
 
 # SCHEDULER PROCESS MANAGEMENT
-
-def is_scx_active() -> bool:
-    try:
-        return bool(SCX_OPS.read_text().strip())
-    except (FileNotFoundError, PermissionError):
-        return False
-
-
-def scx_scheduler_name() -> str:
-    try:
-        return SCX_OPS.read_text().strip()
-    except (FileNotFoundError, PermissionError):
-        return ""
-
-
-def wait_for_activation(timeout: float = 10.0) -> bool:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if is_scx_active():
-            return True
-        time.sleep(0.1)
-    return False
-
-
-def wait_for_deactivation(timeout: float = 5.0) -> bool:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if not is_scx_active():
-            return True
-        time.sleep(0.2)
-    return False
-
 
 def find_scheduler(name: str) -> str | None:
     return shutil.which(name)
@@ -226,14 +366,18 @@ class SchedulerProcess:
         self.cleanup()
 
 
-def start_scheduler(cmd: list[str], name: str) -> SchedulerProcess:
+def start_scheduler(cmd: list[str], name: str) -> SchedulerProcess | None:
     """Spawn a scheduler subprocess in its own process group.
-    Stdout and stderr go to files to avoid pipe buffer overflow."""
+    Stdout and stderr go to files to avoid pipe buffer overflow.
+    Returns None if the binary cannot be found."""
+    bin_path = cmd[0] if cmd else ""
+    if bin_path and not os.path.exists(bin_path) and not shutil.which(bin_path):
+        log_error(f"Binary not found: {bin_path}")
+        return None
+    # Refresh sudo credentials before spawning (bench-scale runs are long)
+    subprocess.run(["sudo", "-v"], capture_output=True)
     full_cmd = ["sudo"] + cmd
     log_info(f"Starting: {' '.join(full_cmd)}")
-    bin_path = cmd[0] if cmd else ""
-    if bin_path and not os.path.exists(bin_path):
-        log_error(f"Binary not found: {bin_path}")
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     stdout_path = str(LOG_DIR / f"sched-{name}-{os.getpid()}.stdout")
     stdout_f = open(stdout_path, "w")
@@ -253,7 +397,20 @@ def start_scheduler(cmd: list[str], name: str) -> SchedulerProcess:
 def start_and_wait(cmd: list[str], name: str,
                    settle_secs: float = 2.0) -> SchedulerProcess | None:
     """Start a scheduler, wait for sched_ext activation. Returns None on failure."""
+    # Detect stale struct_ops registration before starting
+    try:
+        stale = SCX_OPS.read_text().strip()
+        if stale:
+            log_warn(f"Stale scheduler detected: '{stale}', waiting for cleanup...")
+            if not wait_for_no_scheduler(timeout=15):
+                log_error("stale scheduler did not unregister")
+                return None
+            log_info("Stale scheduler cleared")
+    except (FileNotFoundError, PermissionError):
+        pass
     guard = start_scheduler(cmd, name)
+    if guard is None:
+        return None
     if not wait_for_activation(10.0):
         log_warn(f"{name} did not activate within 10s -- skipping")
         exited = guard.proc.poll() is not None
@@ -273,6 +430,32 @@ def start_and_wait(cmd: list[str], name: str,
     return guard
 
 
+def measure_struct_ops_cleanup():
+    """Time how long the kernel takes to fully unregister struct_ops."""
+    try:
+        name = SCX_OPS.read_text().strip()
+        if not name:
+            return
+    except (FileNotFoundError, PermissionError):
+        return
+    t0 = time.monotonic()
+    while True:
+        try:
+            name = SCX_OPS.read_text().strip()
+            if not name:
+                elapsed_ms = (time.monotonic() - t0) * 1000
+                log_info(f"  struct_ops cleanup: {elapsed_ms:.0f}ms")
+                return
+        except (FileNotFoundError, PermissionError):
+            elapsed_ms = (time.monotonic() - t0) * 1000
+            log_info(f"  struct_ops cleanup: {elapsed_ms:.0f}ms (ops disappeared)")
+            return
+        if time.monotonic() - t0 > 30:
+            log_error("struct_ops cleanup: STILL REGISTERED AFTER 30s")
+            return
+        time.sleep(0.01)
+
+
 def stop_and_wait(guard: SchedulerProcess | None) -> str:
     """Stop a scheduler, wait for deactivation. Returns captured stdout."""
     if guard is None:
@@ -281,102 +464,9 @@ def stop_and_wait(guard: SchedulerProcess | None) -> str:
     stdout = guard.drain_stdout()
     if not wait_for_deactivation(5.0):
         log_warn(f"sched_ext still active after stopping {guard.name}")
+    measure_struct_ops_cleanup()
     time.sleep(1)
     return stdout
-
-
-# CPU HOTPLUG
-
-def _parse_cpu_range(path: str) -> int:
-    try:
-        raw = Path(path).read_text().strip()
-    except (FileNotFoundError, PermissionError):
-        return os.cpu_count() or 1
-    count = 0
-    for r in raw.split(","):
-        parts = r.split("-")
-        if len(parts) == 1 and parts[0].strip().isdigit():
-            count += 1
-        elif len(parts) == 2:
-            try:
-                count += int(parts[1]) - int(parts[0]) + 1
-            except ValueError:
-                pass
-    return count
-
-
-def get_possible_cpus() -> int:
-    return _parse_cpu_range("/sys/devices/system/cpu/possible")
-
-
-def get_online_cpus() -> int:
-    return _parse_cpu_range("/sys/devices/system/cpu/online")
-
-
-def set_cpu_online(cpu: int, online: bool) -> bool:
-    if cpu == 0:
-        return True
-    path = f"/sys/devices/system/cpu/cpu{cpu}/online"
-    value = "1" if online else "0"
-    ret = subprocess.run(
-        ["sudo", "tee", path],
-        input=value, capture_output=True, text=True,
-    )
-    return ret.returncode == 0
-
-
-def restrict_cpus(count: int, max_cpus: int) -> bool:
-    for cpu in range(count, max_cpus):
-        if not set_cpu_online(cpu, False):
-            log_warn(f"Failed to offline CPU {cpu}")
-            return False
-    return True
-
-
-def restore_all_cpus(max_cpus: int):
-    for cpu in range(1, max_cpus):
-        set_cpu_online(cpu, True)
-
-
-class CpuGuard:
-    """Context manager that restores all CPUs on exit."""
-    def __init__(self, max_cpus: int):
-        self.max_cpus = max_cpus
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        restore_all_cpus(self.max_cpus)
-
-
-def compute_core_counts(max_cpus: int) -> list[int]:
-    points = [n for n in [2, 4, 8, 16, 32, 64] if n <= max_cpus]
-    if max_cpus not in points:
-        points.append(max_cpus)
-    return points
-
-
-# STATISTICS
-
-def mean_stdev(values: list[float]) -> tuple[float, float]:
-    if not values:
-        return 0.0, 0.0
-    n = len(values)
-    mean = sum(values) / n
-    if n < 2:
-        return mean, 0.0
-    variance = sum((x - mean) ** 2 for x in values) / (n - 1)
-    return mean, math.sqrt(variance)
-
-
-def percentile(values: list[float], pct: float) -> float:
-    """Compute percentile (0-100) using nearest-rank method."""
-    if not values:
-        return 0.0
-    s = sorted(values)
-    k = max(0, min(int(math.ceil(pct / 100.0 * len(s))) - 1, len(s) - 1))
-    return s[k]
 
 
 # MEASUREMENT
@@ -629,6 +719,27 @@ def measure_burst(binary: Path, n_cpus: int, burst_size: int,
              f"p99={burst_stats['p99_us']}us, "
              f"worst={burst_stats['worst_us']}us")
 
+    # POST-BURST RECOVERY: MEASURE HOW QUICKLY LATENCY RETURNS TO NORMAL
+    # DSQ COLLAPSE ROUTES EVERYTHING TO INTERACTIVE DSQ DURING BURST.
+    # WHEN BURST CLEARS, ROUTING SNAPS BACK. TASKS ENQUEUED DURING BURST
+    # ARE STILL IN THE INTERACTIVE DSQ. interactive_run MAY BE IN AN
+    # ARBITRARY STATE. THIS MEASURES THE SETTLING BEHAVIOR.
+    log_info("Recovery: 5s")
+    recovery_probe = subprocess.Popen(
+        [str(binary), "probe"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+    time.sleep(5)
+    recovery_probe.send_signal(signal.SIGINT)
+    try:
+        recovery_out, _ = recovery_probe.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        recovery_probe.kill()
+        recovery_out, _ = recovery_probe.communicate()
+    recovery_stats = parse_probe_output(recovery_out.decode(errors="replace"))
+    log_info(f"Recovery: {recovery_stats['samples']} samples, "
+             f"p99={recovery_stats['p99_us']}us")
+
     # Stop stress workers
     for w in workers:
         w.send_signal(signal.SIGINT)
@@ -645,7 +756,609 @@ def measure_burst(binary: Path, n_cpus: int, burst_size: int,
         "burst_duration_s": round(burst_duration, 1),
         "baseline": baseline,
         "burst": burst_stats,
+        "recovery": recovery_stats,
     }
+
+
+# LONG-RUNNING PROCESS MEASUREMENT
+
+def spawn_longrunners(count: int, duration_secs: float) -> list[subprocess.Popen]:
+    """Spawn persistent CPU-bound processes that report work completed.
+
+    Each process does SHA256 hashing in a tight loop for duration_secs,
+    then prints the number of iterations completed before exiting.
+    This lets us measure whether long-runners actually get CPU time
+    or starve under the scheduler."""
+    script = (
+        "import time,hashlib,sys\n"
+        f"end=time.monotonic()+{duration_secs}\n"
+        "iters=0\n"
+        "while time.monotonic()<end:\n"
+        " hashlib.sha256(b'x'*4096).hexdigest()\n"
+        " iters+=1\n"
+        "print(iters,flush=True)\n"
+    )
+    procs = []
+    for _ in range(count):
+        p = subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        procs.append(p)
+    return procs
+
+
+def measure_longrun(binary: Path, n_cpus: int,
+                    longrun_count: int = 4,
+                    longrun_secs: float = 20.0,
+                    warmup_secs: int = 2) -> dict:
+    """Measure scheduling behavior with persistent long-running CPU-bound processes.
+
+    Simulates real desktop contention: a few heavy background processes (builds,
+    Steam updates, video encoding) competing against interactive workloads.
+
+    Measures two things:
+    1. Interactive latency while long-runners are active (probe P99/worst)
+    2. Long-runner throughput (SHA256 iterations completed -- starvation = 0 or near-0)
+
+    Phases:
+    1. Stress workers saturate all CPUs (same as burst/latency tests)
+    2. Warmup period (discard)
+    3. Spawn long-runners + start latency probe simultaneously
+    4. Let everything run for longrun_secs
+    5. Collect probe latency and long-runner work counts
+    """
+    if n_cpus < 1:
+        return {"survived": True, "latency": {}, "longrun_work": []}
+
+    stress_cpus = list(range(n_cpus))
+    log_info(f"Long-run test: {len(stress_cpus)} stress workers, "
+             f"{longrun_count} long-runners for {longrun_secs}s")
+
+    # Start stress workers on all CPUs
+    workers = []
+    for cpu in stress_cpus:
+        p = subprocess.Popen(
+            [str(binary), "stress-worker", "--cpu", str(cpu)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        workers.append(p)
+
+    # Warmup
+    log_info(f"Warmup: {warmup_secs}s")
+    warmup = subprocess.Popen(
+        [str(binary), "probe"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+    time.sleep(warmup_secs)
+    warmup.send_signal(signal.SIGINT)
+    try:
+        warmup.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        warmup.kill()
+        warmup.wait()
+
+    # Start latency probe + long-runners simultaneously
+    probe = subprocess.Popen(
+        [str(binary), "probe"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+    longrunners = spawn_longrunners(longrun_count, longrun_secs)
+    log_info(f"Running: {longrun_count} long-runners + probe for {longrun_secs}s")
+
+    # Wait for long-runners to finish (they self-terminate after longrun_secs)
+    work_counts = []
+    for lr in longrunners:
+        try:
+            stdout, _ = lr.communicate(timeout=longrun_secs + 10)
+            line = stdout.decode(errors="replace").strip()
+            work_counts.append(int(line) if line.isdigit() else 0)
+        except (subprocess.TimeoutExpired, ValueError):
+            lr.kill()
+            lr.wait()
+            work_counts.append(0)
+
+    # Stop probe
+    probe.send_signal(signal.SIGINT)
+    try:
+        probe_out, _ = probe.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        probe.kill()
+        probe_out, _ = probe.communicate()
+    latency = parse_probe_output(probe_out.decode(errors="replace"))
+
+    total_work = sum(work_counts)
+    min_work = min(work_counts) if work_counts else 0
+    max_work = max(work_counts) if work_counts else 0
+
+    log_info(f"Long-run latency: {latency['samples']} samples, "
+             f"median={latency['median_us']}us, "
+             f"p99={latency['p99_us']}us, "
+             f"worst={latency['worst_us']}us")
+    log_info(f"Long-run work: total={total_work}, "
+             f"min={min_work}, max={max_work}, "
+             f"per-process={work_counts}")
+
+    # Stop stress workers
+    for w in workers:
+        w.send_signal(signal.SIGINT)
+    for w in workers:
+        try:
+            w.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            w.kill()
+            w.wait()
+
+    return {
+        "survived": True,
+        "longrun_count": longrun_count,
+        "longrun_secs": longrun_secs,
+        "latency": latency,
+        "work_total": total_work,
+        "work_min": min_work,
+        "work_max": max_work,
+        "work_per_process": work_counts,
+    }
+
+
+# MIXED WORKLOAD MEASUREMENT (BURST + LONGRUN SIMULTANEOUS)
+
+def measure_mixed(binary: Path, n_cpus: int,
+                  longrun_count: int = 4,
+                  longrun_secs: float = 30.0,
+                  burst_size: int = 0,
+                  burst_delay_secs: float = 5.0,
+                  burst_work_secs: float = 0.5,
+                  warmup_secs: int = 2) -> dict:
+    """Measure scheduling under combined burst + long-running load.
+
+    Simulates the Steam scenario: background updates (long-runners) are
+    already active when the user launches an app (burst of child processes).
+
+    Phases:
+    1. Stress workers saturate all CPUs
+    2. Warmup (discard)
+    3. Spawn long-runners + start latency probe simultaneously
+    4. Wait burst_delay_secs for long-runners to establish vtime
+    5. Fire burst while long-runners are still running
+    6. Wait for burst to clear, continue through long-runner completion
+    7. Collect probe latency + long-runner work counts
+    """
+    if n_cpus < 1:
+        return {"survived": True, "latency": {}, "work_total": 0}
+
+    if burst_size < 1:
+        burst_size = max(8, n_cpus * 4)
+
+    stress_cpus = list(range(n_cpus))
+    log_info(f"Mixed test: {len(stress_cpus)} stress workers, "
+             f"{longrun_count} long-runners ({longrun_secs}s), "
+             f"{burst_size} burst procs after {burst_delay_secs}s delay")
+
+    # Start stress workers on all CPUs
+    workers = []
+    for cpu in stress_cpus:
+        p = subprocess.Popen(
+            [str(binary), "stress-worker", "--cpu", str(cpu)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        workers.append(p)
+
+    # Warmup
+    log_info(f"Warmup: {warmup_secs}s")
+    warmup = subprocess.Popen(
+        [str(binary), "probe"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+    time.sleep(warmup_secs)
+    warmup.send_signal(signal.SIGINT)
+    try:
+        warmup.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        warmup.kill()
+        warmup.wait()
+
+    # Start long-runners + probe simultaneously
+    probe = subprocess.Popen(
+        [str(binary), "probe"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+    longrunners = spawn_longrunners(longrun_count, longrun_secs)
+    log_info(f"Running: {longrun_count} long-runners + probe")
+
+    # Wait for long-runners to establish vtime, then fire burst
+    log_info(f"Delay: {burst_delay_secs}s (establishing long-runner vtime)")
+    time.sleep(burst_delay_secs)
+
+    log_info(f"Firing burst: {burst_size} processes")
+    burst_start = time.monotonic()
+    burst_procs = fire_burst(burst_size, burst_work_secs)
+
+    # Wait for burst processes to exit
+    for bp in burst_procs:
+        try:
+            bp.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            bp.kill()
+            bp.wait()
+    burst_duration = time.monotonic() - burst_start
+    log_info(f"Burst complete: {burst_duration:.1f}s")
+
+    # Wait for long-runners to finish
+    work_counts = []
+    for lr in longrunners:
+        try:
+            stdout, _ = lr.communicate(timeout=longrun_secs + 10)
+            line = stdout.decode(errors="replace").strip()
+            work_counts.append(int(line) if line.isdigit() else 0)
+        except (subprocess.TimeoutExpired, ValueError):
+            lr.kill()
+            lr.wait()
+            work_counts.append(0)
+
+    # Stop probe
+    probe.send_signal(signal.SIGINT)
+    try:
+        probe_out, _ = probe.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        probe.kill()
+        probe_out, _ = probe.communicate()
+    latency = parse_probe_output(probe_out.decode(errors="replace"))
+
+    total_work = sum(work_counts)
+    min_work = min(work_counts) if work_counts else 0
+    max_work = max(work_counts) if work_counts else 0
+
+    log_info(f"Mixed latency: {latency['samples']} samples, "
+             f"median={latency['median_us']}us, "
+             f"p99={latency['p99_us']}us, "
+             f"worst={latency['worst_us']}us")
+    log_info(f"Mixed long-run work: total={total_work}, "
+             f"min={min_work}, max={max_work}, "
+             f"per-process={work_counts}")
+
+    # Stop stress workers
+    for w in workers:
+        w.send_signal(signal.SIGINT)
+    for w in workers:
+        try:
+            w.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            w.kill()
+            w.wait()
+
+    return {
+        "survived": True,
+        "longrun_count": longrun_count,
+        "longrun_secs": longrun_secs,
+        "burst_size": burst_size,
+        "burst_duration_s": round(burst_duration, 1),
+        "latency": latency,
+        "work_total": total_work,
+        "work_min": min_work,
+        "work_max": max_work,
+        "work_per_process": work_counts,
+    }
+
+
+# PERIODIC DEADLINE MEASUREMENT
+
+def measure_deadline(binary: Path, n_cpus: int,
+                     target_fps: int = 60,
+                     duration_secs: int = 15,
+                     warmup_secs: int = 3,
+                     threshold_us: int = 500) -> dict:
+    """Measure frame scheduling jitter under full CPU load.
+
+    Simulates a game/compositor frame loop: workers wake on a periodic
+    timer (16.6ms for 60fps), do a small fixed work unit (~1ms SHA256),
+    then sleep until the next frame. Jitter = actual wake time minus
+    expected wake time.
+
+    A deadline miss is any frame where jitter exceeds threshold_us.
+    """
+    if n_cpus < 1:
+        return {"survived": True, "total_frames": 0, "missed_frames": 0}
+
+    period_us = 1_000_000 // target_fps
+    period_secs = period_us / 1_000_000.0
+    worker_count = min(4, n_cpus)
+
+    log_info(f"Deadline test: {worker_count} frame workers @ {target_fps}fps "
+             f"({period_us}us period), {n_cpus} stress workers, "
+             f"threshold={threshold_us}us")
+
+    # Start stress workers on all CPUs
+    workers = []
+    for cpu in range(n_cpus):
+        p = subprocess.Popen(
+            [str(binary), "stress-worker", "--cpu", str(cpu)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        workers.append(p)
+
+    # Deadline worker script: periodic wake, record jitter, do small work
+    script = (
+        "import time,hashlib,sys\n"
+        f"period={period_secs}\n"
+        f"duration={duration_secs}\n"
+        "end=time.monotonic()+duration\n"
+        "next_wake=time.monotonic()+period\n"
+        "while time.monotonic()<end:\n"
+        " time.sleep(max(0,next_wake-time.monotonic()))\n"
+        " actual=time.monotonic()\n"
+        " jitter_us=int((actual-next_wake)*1e6)\n"
+        " print(jitter_us,flush=True)\n"
+        " for _ in range(50):\n"
+        "  hashlib.sha256(b'x'*4096).hexdigest()\n"
+        " next_wake+=period\n"
+    )
+
+    # Warmup phase (discard)
+    log_info(f"Warmup: {warmup_secs}s")
+    warmup_workers = []
+    for _ in range(worker_count):
+        p = subprocess.Popen(
+            [sys.executable, "-c", script.replace(f"duration={duration_secs}",
+                                                   f"duration={warmup_secs}")],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+        warmup_workers.append(p)
+    for p in warmup_workers:
+        try:
+            p.wait(timeout=warmup_secs + 10)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait()
+
+    # Measurement phase
+    log_info(f"Measuring: {duration_secs}s")
+    deadline_workers = []
+    for _ in range(worker_count):
+        p = subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+        deadline_workers.append(p)
+
+    all_jitter: list[int] = []
+    for p in deadline_workers:
+        try:
+            stdout, _ = p.communicate(timeout=duration_secs + 10)
+            for line in stdout.decode(errors="replace").splitlines():
+                line = line.strip()
+                if line and line.lstrip("-").isdigit():
+                    all_jitter.append(int(line))
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait()
+
+    # Stop stress workers
+    for w in workers:
+        w.send_signal(signal.SIGINT)
+    for w in workers:
+        try:
+            w.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            w.kill()
+            w.wait()
+
+    total = len(all_jitter)
+    missed = sum(1 for j in all_jitter if j > threshold_us) if all_jitter else 0
+    miss_ratio = missed / total if total > 0 else 0.0
+
+    result = {
+        "survived": True,
+        "target_fps": target_fps,
+        "period_us": period_us,
+        "threshold_us": threshold_us,
+        "workers": worker_count,
+        "total_frames": total,
+        "missed_frames": missed,
+        "miss_ratio": round(miss_ratio, 4),
+        "jitter_median_us": int(percentile(all_jitter, 50)) if all_jitter else 0,
+        "jitter_p99_us": int(percentile(all_jitter, 99)) if all_jitter else 0,
+        "jitter_worst_us": int(max(all_jitter)) if all_jitter else 0,
+    }
+
+    log_info(f"Deadline: {total} frames, {missed} missed "
+             f"({miss_ratio:.1%}), "
+             f"jitter p99={result['jitter_p99_us']}us, "
+             f"worst={result['jitter_worst_us']}us")
+    return result
+
+
+# IPC ROUND-TRIP MEASUREMENT
+
+def measure_ipc(binary: Path, n_cpus: int,
+                pair_count: int = 0,
+                rounds: int = 10000,
+                warmup_secs: int = 3) -> dict:
+    """Measure IPC round-trip latency via pipe ping-pong under CPU load.
+
+    Each pair: parent writes 1 byte to pipe, child reads and writes back,
+    parent reads. Measures the scheduling round-trip (two wakeups per round).
+    """
+    if n_cpus < 1:
+        return {"survived": True, "pairs": 0}
+
+    if pair_count < 1:
+        pair_count = max(2, n_cpus // 2)
+
+    log_info(f"IPC test: {pair_count} pipe pairs, {rounds} rounds each, "
+             f"{n_cpus} stress workers")
+
+    # Start stress workers on all CPUs
+    workers = []
+    for cpu in range(n_cpus):
+        p = subprocess.Popen(
+            [str(binary), "stress-worker", "--cpu", str(cpu)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        workers.append(p)
+
+    # IPC pair script: forks internally, does pipe ping-pong, prints avg_us
+    pair_script = (
+        "import os,time,sys\n"
+        f"rounds={rounds}\n"
+        "r1,w1=os.pipe()\n"
+        "r2,w2=os.pipe()\n"
+        "pid=os.fork()\n"
+        "if pid==0:\n"
+        " os.close(w1)\n"
+        " os.close(r2)\n"
+        " for _ in range(rounds):\n"
+        "  os.read(r1,1)\n"
+        "  os.write(w2,b'x')\n"
+        " os._exit(0)\n"
+        "os.close(r1)\n"
+        "os.close(w2)\n"
+        "latencies=[]\n"
+        "for _ in range(rounds):\n"
+        " t=time.monotonic()\n"
+        " os.write(w1,b'x')\n"
+        " os.read(r2,1)\n"
+        " latencies.append(time.monotonic()-t)\n"
+        "os.waitpid(pid,0)\n"
+        "for l in latencies:\n"
+        " print(int(l*1e6),flush=True)\n"
+    )
+
+    # Warmup (one pair, discard)
+    log_info(f"Warmup: {warmup_secs}s (1 pair)")
+    warmup_script = pair_script.replace(f"rounds={rounds}",
+                                         f"rounds={min(1000, rounds)}")
+    warmup = subprocess.Popen(
+        [sys.executable, "-c", warmup_script],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        warmup.wait(timeout=warmup_secs + 10)
+    except subprocess.TimeoutExpired:
+        warmup.kill()
+        warmup.wait()
+
+    # Measurement: launch all pairs simultaneously
+    log_info(f"Measuring: {pair_count} pairs x {rounds} rounds")
+    pairs = []
+    for _ in range(pair_count):
+        p = subprocess.Popen(
+            [sys.executable, "-c", pair_script],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+        pairs.append(p)
+
+    all_rtt: list[int] = []
+    for p in pairs:
+        try:
+            stdout, _ = p.communicate(timeout=120)
+            for line in stdout.decode(errors="replace").splitlines():
+                line = line.strip()
+                if line and line.isdigit():
+                    all_rtt.append(int(line))
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait()
+
+    # Stop stress workers
+    for w in workers:
+        w.send_signal(signal.SIGINT)
+    for w in workers:
+        try:
+            w.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            w.kill()
+            w.wait()
+
+    result = {
+        "survived": True,
+        "pairs": pair_count,
+        "rounds_per_pair": rounds,
+        "total_ops": len(all_rtt),
+        "rtt_median_us": int(percentile(all_rtt, 50)) if all_rtt else 0,
+        "rtt_p99_us": int(percentile(all_rtt, 99)) if all_rtt else 0,
+        "rtt_worst_us": int(max(all_rtt)) if all_rtt else 0,
+    }
+
+    log_info(f"IPC: {len(all_rtt)} round-trips, "
+             f"median={result['rtt_median_us']}us, "
+             f"p99={result['rtt_p99_us']}us, "
+             f"worst={result['rtt_worst_us']}us")
+    return result
+
+
+# APPLICATION LAUNCH MEASUREMENT
+
+def measure_launch(binary: Path, n_cpus: int,
+                   launch_count: int = 100,
+                   warmup_secs: int = 3) -> dict:
+    """Measure fork+exec latency under full CPU load.
+
+    Sequentially launches short-lived processes (/usr/bin/true) and measures
+    wall-clock time from subprocess.run() start to completion. Simulates
+    opening apps while the system is under compile load.
+    """
+    if n_cpus < 1:
+        return {"survived": True, "launches": 0}
+
+    log_info(f"Launch test: {launch_count} launches, {n_cpus} stress workers")
+
+    # Start stress workers on all CPUs
+    workers = []
+    for cpu in range(n_cpus):
+        p = subprocess.Popen(
+            [str(binary), "stress-worker", "--cpu", str(cpu)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        workers.append(p)
+
+    launch_cmd = ["/usr/bin/true"]
+    if not os.path.exists("/usr/bin/true"):
+        launch_cmd = [sys.executable, "-c", ""]
+
+    # Warmup (a few launches, discard)
+    log_info(f"Warmup: {warmup_secs}s")
+    warmup_end = time.monotonic() + warmup_secs
+    while time.monotonic() < warmup_end:
+        subprocess.run(launch_cmd, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL)
+
+    # Measurement
+    log_info(f"Measuring: {launch_count} launches")
+    latencies_us: list[int] = []
+    for _ in range(launch_count):
+        start = time.monotonic()
+        subprocess.run(launch_cmd, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL)
+        elapsed_us = int((time.monotonic() - start) * 1_000_000)
+        latencies_us.append(elapsed_us)
+
+    # Stop stress workers
+    for w in workers:
+        w.send_signal(signal.SIGINT)
+    for w in workers:
+        try:
+            w.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            w.kill()
+            w.wait()
+
+    m, std = mean_stdev([float(x) for x in latencies_us])
+    result = {
+        "survived": True,
+        "launches": launch_count,
+        "launch_mean_us": int(m),
+        "launch_median_us": int(percentile(latencies_us, 50)) if latencies_us else 0,
+        "launch_p99_us": int(percentile(latencies_us, 99)) if latencies_us else 0,
+        "launch_worst_us": int(max(latencies_us)) if latencies_us else 0,
+    }
+
+    log_info(f"Launch: {launch_count} runs, "
+             f"mean={result['launch_mean_us']}us, "
+             f"p99={result['launch_p99_us']}us, "
+             f"worst={result['launch_worst_us']}us")
+    return result
 
 
 # TELEMETRY PARSING
@@ -702,37 +1415,42 @@ def parse_tick_lines(stdout_text: str) -> list[dict]:
             tick["l2_pct_interactive"] = int(m.group(2))
             tick["l2_pct_latcrit"] = int(m.group(3))
 
-        # BPF-only specific
-        if "[BPF]" in line:
-            tick["regime"] = "BPF"
-            m = re.search(r"procdb:\s*(\d+)\s", line)
-            if m:
-                tick["procdb_hits"] = int(m.group(1))
-        # Adaptive specific
-        elif re.search(r"\[(Light|Mixed|Heavy)\]", line, re.IGNORECASE):
-            m = re.search(r"\[(Light|Mixed|Heavy)\]", line, re.IGNORECASE)
-            tick["regime"] = m.group(1)
-            m = re.search(r"p99:\s*(\d+)us", line)
-            if m:
-                tick["p99_us"] = int(m.group(1))
-            m = re.search(r"p99:.*?\[B:(\d+)\s*I:(\d+)\s*L:(\d+)\]", line)
-            if m:
-                tick["tier_p99_batch"] = int(m.group(1))
-                tick["tier_p99_interactive"] = int(m.group(2))
-                tick["tier_p99_latcrit"] = int(m.group(3))
-            m = re.search(r"procdb:\s*(\d+)/(\d+)", line)
-            if m:
-                tick["procdb_total"] = int(m.group(1))
-                tick["procdb_confident"] = int(m.group(2))
-            m = re.search(r"sleep:\s*io=(\d+)%", line)
-            if m:
-                tick["io_pct"] = int(m.group(1))
-            m = re.search(r"slice:\s*(\d+)us", line)
-            if m:
-                tick["slice_us"] = int(m.group(1))
-            m = re.search(r"batch:\s*(\d+)us", line)
-            if m:
-                tick["batch_us"] = int(m.group(1))
+        # REGIME + FLAGS: [BPF], [BPF BURST], [BPF LONGRUN],
+        # [BPF BURST LONGRUN], [MIXED], [MIXED BURST], [HEAVY LONGRUN], etc.
+        regime_match = re.search(
+            r'\[(BPF|Light|Mixed|Heavy|LIGHT|MIXED|HEAVY)((?:\s+(?:BURST|LONGRUN))*)\]', line)
+        if regime_match:
+            tick["regime"] = regime_match.group(1)
+            flags = regime_match.group(2).upper()
+            tick["burst_active"] = "BURST" in flags
+            tick["longrun_active"] = "LONGRUN" in flags
+
+            if tick["regime"] == "BPF":
+                m = re.search(r"procdb:\s*(\d+)\s", line)
+                if m:
+                    tick["procdb_hits"] = int(m.group(1))
+            else:
+                m = re.search(r"p99:\s*(\d+)us", line)
+                if m:
+                    tick["p99_us"] = int(m.group(1))
+                m = re.search(r"p99:.*?\[B:(\d+)\s*I:(\d+)\s*L:(\d+)\]", line)
+                if m:
+                    tick["tier_p99_batch"] = int(m.group(1))
+                    tick["tier_p99_interactive"] = int(m.group(2))
+                    tick["tier_p99_latcrit"] = int(m.group(3))
+                m = re.search(r"procdb:\s*(\d+)/(\d+)", line)
+                if m:
+                    tick["procdb_total"] = int(m.group(1))
+                    tick["procdb_confident"] = int(m.group(2))
+                m = re.search(r"sleep:\s*io=(\d+)%", line)
+                if m:
+                    tick["io_pct"] = int(m.group(1))
+                m = re.search(r"slice:\s*(\d+)us", line)
+                if m:
+                    tick["slice_us"] = int(m.group(1))
+                m = re.search(r"batch:\s*(\d+)us", line)
+                if m:
+                    tick["batch_us"] = int(m.group(1))
         if tick:
             ticks.append(tick)
 
@@ -891,6 +1609,173 @@ def write_prometheus(data: dict, stamp: str) -> Path:
                     gauge("pandemonium_bench_throughput_vs_eevdf_pct",
                           "Throughput delta vs EEVDF",
                           tp["vs_eevdf_pct"], labels)
+
+            # Burst metrics
+            br = sched_data.get("burst", {})
+            if br:
+                survived = 1 if br.get("survived", True) else 0
+                gauge("pandemonium_bench_burst_survived",
+                      "Whether scheduler survived burst (1=OK, 0=CRASHED)",
+                      survived, labels)
+                baseline = br.get("baseline", {})
+                if baseline.get("samples", 0) > 0:
+                    gauge("pandemonium_bench_burst_baseline_p99_us",
+                          "Baseline P99 before burst",
+                          baseline["p99_us"], labels)
+                burst = br.get("burst", {})
+                if burst.get("samples", 0) > 0:
+                    gauge("pandemonium_bench_burst_p99_us",
+                          "P99 during burst",
+                          burst["p99_us"], labels)
+                    gauge("pandemonium_bench_burst_worst_us",
+                          "Worst-case latency during burst",
+                          burst["worst_us"], labels)
+                    gauge("pandemonium_bench_burst_samples",
+                          "Latency samples collected during burst",
+                          burst["samples"], labels)
+
+            # Long-running metrics
+            lr = sched_data.get("longrun", {})
+            if lr:
+                survived = 1 if lr.get("survived", True) else 0
+                gauge("pandemonium_bench_longrun_survived",
+                      "Whether scheduler survived long-run test (1=OK, 0=CRASHED)",
+                      survived, labels)
+                lr_lat = lr.get("latency", {})
+                if lr_lat.get("samples", 0) > 0:
+                    gauge("pandemonium_bench_longrun_latency_p99_us",
+                          "P99 latency during long-running process test",
+                          lr_lat["p99_us"], labels)
+                    gauge("pandemonium_bench_longrun_latency_worst_us",
+                          "Worst-case latency during long-running process test",
+                          lr_lat["worst_us"], labels)
+                if lr.get("work_total", 0) > 0:
+                    gauge("pandemonium_bench_longrun_work_total",
+                          "Total SHA256 iterations across all long-runners",
+                          lr["work_total"], labels)
+                    gauge("pandemonium_bench_longrun_work_min",
+                          "Minimum work by any single long-runner (starvation detector)",
+                          lr["work_min"], labels)
+
+            # Mixed workload metrics
+            mx = sched_data.get("mixed", {})
+            if mx:
+                survived = 1 if mx.get("survived", True) else 0
+                gauge("pandemonium_bench_mixed_survived",
+                      "Whether scheduler survived mixed test (1=OK, 0=CRASHED)",
+                      survived, labels)
+                mx_lat = mx.get("latency", {})
+                if mx_lat.get("samples", 0) > 0:
+                    gauge("pandemonium_bench_mixed_latency_p99_us",
+                          "P99 latency during mixed workload test",
+                          mx_lat["p99_us"], labels)
+                    gauge("pandemonium_bench_mixed_latency_worst_us",
+                          "Worst-case latency during mixed workload test",
+                          mx_lat["worst_us"], labels)
+                if mx.get("work_total", 0) > 0:
+                    gauge("pandemonium_bench_mixed_work_total",
+                          "Total SHA256 iterations in mixed test",
+                          mx["work_total"], labels)
+                    gauge("pandemonium_bench_mixed_work_min",
+                          "Minimum work by any long-runner in mixed test",
+                          mx["work_min"], labels)
+                if mx.get("work_max", 0) > 0:
+                    gauge("pandemonium_bench_mixed_work_max",
+                          "Maximum work by any long-runner in mixed test",
+                          mx["work_max"], labels)
+
+            # Deadline metrics
+            dl = sched_data.get("deadline", {})
+            if dl and dl.get("total_frames", 0) > 0:
+                survived = 1 if dl.get("survived", True) else 0
+                gauge("pandemonium_bench_deadline_survived",
+                      "Whether scheduler survived deadline test (1=OK, 0=CRASHED)",
+                      survived, labels)
+                gauge("pandemonium_bench_deadline_total_frames",
+                      "Total frame cycles measured",
+                      dl["total_frames"], labels)
+                gauge("pandemonium_bench_deadline_missed_frames",
+                      "Frames exceeding jitter threshold",
+                      dl["missed_frames"], labels)
+                gauge("pandemonium_bench_deadline_miss_ratio",
+                      "Fraction of frames missed",
+                      dl["miss_ratio"], labels)
+                gauge("pandemonium_bench_deadline_jitter_p99_us",
+                      "P99 frame scheduling jitter",
+                      dl["jitter_p99_us"], labels)
+                gauge("pandemonium_bench_deadline_jitter_worst_us",
+                      "Worst-case frame scheduling jitter",
+                      dl["jitter_worst_us"], labels)
+
+            # IPC metrics
+            ipc = sched_data.get("ipc", {})
+            if ipc and ipc.get("total_ops", 0) > 0:
+                survived = 1 if ipc.get("survived", True) else 0
+                gauge("pandemonium_bench_ipc_survived",
+                      "Whether scheduler survived IPC test (1=OK, 0=CRASHED)",
+                      survived, labels)
+                gauge("pandemonium_bench_ipc_rtt_median_us",
+                      "Median pipe round-trip latency",
+                      ipc["rtt_median_us"], labels)
+                gauge("pandemonium_bench_ipc_rtt_p99_us",
+                      "P99 pipe round-trip latency",
+                      ipc["rtt_p99_us"], labels)
+                gauge("pandemonium_bench_ipc_rtt_worst_us",
+                      "Worst-case pipe round-trip latency",
+                      ipc["rtt_worst_us"], labels)
+
+            # Launch metrics
+            lnch = sched_data.get("launch", {})
+            if lnch and lnch.get("launches", 0) > 0:
+                survived = 1 if lnch.get("survived", True) else 0
+                gauge("pandemonium_bench_launch_survived",
+                      "Whether scheduler survived launch test (1=OK, 0=CRASHED)",
+                      survived, labels)
+                gauge("pandemonium_bench_launch_mean_us",
+                      "Mean fork+exec latency under load",
+                      lnch["launch_mean_us"], labels)
+                gauge("pandemonium_bench_launch_p99_us",
+                      "P99 fork+exec latency under load",
+                      lnch["launch_p99_us"], labels)
+                gauge("pandemonium_bench_launch_worst_us",
+                      "Worst-case fork+exec latency under load",
+                      lnch["launch_worst_us"], labels)
+
+            # Post-burst recovery metrics
+            br = sched_data.get("burst", {})
+            if br:
+                br_recovery = br.get("recovery", {})
+                if br_recovery.get("samples", 0) > 0:
+                    gauge("pandemonium_bench_burst_recovery_p99_us",
+                          "P99 latency during post-burst recovery",
+                          br_recovery["p99_us"], labels)
+                    gauge("pandemonium_bench_burst_recovery_worst_us",
+                          "Worst-case latency during post-burst recovery",
+                          br_recovery["worst_us"], labels)
+
+                # CUSUM burst detection verification
+                if "cusum_activated" in br:
+                    gauge("pandemonium_bench_burst_cusum_activated",
+                          "Whether CUSUM burst detection fired (1=yes, 0=no)",
+                          1 if br["cusum_activated"] else 0, labels)
+                if "cusum_ticks" in br:
+                    gauge("pandemonium_bench_burst_cusum_ticks",
+                          "Number of scheduler ticks with burst_mode active",
+                          br["cusum_ticks"], labels)
+
+            # Longrun detection verification
+            lr_ticks = sched_data.get("longrun_ticks", 0)
+            if lr_ticks > 0:
+                gauge("pandemonium_bench_longrun_ticks",
+                      "Number of scheduler ticks with longrun_mode active",
+                      lr_ticks, labels)
+
+            # Long-run work distribution
+            lr = sched_data.get("longrun", {})
+            if lr and lr.get("work_max", 0) > 0:
+                gauge("pandemonium_bench_longrun_work_max",
+                      "Maximum work by any single long-runner",
+                      lr["work_max"], labels)
 
             # Scheduler telemetry (PANDEMONIUM only)
             telem = sched_data.get("telemetry", {})
@@ -1133,9 +2018,24 @@ def prom_sys_append_probe(path: Path, lat: dict, label_str: str):
 def format_report(data: dict) -> str:
     """Format benchmark results into a human-readable report."""
     lines = []
-    lines.append("PANDEMONIUM BENCH-SCALE")
+    if data.get("deadline_only"):
+        mode = "DEADLINE ONLY"
+    elif data.get("ipc_only"):
+        mode = "IPC ONLY"
+    elif data.get("launch_only"):
+        mode = "LAUNCH ONLY"
+    elif data.get("mixed_only"):
+        mode = "MIXED ONLY"
+    elif data.get("longrun_only"):
+        mode = "LONG-RUN ONLY"
+    elif data.get("burst_only"):
+        mode = "BURST ONLY"
+    else:
+        mode = "BENCH-SCALE"
+    lines.append(f"PANDEMONIUM {mode}")
     lines.append(f"VERSION:     {data.get('version', '?')}")
-    lines.append(f"ITERATIONS:  {data.get('iterations', '?')}")
+    if not data.get("burst_only"):
+        lines.append(f"ITERATIONS:  {data.get('iterations', '?')}")
     lines.append(f"MAX CPUS:    {data.get('max_cpus', '?')}")
     lines.append("")
 
@@ -1182,7 +2082,7 @@ def format_report(data: dict) -> str:
             lines.append("")
             lines.append(f"{'SCHEDULER':<28} {'STATUS':>8} "
                         f"{'BASE P99':>10} {'BURST P99':>10} "
-                        f"{'WORST':>10} {'SAMPLES':>8}")
+                        f"{'WORST':>10} {'RECV P99':>10} {'SAMPLES':>8}")
             for sched_name, sched_data in schedulers.items():
                 br = sched_data.get("burst", {})
                 if not br:
@@ -1190,17 +2090,139 @@ def format_report(data: dict) -> str:
                 status = "OK" if br.get("survived", True) else "CRASHED"
                 base = br.get("baseline", {})
                 burst = br.get("burst", {})
+                recovery = br.get("recovery", {})
                 bp99 = (f"{base['p99_us']}us"
                         if base.get("samples", 0) > 0 else "--")
                 brp99 = (f"{burst['p99_us']}us"
                          if burst.get("samples", 0) > 0 else "--")
                 worst = (f"{burst['worst_us']}us"
                          if burst.get("samples", 0) > 0 else "--")
+                rp99 = (f"{recovery['p99_us']}us"
+                        if recovery.get("samples", 0) > 0 else "--")
                 samples = (str(burst.get("samples", 0))
                            if burst.get("samples", 0) > 0 else "--")
                 lines.append(f"{sched_name:<28} {status:>8} "
                              f"{bp99:>10} {brp99:>10} "
-                             f"{worst:>10} {samples:>8}")
+                             f"{worst:>10} {rp99:>10} {samples:>8}")
+
+        # Long-running table
+        has_longrun = any(
+            s.get("longrun", {}).get("latency", {}).get("samples", 0) > 0
+            for s in schedulers.values())
+        if has_longrun:
+            lines.append("")
+            lines.append(f"{'SCHEDULER':<28} {'STATUS':>8} "
+                        f"{'LAT P99':>10} {'WORST':>10} "
+                        f"{'WORK TOT':>10} {'WORK MIN':>10} {'WORK MAX':>10}")
+            for sched_name, sched_data in schedulers.items():
+                lr = sched_data.get("longrun", {})
+                if not lr:
+                    continue
+                status = "OK" if lr.get("survived", True) else "CRASHED"
+                lat = lr.get("latency", {})
+                lp99 = (f"{lat['p99_us']}us"
+                        if lat.get("samples", 0) > 0 else "--")
+                lworst = (f"{lat['worst_us']}us"
+                          if lat.get("samples", 0) > 0 else "--")
+                work_tot = str(lr.get("work_total", 0))
+                work_min = str(lr.get("work_min", 0))
+                work_max = str(lr.get("work_max", 0))
+                lines.append(f"{sched_name:<28} {status:>8} "
+                             f"{lp99:>10} {lworst:>10} "
+                             f"{work_tot:>10} {work_min:>10} {work_max:>10}")
+
+        # Mixed workload table
+        has_mixed = any(
+            s.get("mixed", {}).get("latency", {}).get("samples", 0) > 0
+            for s in schedulers.values())
+        if has_mixed:
+            lines.append("")
+            lines.append(f"{'SCHEDULER':<28} {'STATUS':>8} "
+                        f"{'LAT P99':>10} {'WORST':>10} "
+                        f"{'WORK TOT':>10} {'WORK MIN':>10} {'WORK MAX':>10}")
+            for sched_name, sched_data in schedulers.items():
+                mx = sched_data.get("mixed", {})
+                if not mx:
+                    continue
+                status = "OK" if mx.get("survived", True) else "CRASHED"
+                lat = mx.get("latency", {})
+                mp99 = (f"{lat['p99_us']}us"
+                        if lat.get("samples", 0) > 0 else "--")
+                mworst = (f"{lat['worst_us']}us"
+                          if lat.get("samples", 0) > 0 else "--")
+                work_tot = str(mx.get("work_total", 0))
+                work_min = str(mx.get("work_min", 0))
+                work_max = str(mx.get("work_max", 0))
+                lines.append(f"{sched_name:<28} {status:>8} "
+                             f"{mp99:>10} {mworst:>10} "
+                             f"{work_tot:>10} {work_min:>10} {work_max:>10}")
+
+        # Deadline table
+        has_deadline = any(
+            s.get("deadline", {}).get("total_frames", 0) > 0
+            for s in schedulers.values())
+        if has_deadline:
+            lines.append("")
+            lines.append(f"{'SCHEDULER':<28} {'STATUS':>8} "
+                        f"{'MISSES':>8} {'TOTAL':>8} "
+                        f"{'RATIO':>8} {'JIT P99':>10} {'WORST':>10}")
+            for sched_name, sched_data in schedulers.items():
+                dl = sched_data.get("deadline", {})
+                if not dl or dl.get("total_frames", 0) == 0:
+                    continue
+                status = "OK" if dl.get("survived", True) else "CRASHED"
+                missed = str(dl.get("missed_frames", 0))
+                total = str(dl.get("total_frames", 0))
+                ratio = f"{dl.get('miss_ratio', 0):.1%}"
+                jp99 = f"{dl['jitter_p99_us']}us"
+                jworst = f"{dl['jitter_worst_us']}us"
+                lines.append(f"{sched_name:<28} {status:>8} "
+                             f"{missed:>8} {total:>8} "
+                             f"{ratio:>8} {jp99:>10} {jworst:>10}")
+
+        # IPC table
+        has_ipc = any(
+            s.get("ipc", {}).get("total_ops", 0) > 0
+            for s in schedulers.values())
+        if has_ipc:
+            lines.append("")
+            lines.append(f"{'SCHEDULER':<28} {'STATUS':>8} "
+                        f"{'PAIRS':>8} {'MEDIAN':>10} "
+                        f"{'P99':>10} {'WORST':>10}")
+            for sched_name, sched_data in schedulers.items():
+                ipc = sched_data.get("ipc", {})
+                if not ipc or ipc.get("total_ops", 0) == 0:
+                    continue
+                status = "OK" if ipc.get("survived", True) else "CRASHED"
+                pairs = str(ipc.get("pairs", 0))
+                median = f"{ipc['rtt_median_us']}us"
+                p99 = f"{ipc['rtt_p99_us']}us"
+                worst = f"{ipc['rtt_worst_us']}us"
+                lines.append(f"{sched_name:<28} {status:>8} "
+                             f"{pairs:>8} {median:>10} "
+                             f"{p99:>10} {worst:>10}")
+
+        # Launch table
+        has_launch = any(
+            s.get("launch", {}).get("launches", 0) > 0
+            for s in schedulers.values())
+        if has_launch:
+            lines.append("")
+            lines.append(f"{'SCHEDULER':<28} {'STATUS':>8} "
+                        f"{'COUNT':>8} {'MEAN':>10} "
+                        f"{'P99':>10} {'WORST':>10}")
+            for sched_name, sched_data in schedulers.items():
+                lnch = sched_data.get("launch", {})
+                if not lnch or lnch.get("launches", 0) == 0:
+                    continue
+                status = "OK" if lnch.get("survived", True) else "CRASHED"
+                count = str(lnch.get("launches", 0))
+                mean = f"{lnch['launch_mean_us']}us"
+                p99 = f"{lnch['launch_p99_us']}us"
+                worst = f"{lnch['launch_worst_us']}us"
+                lines.append(f"{sched_name:<28} {status:>8} "
+                             f"{count:>8} {mean:>10} "
+                             f"{p99:>10} {worst:>10}")
 
         lines.append("")
 
@@ -1280,7 +2302,865 @@ def format_report(data: dict) -> str:
 
             lines.append("")
 
+        # Long-run summary matrix
+        has_any_longrun = any(
+            results.get(c, {}).get(s, {}).get("longrun", {})
+            .get("latency", {}).get("samples", 0) > 0
+            for c in sorted_cores for s in all_schedulers)
+        if has_any_longrun:
+            lines.append("LONG-RUN LATENCY P99 (us)")
+            header = f"{'SCHEDULER':<28}"
+            for c in sorted_cores:
+                header += f" {c + 'C':>8}"
+            lines.append(header)
+
+            for sched in all_schedulers:
+                row = f"{sched:<28}"
+                for c in sorted_cores:
+                    lr = results.get(c, {}).get(sched, {}).get("longrun", {})
+                    lat = lr.get("latency", {})
+                    p99 = lat.get("p99_us")
+                    if p99 is not None and lat.get("samples", 0) > 0:
+                        survived = lr.get("survived", True)
+                        tag = "" if survived else "*"
+                        row += f" {str(p99) + tag:>8}"
+                    else:
+                        row += f" {'--':>8}"
+                lines.append(row)
+
+            lines.append("")
+
+            lines.append("LONG-RUN WORK (MIN PER-PROCESS)")
+            header = f"{'SCHEDULER':<28}"
+            for c in sorted_cores:
+                header += f" {c + 'C':>8}"
+            lines.append(header)
+
+            for sched in all_schedulers:
+                row = f"{sched:<28}"
+                for c in sorted_cores:
+                    lr = results.get(c, {}).get(sched, {}).get("longrun", {})
+                    work_min = lr.get("work_min")
+                    if work_min is not None and work_min > 0:
+                        row += f" {work_min:>8}"
+                    else:
+                        row += f" {'--':>8}"
+                lines.append(row)
+
+            lines.append("")
+
+            lines.append("LONG-RUN WORK (MAX PER-PROCESS)")
+            header = f"{'SCHEDULER':<28}"
+            for c in sorted_cores:
+                header += f" {c + 'C':>8}"
+            lines.append(header)
+
+            for sched in all_schedulers:
+                row = f"{sched:<28}"
+                for c in sorted_cores:
+                    lr = results.get(c, {}).get(sched, {}).get("longrun", {})
+                    work_max = lr.get("work_max")
+                    if work_max is not None and work_max > 0:
+                        row += f" {work_max:>8}"
+                    else:
+                        row += f" {'--':>8}"
+                lines.append(row)
+
+            lines.append("")
+
+        # Mixed summary matrix
+        has_any_mixed = any(
+            results.get(c, {}).get(s, {}).get("mixed", {})
+            .get("latency", {}).get("samples", 0) > 0
+            for c in sorted_cores for s in all_schedulers)
+        if has_any_mixed:
+            lines.append("MIXED LATENCY P99 (us)")
+            header = f"{'SCHEDULER':<28}"
+            for c in sorted_cores:
+                header += f" {c + 'C':>8}"
+            lines.append(header)
+
+            for sched in all_schedulers:
+                row = f"{sched:<28}"
+                for c in sorted_cores:
+                    mx = results.get(c, {}).get(sched, {}).get("mixed", {})
+                    lat = mx.get("latency", {})
+                    p99 = lat.get("p99_us")
+                    if p99 is not None and lat.get("samples", 0) > 0:
+                        survived = mx.get("survived", True)
+                        tag = "" if survived else "*"
+                        row += f" {str(p99) + tag:>8}"
+                    else:
+                        row += f" {'--':>8}"
+                lines.append(row)
+
+            lines.append("")
+
+            lines.append("MIXED WORK MIN (PER-PROCESS)")
+            header = f"{'SCHEDULER':<28}"
+            for c in sorted_cores:
+                header += f" {c + 'C':>8}"
+            lines.append(header)
+
+            for sched in all_schedulers:
+                row = f"{sched:<28}"
+                for c in sorted_cores:
+                    mx = results.get(c, {}).get(sched, {}).get("mixed", {})
+                    work_min = mx.get("work_min")
+                    if work_min is not None and work_min > 0:
+                        row += f" {work_min:>8}"
+                    else:
+                        row += f" {'--':>8}"
+                lines.append(row)
+
+            lines.append("")
+
+            lines.append("MIXED WORK MAX (PER-PROCESS)")
+            header = f"{'SCHEDULER':<28}"
+            for c in sorted_cores:
+                header += f" {c + 'C':>8}"
+            lines.append(header)
+
+            for sched in all_schedulers:
+                row = f"{sched:<28}"
+                for c in sorted_cores:
+                    mx = results.get(c, {}).get(sched, {}).get("mixed", {})
+                    work_max = mx.get("work_max")
+                    if work_max is not None and work_max > 0:
+                        row += f" {work_max:>8}"
+                    else:
+                        row += f" {'--':>8}"
+                lines.append(row)
+
+            lines.append("")
+
+        # Deadline jitter summary matrix
+        has_any_deadline = any(
+            results.get(c, {}).get(s, {}).get("deadline", {})
+            .get("total_frames", 0) > 0
+            for c in sorted_cores for s in all_schedulers)
+        if has_any_deadline:
+            lines.append("DEADLINE JITTER P99 (us)")
+            header = f"{'SCHEDULER':<28}"
+            for c in sorted_cores:
+                header += f" {c + 'C':>8}"
+            lines.append(header)
+
+            for sched in all_schedulers:
+                row = f"{sched:<28}"
+                for c in sorted_cores:
+                    dl = results.get(c, {}).get(sched, {}).get("deadline", {})
+                    jp99 = dl.get("jitter_p99_us")
+                    if jp99 is not None and dl.get("total_frames", 0) > 0:
+                        survived = dl.get("survived", True)
+                        tag = "" if survived else "*"
+                        row += f" {str(jp99) + tag:>8}"
+                    else:
+                        row += f" {'--':>8}"
+                lines.append(row)
+
+            lines.append("")
+
+            lines.append("DEADLINE MISS RATIO")
+            header = f"{'SCHEDULER':<28}"
+            for c in sorted_cores:
+                header += f" {c + 'C':>8}"
+            lines.append(header)
+
+            for sched in all_schedulers:
+                row = f"{sched:<28}"
+                for c in sorted_cores:
+                    dl = results.get(c, {}).get(sched, {}).get("deadline", {})
+                    ratio = dl.get("miss_ratio")
+                    if ratio is not None and dl.get("total_frames", 0) > 0:
+                        row += f" {ratio:>7.1%}"
+                    else:
+                        row += f" {'--':>8}"
+                lines.append(row)
+
+            lines.append("")
+
+        # IPC round-trip summary matrix
+        has_any_ipc = any(
+            results.get(c, {}).get(s, {}).get("ipc", {})
+            .get("total_ops", 0) > 0
+            for c in sorted_cores for s in all_schedulers)
+        if has_any_ipc:
+            lines.append("IPC ROUND-TRIP P99 (us)")
+            header = f"{'SCHEDULER':<28}"
+            for c in sorted_cores:
+                header += f" {c + 'C':>8}"
+            lines.append(header)
+
+            for sched in all_schedulers:
+                row = f"{sched:<28}"
+                for c in sorted_cores:
+                    ipc = results.get(c, {}).get(sched, {}).get("ipc", {})
+                    rp99 = ipc.get("rtt_p99_us")
+                    if rp99 is not None and ipc.get("total_ops", 0) > 0:
+                        survived = ipc.get("survived", True)
+                        tag = "" if survived else "*"
+                        row += f" {str(rp99) + tag:>8}"
+                    else:
+                        row += f" {'--':>8}"
+                lines.append(row)
+
+            lines.append("")
+
+        # App launch summary matrix
+        has_any_launch = any(
+            results.get(c, {}).get(s, {}).get("launch", {})
+            .get("launches", 0) > 0
+            for c in sorted_cores for s in all_schedulers)
+        if has_any_launch:
+            lines.append("APP LAUNCH P99 (us)")
+            header = f"{'SCHEDULER':<28}"
+            for c in sorted_cores:
+                header += f" {c + 'C':>8}"
+            lines.append(header)
+
+            for sched in all_schedulers:
+                row = f"{sched:<28}"
+                for c in sorted_cores:
+                    lnch = results.get(c, {}).get(sched, {}).get("launch", {})
+                    lp99 = lnch.get("launch_p99_us")
+                    if lp99 is not None and lnch.get("launches", 0) > 0:
+                        survived = lnch.get("survived", True)
+                        tag = "" if survived else "*"
+                        row += f" {str(lp99) + tag:>8}"
+                    else:
+                        row += f" {'--':>8}"
+                lines.append(row)
+
+            lines.append("")
+
     return "\n".join(lines)
+
+
+# BENCH-PCPU: PER-CPU DSQ VISIBILITY TESTS
+# DIRECTLY ATTACKS THE THREE LAYERS THAT PREVENT PER-CPU DSQ STARVATION:
+#   1. BOUNDED DEPTH GATE (BURST MODE THRESHOLD=1)
+#   2. L2 WORK STEALING (DISPATCH CHECKS SIBLING PER-CPU DSQs)
+#   3. PER-CPU SOJOURN RESCUE (TICK DETECTS STALE TASKS AT 10MS)
+
+def fire_burst_timed(count: int,
+                     work_secs: float = 0.5) -> list[subprocess.Popen]:
+    """Spawn count short-lived CPU-bound processes that report elapsed time.
+
+    Each process records wall-clock elapsed time. If a process doing 0.5s
+    of work takes 35s wall-clock, it was starved for approximately 34.5s.
+    Output: one float per line on stdout (elapsed seconds)."""
+    script = (
+        "import time,hashlib\n"
+        "start=time.monotonic()\n"
+        f"end=start+{work_secs}\n"
+        "while time.monotonic()<end:\n"
+        " hashlib.sha256(b'x'*4096).hexdigest()\n"
+        "print(f'{time.monotonic()-start:.4f}')\n"
+    )
+    procs = []
+    for _ in range(count):
+        p = subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        procs.append(p)
+    return procs
+
+
+def collect_burst_times(procs: list[subprocess.Popen],
+                        timeout: float = 60.0) -> list[float]:
+    """Collect elapsed times from timed burst processes."""
+    times = []
+    for p in procs:
+        try:
+            stdout, _ = p.communicate(timeout=timeout)
+            for line in stdout.decode(errors="replace").splitlines():
+                line = line.strip()
+                if line:
+                    try:
+                        times.append(float(line))
+                    except ValueError:
+                        pass
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait()
+    return times
+
+
+def measure_burst_starvation(binary: Path, n_cpus: int,
+                             burst_size: int = 300,
+                             burst_work_secs: float = 0.5) -> dict:
+    """Reproduce the CS2 starvation scenario that killed v5.4.1.
+
+    Full CPU saturation + massive fork/exec storm. Measures:
+    - Max scheduling delay of burst tasks (elapsed - work_secs)
+    - Probe wake-to-run latency during burst
+    - Recovery latency after burst clears
+
+    PASS: max_delay < 2s AND probe p99 < 50000us during burst
+    FAIL: any burst task starved > 2s (per-CPU DSQ visibility broken)
+    """
+    if n_cpus < 2:
+        return {"survived": True, "pass": True, "skip": True}
+
+    log_info(f"[burst-starvation] {n_cpus}C, {burst_size} burst tasks, "
+             f"{burst_work_secs}s work each")
+
+    # SATURATE ALL CPUs
+    workers = []
+    for cpu in range(n_cpus):
+        p = subprocess.Popen(
+            [str(binary), "stress-worker", "--cpu", str(cpu)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        workers.append(p)
+
+    # WARMUP: LET SCHEDULER CLASSIFY WORKLOAD
+    warmup = subprocess.Popen(
+        [str(binary), "probe"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+    time.sleep(3)
+    warmup.send_signal(signal.SIGINT)
+    try:
+        warmup.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        warmup.kill()
+        warmup.wait()
+
+    # BASELINE PROBE (5S)
+    log_info("[burst-starvation] Baseline: 5s")
+    baseline_probe = subprocess.Popen(
+        [str(binary), "probe"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+    time.sleep(5)
+    baseline_probe.send_signal(signal.SIGINT)
+    try:
+        baseline_out, _ = baseline_probe.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        baseline_probe.kill()
+        baseline_out, _ = baseline_probe.communicate()
+    baseline = parse_probe_output(baseline_out.decode(errors="replace"))
+    log_info(f"[burst-starvation] Baseline: median={baseline['median_us']}us "
+             f"p99={baseline['p99_us']}us")
+
+    # START PROBE FOR BURST MEASUREMENT
+    burst_probe = subprocess.Popen(
+        [str(binary), "probe"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+    time.sleep(0.5)
+
+    # DETONATE: FIRE TIMED BURST
+    log_info(f"[burst-starvation] Firing {burst_size} burst tasks")
+    burst_start = time.monotonic()
+    burst_procs = fire_burst_timed(burst_size, burst_work_secs)
+
+    # COLLECT BURST TASK WALL-CLOCK TIMES
+    burst_times = collect_burst_times(burst_procs, timeout=60)
+    burst_duration = time.monotonic() - burst_start
+    log_info(f"[burst-starvation] Burst complete: {burst_duration:.1f}s, "
+             f"{len(burst_times)} tasks reported")
+
+    # SETTLING
+    remaining = max(0, 15 - burst_duration)
+    if remaining > 0:
+        time.sleep(remaining)
+
+    # STOP BURST PROBE
+    burst_probe.send_signal(signal.SIGINT)
+    try:
+        burst_out, _ = burst_probe.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        burst_probe.kill()
+        burst_out, _ = burst_probe.communicate()
+    burst_lat = parse_probe_output(burst_out.decode(errors="replace"))
+
+    # RECOVERY PROBE (5S)
+    log_info("[burst-starvation] Recovery: 5s")
+    recovery_probe = subprocess.Popen(
+        [str(binary), "probe"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+    time.sleep(5)
+    recovery_probe.send_signal(signal.SIGINT)
+    try:
+        recovery_out, _ = recovery_probe.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        recovery_probe.kill()
+        recovery_out, _ = recovery_probe.communicate()
+    recovery = parse_probe_output(recovery_out.decode(errors="replace"))
+
+    # STOP STRESS WORKERS
+    for w in workers:
+        w.send_signal(signal.SIGINT)
+    for w in workers:
+        try:
+            w.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            w.kill()
+            w.wait()
+
+    # ANALYZE BURST TASK DELAYS
+    max_delay = 0.0
+    delays = []
+    for t in burst_times:
+        delay = max(0, t - burst_work_secs)
+        delays.append(delay)
+        if delay > max_delay:
+            max_delay = delay
+
+    p99_delay = percentile(delays, 99) if delays else 0
+    median_delay = percentile(delays, 50) if delays else 0
+
+    passed = max_delay < 2.0 and burst_lat["p99_us"] < 50000
+
+    verdict = "PASS" if passed else "FAIL"
+    log_info(f"[burst-starvation] Task delay: max={max_delay:.3f}s "
+             f"p99={p99_delay:.3f}s median={median_delay:.3f}s")
+    log_info(f"[burst-starvation] Probe during burst: "
+             f"p99={burst_lat['p99_us']}us worst={burst_lat['worst_us']}us")
+    log_info(f"[burst-starvation] Recovery: p99={recovery['p99_us']}us")
+    log_info(f"[burst-starvation] {verdict}")
+
+    return {
+        "survived": True,
+        "pass": passed,
+        "n_cpus": n_cpus,
+        "burst_size": burst_size,
+        "burst_duration_s": round(burst_duration, 1),
+        "tasks_reported": len(burst_times),
+        "max_delay_s": round(max_delay, 3),
+        "p99_delay_s": round(p99_delay, 3),
+        "median_delay_s": round(median_delay, 3),
+        "baseline": baseline,
+        "burst_latency": burst_lat,
+        "recovery": recovery,
+    }
+
+
+def measure_work_stealing(binary: Path, n_cpus: int) -> dict:
+    """Test L2 work stealing under asymmetric load.
+
+    Pin stress workers to half the CPUs (saturate them). Probe floats
+    across all CPUs. Work stealing should pull tasks from saturated CPUs'
+    per-CPU DSQs to idle siblings in the same L2 domain.
+
+    Compares probe latency under asymmetric load (half saturated) vs
+    symmetric load (all saturated). If work stealing works, the ratio
+    stays bounded.
+
+    PASS: asymmetric p99 < 5x symmetric p99
+    """
+    if n_cpus < 4:
+        return {"survived": True, "pass": True, "skip": True}
+
+    half = n_cpus // 2
+    log_info(f"[work-stealing] {n_cpus}C, saturating {half} CPUs, "
+             f"{n_cpus - half} idle for stealing")
+
+    # PHASE 1: SYMMETRIC (ALL CPUs SATURATED) -- BASELINE
+    log_info("[work-stealing] Phase 1: symmetric (all CPUs saturated)")
+    sym_workers = []
+    for cpu in range(n_cpus):
+        p = subprocess.Popen(
+            [str(binary), "stress-worker", "--cpu", str(cpu)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        sym_workers.append(p)
+
+    warmup = subprocess.Popen(
+        [str(binary), "probe"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+    time.sleep(2)
+    warmup.send_signal(signal.SIGINT)
+    try:
+        warmup.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        warmup.kill()
+        warmup.wait()
+
+    sym_probe = subprocess.Popen(
+        [str(binary), "probe"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+    time.sleep(10)
+    sym_probe.send_signal(signal.SIGINT)
+    try:
+        sym_out, _ = sym_probe.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        sym_probe.kill()
+        sym_out, _ = sym_probe.communicate()
+    symmetric = parse_probe_output(sym_out.decode(errors="replace"))
+
+    for w in sym_workers:
+        w.send_signal(signal.SIGINT)
+    for w in sym_workers:
+        try:
+            w.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            w.kill()
+            w.wait()
+
+    log_info(f"[work-stealing] Symmetric: median={symmetric['median_us']}us "
+             f"p99={symmetric['p99_us']}us worst={symmetric['worst_us']}us")
+
+    time.sleep(2)
+
+    # PHASE 2: ASYMMETRIC (HALF CPUs SATURATED)
+    log_info(f"[work-stealing] Phase 2: asymmetric ({half} CPUs saturated)")
+    asym_workers = []
+    for cpu in range(half):
+        p = subprocess.Popen(
+            [str(binary), "stress-worker", "--cpu", str(cpu)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        asym_workers.append(p)
+
+    warmup = subprocess.Popen(
+        [str(binary), "probe"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+    time.sleep(2)
+    warmup.send_signal(signal.SIGINT)
+    try:
+        warmup.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        warmup.kill()
+        warmup.wait()
+
+    asym_probe = subprocess.Popen(
+        [str(binary), "probe"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+    time.sleep(10)
+    asym_probe.send_signal(signal.SIGINT)
+    try:
+        asym_out, _ = asym_probe.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        asym_probe.kill()
+        asym_out, _ = asym_probe.communicate()
+    asymmetric = parse_probe_output(asym_out.decode(errors="replace"))
+
+    for w in asym_workers:
+        w.send_signal(signal.SIGINT)
+    for w in asym_workers:
+        try:
+            w.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            w.kill()
+            w.wait()
+
+    log_info(f"[work-stealing] Asymmetric: median={asymmetric['median_us']}us "
+             f"p99={asymmetric['p99_us']}us worst={asymmetric['worst_us']}us")
+
+    # ANALYSIS: RATIO OF ASYMMETRIC TO SYMMETRIC
+    sym_p99 = max(symmetric["p99_us"], 1)
+    asym_p99 = asymmetric["p99_us"]
+    ratio = asym_p99 / sym_p99
+
+    # ASYMMETRIC SHOULD BE BETTER THAN SYMMETRIC (HALF THE CPUs ARE FREE)
+    # IF WORK STEALING IS BROKEN, TASKS ON SATURATED CPUs ROT,
+    # AND RATIO COULD EXCEED 5X.
+    passed = ratio < 5.0
+
+    verdict = "PASS" if passed else "FAIL"
+    log_info(f"[work-stealing] Ratio: {ratio:.1f}x (asym/sym p99)")
+    log_info(f"[work-stealing] {verdict}")
+
+    return {
+        "survived": True,
+        "pass": passed,
+        "n_cpus": n_cpus,
+        "half_saturated": half,
+        "symmetric": symmetric,
+        "asymmetric": asymmetric,
+        "ratio": round(ratio, 2),
+    }
+
+
+def measure_sojourn_ceiling(binary: Path, n_cpus: int,
+                            wave_count: int = 5,
+                            tasks_per_wave: int = 50,
+                            work_secs: float = 0.01) -> dict:
+    """Test per-CPU sojourn rescue under sustained full saturation.
+
+    All CPUs saturated with stress workers. Repeated waves of short-lived
+    tasks (10ms work each) are fired into the system. The depth gate and
+    work stealing handle most tasks. The sojourn rescue in tick() catches
+    any that slip through -- stale pcpu_enqueue_ns triggers a kick within
+    the sojourn threshold (5ms default).
+
+    PASS: no task waits > 1s
+    """
+    if n_cpus < 2:
+        return {"survived": True, "pass": True, "skip": True}
+
+    log_info(f"[sojourn-ceiling] {n_cpus}C, {wave_count} waves of "
+             f"{tasks_per_wave} tasks ({work_secs}s work each)")
+
+    # SATURATE ALL CPUs
+    workers = []
+    for cpu in range(n_cpus):
+        p = subprocess.Popen(
+            [str(binary), "stress-worker", "--cpu", str(cpu)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        workers.append(p)
+    time.sleep(3)
+
+    # FIRE WAVES OF SHORT TASKS
+    all_delays = []
+    max_delay = 0.0
+
+    for wave in range(wave_count):
+        log_info(f"[sojourn-ceiling] Wave {wave + 1}/{wave_count}: "
+                 f"{tasks_per_wave} tasks")
+        procs = fire_burst_timed(tasks_per_wave, work_secs)
+        times = collect_burst_times(procs, timeout=30)
+
+        for t in times:
+            delay = max(0, t - work_secs)
+            all_delays.append(delay)
+            if delay > max_delay:
+                max_delay = delay
+
+        log_info(f"[sojourn-ceiling] Wave {wave + 1}: "
+                 f"{len(times)} tasks, max_delay={max_delay:.3f}s")
+        time.sleep(2)
+
+    # STOP STRESS WORKERS
+    for w in workers:
+        w.send_signal(signal.SIGINT)
+    for w in workers:
+        try:
+            w.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            w.kill()
+            w.wait()
+
+    p99_delay = percentile(all_delays, 99) if all_delays else 0
+    median_delay = percentile(all_delays, 50) if all_delays else 0
+    passed = max_delay < 1.0
+
+    verdict = "PASS" if passed else "FAIL"
+    log_info(f"[sojourn-ceiling] Total: {len(all_delays)} tasks, "
+             f"max={max_delay:.3f}s p99={p99_delay:.3f}s "
+             f"median={median_delay:.3f}s")
+    log_info(f"[sojourn-ceiling] {verdict}")
+
+    return {
+        "survived": True,
+        "pass": passed,
+        "n_cpus": n_cpus,
+        "waves": wave_count,
+        "tasks_per_wave": tasks_per_wave,
+        "total_tasks": len(all_delays),
+        "max_delay_s": round(max_delay, 3),
+        "p99_delay_s": round(p99_delay, 3),
+        "median_delay_s": round(median_delay, 3),
+    }
+
+
+def cmd_bench_pcpu(args) -> int:
+    """Per-CPU DSQ visibility stress test.
+
+    Three tests attack the per-CPU DSQ reintroduction (v5.4.8):
+      burst-starvation: Reproduces the CS2 starvation scenario
+      work-stealing:    Tests L2 work stealing under asymmetric load
+      sojourn-ceiling:  Tests per-CPU sojourn rescue under full saturation
+
+    Requires sudo. Runs at current online CPU count by default.
+    """
+    subprocess.run(["sudo", "true"])
+    nuke_stale_build()
+    if not build():
+        return 1
+
+    max_cpus = os.cpu_count() or 2
+
+    if args.core_counts:
+        core_counts = [int(c.strip()) for c in args.core_counts.split(",")]
+        core_counts = [c for c in core_counts if 2 <= c <= max_cpus]
+        core_counts = sorted(set(core_counts))
+    else:
+        core_counts = compute_core_counts(max_cpus)
+
+    version = get_version()
+    git = get_git_info()
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+    log_info(f"PANDEMONIUMv{version} BENCH-PCPU")
+    log_info(f"Core counts: {core_counts}")
+    log_info(f"Iterations: {args.iterations}")
+
+    all_results = {}
+    overall_pass = True
+
+    try:
+        for nr_cpus in core_counts:
+            log_info(f"[{nr_cpus}C] Starting per-CPU DSQ tests")
+
+            if nr_cpus < max_cpus:
+                if not restrict_cpus(nr_cpus, max_cpus):
+                    log_error(f"[{nr_cpus}C] Failed to restrict CPUs")
+                    restore_all_cpus(max_cpus)
+                    continue
+            time.sleep(1)
+
+            core_results = {"burst": [], "steal": [], "sojourn": []}
+
+            for iteration in range(1, args.iterations + 1):
+                log_info(f"[{nr_cpus}C] Iteration {iteration}/{args.iterations}")
+
+                # START SCHEDULER
+                guard = start_and_wait(
+                    [str(BINARY), "--nr-cpus", str(nr_cpus)],
+                    "PANDEMONIUM", settle_secs=3)
+                if guard is None:
+                    log_error(f"[{nr_cpus}C] Scheduler failed to start")
+                    core_results["burst"].append({"survived": False, "pass": False})
+                    core_results["steal"].append({"survived": False, "pass": False})
+                    core_results["sojourn"].append({"survived": False, "pass": False})
+                    overall_pass = False
+                    continue
+
+                dmesg = DmesgMonitor()
+
+                try:
+                    # TEST 1: BURST STARVATION
+                    burst_size = max(nr_cpus * 20, 100)
+                    r = measure_burst_starvation(BINARY, nr_cpus,
+                                                 burst_size=burst_size)
+                    core_results["burst"].append(r)
+                    if not r.get("pass", False) and not r.get("skip", False):
+                        overall_pass = False
+
+                    dmesg.check()
+                    if dmesg.crashed:
+                        log_error(f"[{nr_cpus}C] Crash detected after burst test")
+                        overall_pass = False
+                        stop_and_wait(guard)
+                        continue
+
+                    time.sleep(3)
+
+                    # TEST 2: WORK STEALING
+                    r = measure_work_stealing(BINARY, nr_cpus)
+                    core_results["steal"].append(r)
+                    if not r.get("pass", False) and not r.get("skip", False):
+                        overall_pass = False
+
+                    dmesg.check()
+                    if dmesg.crashed:
+                        log_error(f"[{nr_cpus}C] Crash detected after steal test")
+                        overall_pass = False
+                        stop_and_wait(guard)
+                        continue
+
+                    time.sleep(3)
+
+                    # TEST 3: SOJOURN CEILING
+                    r = measure_sojourn_ceiling(BINARY, nr_cpus)
+                    core_results["sojourn"].append(r)
+                    if not r.get("pass", False) and not r.get("skip", False):
+                        overall_pass = False
+
+                finally:
+                    dmesg.save()
+                    stdout = stop_and_wait(guard)
+                    time.sleep(2)
+
+            all_results[nr_cpus] = core_results
+
+            if nr_cpus < max_cpus:
+                restore_all_cpus(max_cpus)
+                time.sleep(1)
+
+    except KeyboardInterrupt:
+        log_info("Interrupted")
+        overall_pass = False
+    finally:
+        restore_all_cpus(max_cpus)
+
+    # REPORT
+    log_info("")
+    log_info(f"PANDEMONIUMv{version} BENCH-PCPU RESULTS")
+    log_info("")
+
+    for nr_cpus in sorted(all_results.keys()):
+        cr = all_results[nr_cpus]
+        log_info(f"  {nr_cpus}C:")
+
+        for test_name in ["burst", "steal", "sojourn"]:
+            results = cr[test_name]
+            if not results:
+                continue
+            passes = sum(1 for r in results
+                         if r.get("pass", False) or r.get("skip", False))
+            total = len(results)
+            label = "PASS" if passes == total else "FAIL"
+
+            detail = ""
+            if test_name == "burst" and results:
+                r = results[-1]
+                if not r.get("skip"):
+                    detail = (f"max_delay={r.get('max_delay_s', '?')}s "
+                              f"burst_p99={r.get('burst_latency', {}).get('p99_us', '?')}us")
+            elif test_name == "steal" and results:
+                r = results[-1]
+                if not r.get("skip"):
+                    detail = (f"ratio={r.get('ratio', '?')}x "
+                              f"asym_p99={r.get('asymmetric', {}).get('p99_us', '?')}us")
+            elif test_name == "sojourn" and results:
+                r = results[-1]
+                if not r.get("skip"):
+                    detail = (f"max_delay={r.get('max_delay_s', '?')}s "
+                              f"p99_delay={r.get('p99_delay_s', '?')}s")
+
+            log_info(f"    {test_name:20s} {label} ({passes}/{total})  {detail}")
+
+    log_info("")
+    if overall_pass:
+        log_info("OVERALL: PASS")
+    else:
+        log_info("OVERALL: FAIL")
+
+    # PROMETHEUS OUTPUT
+    prom_path = LOG_DIR / f"bench-pcpu-{stamp}.prom"
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(prom_path, "w") as f:
+        f.write(f'# PANDEMONIUM bench-pcpu v{version}\n')
+        f.write(f'# {datetime.now().isoformat()}\n')
+        for nr_cpus in sorted(all_results.keys()):
+            cr = all_results[nr_cpus]
+            for test_name in ["burst", "steal", "sojourn"]:
+                results = cr[test_name]
+                if not results:
+                    continue
+                r = results[-1]
+                label = f'test="{test_name}",cpus="{nr_cpus}"'
+                f.write(f'pandemonium_pcpu_pass{{{label}}} '
+                        f'{1 if r.get("pass", False) else 0}\n')
+                if test_name == "burst" and not r.get("skip"):
+                    f.write(f'pandemonium_pcpu_burst_max_delay_s{{{label}}} '
+                            f'{r.get("max_delay_s", 0)}\n')
+                    bl = r.get("burst_latency", {})
+                    f.write(f'pandemonium_pcpu_burst_p99_us{{{label}}} '
+                            f'{bl.get("p99_us", 0)}\n')
+                elif test_name == "steal" and not r.get("skip"):
+                    f.write(f'pandemonium_pcpu_steal_ratio{{{label}}} '
+                            f'{r.get("ratio", 0)}\n')
+                elif test_name == "sojourn" and not r.get("skip"):
+                    f.write(f'pandemonium_pcpu_sojourn_max_delay_s{{{label}}} '
+                            f'{r.get("max_delay_s", 0)}\n')
+    log_info(f"Prometheus: {prom_path}")
+
+    return 0 if overall_pass else 1
 
 
 # BENCH-SCALE COMMAND
@@ -1311,7 +3191,18 @@ def cmd_bench_scale(args) -> int:
 
     subprocess.run(["sudo", "true"])
 
-    dmesg_start = dmesg_baseline()
+    dmesg = DmesgMonitor()
+
+    # Trace capture (optional)
+    trace = None
+    trace_path = None
+    if getattr(args, "trace", False):
+        stamp_early = datetime.now().strftime("%Y%m%d-%H%M%S")
+        trace_path = LOG_DIR / f"trace-{stamp_early}.log"
+        trace = TraceCapture(trace_path)
+        if not trace.start():
+            log_warn("trace capture unavailable, continuing without")
+            trace = None
 
     nuke_stale_build()
 
@@ -1339,7 +3230,7 @@ def cmd_bench_scale(args) -> int:
     if preflight is None:
         log_error("Pre-flight FAILED -- PANDEMONIUM cannot activate")
         log_error("Fix the error above before running bench-scale")
-        capture_dmesg(dmesg_start, datetime.now().strftime("%Y%m%d-%H%M%S"))
+        dmesg.save()
         return 1
     stop_and_wait(preflight)
     log_info("Pre-flight PASSED")
@@ -1380,8 +3271,21 @@ def cmd_bench_scale(args) -> int:
     print()
     log_info(f"Schedulers: {', '.join(name for name, _ in base_entries)}")
     log_info(f"Core counts: {core_counts}")
-    log_info(f"Iterations: {args.iterations}")
-    log_info(f"Workload: {workload_cmd}")
+    if args.deadline:
+        log_info("Mode: DEADLINE ONLY (periodic frame jitter)")
+    elif args.ipc:
+        log_info("Mode: IPC ONLY (pipe round-trip latency)")
+    elif args.launch:
+        log_info("Mode: LAUNCH ONLY (fork+exec latency)")
+    elif args.mixed:
+        log_info("Mode: MIXED ONLY (burst + long-run combined)")
+    elif args.longrun:
+        log_info("Mode: LONG-RUN ONLY (skipping latency, throughput, burst)")
+    elif args.burst:
+        log_info("Mode: BURST ONLY (skipping latency + throughput)")
+    else:
+        log_info(f"Iterations: {args.iterations}")
+        log_info(f"Workload: {workload_cmd}")
     print()
 
     # Data structure for all results
@@ -1395,6 +3299,12 @@ def cmd_bench_scale(args) -> int:
         "git_dirty": git["dirty"],
         "timestamp": stamp,
         "iterations": args.iterations,
+        "burst_only": args.burst,
+        "longrun_only": args.longrun,
+        "mixed_only": args.mixed,
+        "deadline_only": args.deadline,
+        "ipc_only": args.ipc,
+        "launch_only": args.launch,
         "max_cpus": max_cpus,
         "results": {},
     }
@@ -1445,49 +3355,129 @@ def cmd_bench_scale(args) -> int:
                         print()
                         continue
 
-                # Latency measurement
-                latency = measure_latency(BINARY, n, iterations=args.iterations)
-                sched_result["latency"] = latency
+                any_single = (args.burst or args.longrun or args.mixed
+                              or args.deadline or args.ipc or args.launch)
+                run_full = not any_single
 
-                # Throughput measurement
-                times = []
-                for i in range(args.iterations):
-                    log_info(f"Throughput iteration {i + 1}/{args.iterations}")
-                    t = timed_run(workload_cmd, clean_cmd)
-                    if t is None:
-                        log_warn(f"Workload failed under {sched_name}")
-                        break
-                    times.append(t)
+                if run_full:
+                    # Latency measurement
+                    latency = measure_latency(BINARY, n,
+                                              iterations=args.iterations)
+                    sched_result["latency"] = latency
 
-                if times:
-                    m, std = mean_stdev(times)
-                    tp = {"times": [round(t, 2) for t in times],
-                          "mean_s": round(m, 2),
-                          "stdev_s": round(std, 2)}
-                    if sched_name == "EEVDF":
-                        eevdf_mean[cores_str] = m
-                    elif cores_str in eevdf_mean and eevdf_mean[cores_str] > 0:
-                        delta = ((m - eevdf_mean[cores_str])
-                                 / eevdf_mean[cores_str]) * 100.0
-                        tp["vs_eevdf_pct"] = round(delta, 1)
-                    sched_result["throughput"] = tp
+                    # Throughput measurement
+                    times = []
+                    for i in range(args.iterations):
+                        log_info(f"Throughput iteration {i + 1}/{args.iterations}")
+                        t = timed_run(workload_cmd, clean_cmd)
+                        if t is None:
+                            log_warn(f"Workload failed under {sched_name}")
+                            break
+                        times.append(t)
 
-                # Burst measurement (app launch under full load)
-                burst_size = n * 4
-                if burst_size < 8:
-                    burst_size = 8
-                burst_result = measure_burst(BINARY, n, burst_size)
-                if guard is not None and guard.proc.poll() is not None:
-                    burst_result["survived"] = False
-                    log_error(f"{sched_name} CRASHED during burst "
-                              f"(exit {guard.proc.returncode})")
-                sched_result["burst"] = burst_result
+                    if times:
+                        m, std = mean_stdev(times)
+                        tp = {"times": [round(t, 2) for t in times],
+                              "mean_s": round(m, 2),
+                              "stdev_s": round(std, 2)}
+                        if sched_name == "EEVDF":
+                            eevdf_mean[cores_str] = m
+                        elif (cores_str in eevdf_mean
+                              and eevdf_mean[cores_str] > 0):
+                            delta = ((m - eevdf_mean[cores_str])
+                                     / eevdf_mean[cores_str]) * 100.0
+                            tp["vs_eevdf_pct"] = round(delta, 1)
+                        sched_result["throughput"] = tp
+
+                if run_full or args.burst:
+                    # Burst measurement (app launch under full load)
+                    burst_size = n * 4
+                    if burst_size < 8:
+                        burst_size = 8
+                    burst_result = measure_burst(BINARY, n, burst_size)
+                    if guard is not None and guard.proc.poll() is not None:
+                        burst_result["survived"] = False
+                        log_error(f"{sched_name} CRASHED during burst "
+                                  f"(exit {guard.proc.returncode})")
+                    sched_result["burst"] = burst_result
+
+                if run_full or args.longrun:
+                    # Long-running process test
+                    longrun_count = max(4, n // 2)
+                    longrun_result = measure_longrun(BINARY, n,
+                                                     longrun_count=longrun_count)
+                    if guard is not None and guard.proc.poll() is not None:
+                        longrun_result["survived"] = False
+                        log_error(f"{sched_name} CRASHED during long-run "
+                                  f"(exit {guard.proc.returncode})")
+                    sched_result["longrun"] = longrun_result
+
+                if run_full or args.mixed:
+                    # Mixed workload test (burst + longrun combined)
+                    mixed_burst_size = n * 4
+                    if mixed_burst_size < 8:
+                        mixed_burst_size = 8
+                    mixed_result = measure_mixed(BINARY, n,
+                                                 longrun_count=max(4, n // 2),
+                                                 burst_size=mixed_burst_size)
+                    if guard is not None and guard.proc.poll() is not None:
+                        mixed_result["survived"] = False
+                        log_error(f"{sched_name} CRASHED during mixed test "
+                                  f"(exit {guard.proc.returncode})")
+                    sched_result["mixed"] = mixed_result
+
+                if run_full or args.deadline:
+                    # Periodic deadline (frame scheduling jitter)
+                    deadline_result = measure_deadline(BINARY, n)
+                    if guard is not None and guard.proc.poll() is not None:
+                        deadline_result["survived"] = False
+                        log_error(f"{sched_name} CRASHED during deadline test "
+                                  f"(exit {guard.proc.returncode})")
+                    sched_result["deadline"] = deadline_result
+
+                if run_full or args.ipc:
+                    # IPC round-trip (pipe ping-pong)
+                    ipc_result = measure_ipc(BINARY, n)
+                    if guard is not None and guard.proc.poll() is not None:
+                        ipc_result["survived"] = False
+                        log_error(f"{sched_name} CRASHED during IPC test "
+                                  f"(exit {guard.proc.returncode})")
+                    sched_result["ipc"] = ipc_result
+
+                if run_full or args.launch:
+                    # Application launch under load
+                    launch_result = measure_launch(BINARY, n)
+                    if guard is not None and guard.proc.poll() is not None:
+                        launch_result["survived"] = False
+                        log_error(f"{sched_name} CRASHED during launch test "
+                                  f"(exit {guard.proc.returncode})")
+                    sched_result["launch"] = launch_result
 
                 # Stop scheduler, capture telemetry
                 stdout = stop_and_wait(guard)
                 if stdout and "PANDEMONIUM" in sched_name:
                     ticks = parse_tick_lines(stdout)
                     knobs = parse_knobs_line(stdout)
+
+                    # BURST ACTIVATION VERIFICATION
+                    if "burst" in sched_result:
+                        burst_ticks = [t for t in ticks if t.get("burst_active")]
+                        if burst_ticks:
+                            log_info(f"Burst verification: CUSUM activated in "
+                                     f"{len(burst_ticks)}/{len(ticks)} ticks")
+                        else:
+                            log_warn(f"Burst verification: CUSUM NEVER ACTIVATED "
+                                     f"(burst test may be ineffective at {n} cores)")
+                        sched_result["burst"]["cusum_activated"] = len(burst_ticks) > 0
+                        sched_result["burst"]["cusum_ticks"] = len(burst_ticks)
+
+                    # LONGRUN ACTIVATION VERIFICATION
+                    longrun_ticks = [t for t in ticks if t.get("longrun_active")]
+                    if longrun_ticks:
+                        log_info(f"Longrun verification: detected in "
+                                 f"{len(longrun_ticks)}/{len(ticks)} ticks")
+                    sched_result["longrun_ticks"] = len(longrun_ticks)
+
                     sched_result["telemetry"] = {
                         "tick_count": len(ticks),
                         "tick_aggregate": aggregate_ticks(ticks),
@@ -1517,8 +3507,20 @@ def cmd_bench_scale(args) -> int:
     prom_path = write_prometheus(data, stamp)
     log_info(f"Prometheus metrics saved to {prom_path}")
 
-    # Capture dmesg
-    capture_dmesg(dmesg_start, stamp)
+    # Dmesg
+    dmesg.save(stamp)
+
+    # Trace teardown
+    if trace is not None:
+        trace.stop()
+        log_info(f"Trace log: {trace_path}")
+        if trace_path and trace_path.exists():
+            lines = trace_path.read_text().splitlines()
+            if lines:
+                tail = lines[-20:]
+                log_info(f"Last {len(tail)} trace events:")
+                for line in tail:
+                    log_info(f"  {line.rstrip()}")
 
     # Restart PANDEMONIUM service if it was running
     ret = subprocess.run(["systemctl", "is-enabled", "pandemonium"],
@@ -1559,7 +3561,7 @@ def cmd_bench_sys(args) -> int:
 
     subprocess.run(["sudo", "true"])
 
-    dmesg_start = dmesg_baseline()
+    dmesg = DmesgMonitor()
 
     # Only build PANDEMONIUM binary when we need it (pandemonium modes or probe)
     if is_pandemonium or args.with_probe:
@@ -1614,7 +3616,7 @@ def cmd_bench_sys(args) -> int:
         guard = start_and_wait(sched_cmd, sched_display, settle_secs=settle)
         if guard is None:
             log_error(f"{sched_display} failed to activate")
-            capture_dmesg(dmesg_start, datetime.now().strftime("%Y%m%d-%H%M%S"))
+            dmesg.save()
             return 1
 
     # Optionally start latency probe
@@ -1712,7 +3714,7 @@ def cmd_bench_sys(args) -> int:
                  f"{ticks_written} ticks")
         log_info(f"Prometheus: {prom_path}")
 
-        capture_dmesg(dmesg_start, stamp)
+        dmesg.save(stamp)
         fix_ownership()
 
     except Exception:
@@ -1741,7 +3743,1881 @@ def cmd_bench_sys(args) -> int:
     return 0
 
 
+# BENCH-TRACE WORKLOAD GENERATORS
+
+class _StressWorkers:
+    """Background CPU stress saturating all cores (for bench-trace)."""
+
+    def __init__(self, n_cpus):
+        self.procs = []
+        self.n = n_cpus
+
+    def start(self):
+        script = (
+            "import hashlib\n"
+            "d = b'stress' * 1000\n"
+            "while True:\n"
+            "    d = hashlib.sha256(d).digest()\n"
+        )
+        for _ in range(self.n):
+            p = subprocess.Popen(
+                [sys.executable, "-c", script],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            self.procs.append(p)
+
+    def stop(self):
+        for p in self.procs:
+            p.kill()
+        for p in self.procs:
+            p.wait()
+        self.procs.clear()
+
+
+class _LatencyProbe:
+    """Wakeup latency via sleep/wake cycles (for bench-trace)."""
+
+    def __init__(self, duration_secs):
+        self.duration = duration_secs
+        self.proc = None
+
+    def start(self):
+        script = (
+            f"import time, sys\n"
+            f"end = time.monotonic() + {self.duration}\n"
+            "while time.monotonic() < end:\n"
+            "    t0 = time.monotonic()\n"
+            "    time.sleep(0.001)\n"
+            "    lat = (time.monotonic() - t0 - 0.001) * 1e6\n"
+            "    if lat > 0:\n"
+            "        print(f'{lat:.0f}', flush=True)\n"
+        )
+        self.proc = subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        )
+
+    def collect(self) -> list[float]:
+        if self.proc is None:
+            return []
+        out, _ = self.proc.communicate(timeout=self.duration + 10)
+        return [float(x) for x in out.strip().splitlines() if x.strip()]
+
+
+class _LongRunners:
+    """Persistent CPU-bound processes that count work iterations (for bench-trace)."""
+
+    def __init__(self, count):
+        self.count = count
+        self.procs = []
+
+    def start(self, duration_secs):
+        script = (
+            f"import hashlib, time, sys\n"
+            f"end = time.monotonic() + {duration_secs}\n"
+            "iters = 0\n"
+            "d = b'longrun' * 1000\n"
+            "while time.monotonic() < end:\n"
+            "    for _ in range(100):\n"
+            "        d = hashlib.sha256(d).digest()\n"
+            "    iters += 100\n"
+            "print(iters, flush=True)\n"
+        )
+        for _ in range(self.count):
+            p = subprocess.Popen(
+                [sys.executable, "-c", script],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            )
+            self.procs.append(p)
+
+    def collect(self, timeout=60) -> list[int]:
+        results = []
+        for p in self.procs:
+            try:
+                out, _ = p.communicate(timeout=timeout)
+                results.append(int(out.strip()))
+            except (subprocess.TimeoutExpired, ValueError):
+                p.kill()
+                results.append(0)
+        self.procs.clear()
+        return results
+
+
+def _burst_processes(count):
+    """Spawn count short-lived CPU-bound processes."""
+    script = (
+        "import hashlib\n"
+        "d = b'burst' * 1000\n"
+        "for _ in range(2000):\n"
+        "    d = hashlib.sha256(d).digest()\n"
+    )
+    procs = []
+    for _ in range(count):
+        p = subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        procs.append(p)
+    return procs
+
+
+# BENCH-TRACE PHASES
+
+def _trace_phase_latency(nr_cpus, dmesg, sched_alive_fn, duration=15):
+    log_info(f"PHASE: latency ({duration}s)")
+    probe = _LatencyProbe(duration)
+    probe.start()
+    samples = probe.collect()
+    if samples:
+        p99 = percentile(samples, 99)
+        log_info(f"  latency: {len(samples)} samples, P99={p99:.0f}us")
+    if dmesg.check():
+        return False
+    return sched_alive_fn()
+
+
+def _trace_phase_burst(nr_cpus, dmesg, sched_alive_fn):
+    burst_size = nr_cpus * 4
+    log_info(f"PHASE: burst (size={burst_size})")
+    probe_base = _LatencyProbe(5)
+    probe_base.start()
+    probe_base.collect()
+    if dmesg.check() or not sched_alive_fn():
+        return False
+    burst_procs = _burst_processes(burst_size)
+    probe_burst = _LatencyProbe(10)
+    probe_burst.start()
+    burst_samples = probe_burst.collect()
+    for p in burst_procs:
+        try:
+            p.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            p.kill()
+    if dmesg.check() or not sched_alive_fn():
+        return False
+    probe_recv = _LatencyProbe(5)
+    probe_recv.start()
+    recv_samples = probe_recv.collect()
+    bp99 = percentile(burst_samples, 99) if burst_samples else 0
+    rp99 = percentile(recv_samples, 99) if recv_samples else 0
+    log_info(f"  burst P99={bp99:.0f}us, recovery P99={rp99:.0f}us")
+    if dmesg.check():
+        return False
+    return sched_alive_fn()
+
+
+def _trace_phase_longrun(nr_cpus, dmesg, sched_alive_fn, duration=20):
+    n_runners = max(2, nr_cpus // 2)
+    log_info(f"PHASE: longrun ({n_runners} runners, {duration}s)")
+    runners = _LongRunners(n_runners)
+    runners.start(duration)
+    probe = _LatencyProbe(duration)
+    probe.start()
+    samples = probe.collect()
+    work = runners.collect(timeout=duration + 15)
+    p99 = percentile(samples, 99) if samples else 0
+    min_work = min(work) if work else 0
+    log_info(f"  longrun P99={p99:.0f}us, min_work={min_work}")
+    if dmesg.check():
+        return False
+    return sched_alive_fn()
+
+
+def _trace_phase_mixed(nr_cpus, dmesg, sched_alive_fn, duration=30):
+    n_runners = max(2, nr_cpus // 2)
+    burst_size = nr_cpus * 4
+    log_info(f"PHASE: mixed ({n_runners} runners + {burst_size} burst, {duration}s)")
+    runners = _LongRunners(n_runners)
+    runners.start(duration)
+    probe = _LatencyProbe(duration)
+    probe.start()
+    time.sleep(5)
+    if dmesg.check() or not sched_alive_fn():
+        runners.collect(timeout=5)
+        return False
+    burst_procs = _burst_processes(burst_size)
+    samples = probe.collect()
+    work = runners.collect(timeout=duration + 15)
+    for p in burst_procs:
+        try:
+            p.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            p.kill()
+    p99 = percentile(samples, 99) if samples else 0
+    min_work = min(work) if work else 0
+    log_info(f"  mixed P99={p99:.0f}us, min_work={min_work}")
+    if dmesg.check():
+        return False
+    return sched_alive_fn()
+
+
+def _trace_phase_deadline(nr_cpus, dmesg, sched_alive_fn, duration=15):
+    log_info(f"PHASE: deadline ({duration}s)")
+    script = (
+        f"import time, sys\n"
+        f"target_ns = 16_666_667\n"
+        f"misses = 0\n"
+        f"total = 0\n"
+        f"end = time.monotonic() + {duration}\n"
+        "while time.monotonic() < end:\n"
+        "    t0 = time.monotonic()\n"
+        "    time.sleep(target_ns / 1e9)\n"
+        "    actual = (time.monotonic() - t0) * 1e9\n"
+        "    jitter = actual - target_ns\n"
+        "    total += 1\n"
+        "    if jitter > 500_000:\n"
+        "        misses += 1\n"
+        "print(f'{misses}/{total}', flush=True)\n"
+    )
+    p = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+    )
+    try:
+        out, _ = p.communicate(timeout=duration + 10)
+        log_info(f"  deadline: {out.strip()}")
+    except subprocess.TimeoutExpired:
+        p.kill()
+    if dmesg.check():
+        return False
+    return sched_alive_fn()
+
+
+def _trace_phase_ipc(nr_cpus, dmesg, sched_alive_fn):
+    n_pairs = max(2, nr_cpus // 2)
+    rounds = 10000
+    log_info(f"PHASE: ipc ({n_pairs} pairs, {rounds} rounds)")
+    script = (
+        "import os, time, sys\n"
+        "r1, w1 = os.pipe()\n"
+        "r2, w2 = os.pipe()\n"
+        "pid = os.fork()\n"
+        "if pid == 0:\n"
+        f"    for _ in range({rounds}):\n"
+        "        os.read(r1, 1)\n"
+        "        os.write(w2, b'x')\n"
+        "    os._exit(0)\n"
+        "else:\n"
+        "    t0 = time.monotonic()\n"
+        f"    for _ in range({rounds}):\n"
+        "        os.write(w1, b'x')\n"
+        "        os.read(r2, 1)\n"
+        "    elapsed = time.monotonic() - t0\n"
+        "    os.waitpid(pid, 0)\n"
+        f"    rtt = elapsed / {rounds} * 1e6\n"
+        "    print(f'{rtt:.1f}', flush=True)\n"
+    )
+    procs = []
+    for _ in range(n_pairs):
+        p = subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        )
+        procs.append(p)
+    rtts = []
+    for p in procs:
+        try:
+            out, _ = p.communicate(timeout=30)
+            rtts.append(float(out.strip()))
+        except (subprocess.TimeoutExpired, ValueError):
+            p.kill()
+    if rtts:
+        log_info(f"  ipc: median={sorted(rtts)[len(rtts)//2]:.1f}us")
+    if dmesg.check():
+        return False
+    return sched_alive_fn()
+
+
+def _trace_phase_launch(nr_cpus, dmesg, sched_alive_fn, count=100):
+    log_info(f"PHASE: launch ({count} launches)")
+    times = []
+    for _ in range(count):
+        t0 = time.monotonic()
+        subprocess.run(["/usr/bin/true"], capture_output=True)
+        times.append((time.monotonic() - t0) * 1e6)
+    if times:
+        p99 = percentile(times, 99)
+        log_info(f"  launch P99={p99:.0f}us")
+    if dmesg.check():
+        return False
+    return sched_alive_fn()
+
+
+# BENCH-TRACE COMMAND
+
+def _trace_start_scheduler(nr_cpus=None):
+    """Start PANDEMONIUM with stale detection and settle verification."""
+    try:
+        stale = SCX_OPS.read_text().strip()
+        if stale:
+            log_warn(f"Stale scheduler detected: '{stale}', waiting for cleanup...")
+            if not wait_for_no_scheduler(timeout=15):
+                log_error("stale scheduler did not unregister")
+                return None
+            log_info("Stale scheduler cleared")
+    except (FileNotFoundError, PermissionError):
+        pass
+
+    cmd = ["sudo", str(BINARY), "--verbose"]
+    if nr_cpus is not None:
+        cmd.extend(["--nr-cpus", str(nr_cpus)])
+    log_info(f"Starting: {' '.join(cmd)}")
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        preexec_fn=os.setpgrp,
+        text=True,
+    )
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            err = proc.stderr.read() if proc.stderr else ""
+            log_error(f"scheduler exited early (code {proc.returncode})")
+            for line in err.strip().splitlines()[-5:]:
+                log_error(f"  stderr: {line.rstrip()}")
+            return None
+        try:
+            name = SCX_OPS.read_text().strip()
+            if name == "pandemonium":
+                log_info("Scheduler activated")
+                time.sleep(2.0)
+                if proc.poll() is not None:
+                    err = proc.stderr.read() if proc.stderr else ""
+                    log_error(f"scheduler died during settle (code {proc.returncode})")
+                    for line in err.strip().splitlines()[-5:]:
+                        log_error(f"  stderr: {line.rstrip()}")
+                    return None
+                return proc
+        except (FileNotFoundError, PermissionError):
+            pass
+        time.sleep(0.1)
+    log_error("scheduler did not activate within 10s")
+    return None
+
+
+def _trace_stop_scheduler(proc):
+    if proc is None:
+        return
+    if proc.poll() is not None:
+        log_warn(f"Scheduler already exited (code {proc.returncode})")
+        measure_struct_ops_cleanup()
+        return
+    try:
+        pgid = os.getpgid(proc.pid)
+        os.killpg(pgid, signal.SIGINT)
+    except (ProcessLookupError, PermissionError):
+        return
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            measure_struct_ops_cleanup()
+            return
+        time.sleep(0.1)
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    proc.wait()
+    measure_struct_ops_cleanup()
+
+
+def _trace_run_iteration(iteration, total, nr_cpus):
+    """Run one full workload iteration. Returns True if scheduler survived."""
+    dmesg = DmesgMonitor()
+
+    label = f"[{iteration}/{total}] " if total > 1 else ""
+    log_info(f"{label}Starting scheduler")
+
+    sched_proc = _trace_start_scheduler(nr_cpus=nr_cpus)
+    if sched_proc is None:
+        return False
+
+    def sched_alive():
+        return sched_proc is not None and sched_proc.poll() is None
+
+    log_info(f"{label}Starting workload sequence at {nr_cpus}C")
+    stress = _StressWorkers(nr_cpus)
+    stress.start()
+    time.sleep(2)
+
+    phases = [
+        ("latency",  lambda: _trace_phase_latency(nr_cpus, dmesg, sched_alive)),
+        ("burst",    lambda: _trace_phase_burst(nr_cpus, dmesg, sched_alive)),
+        ("longrun",  lambda: _trace_phase_longrun(nr_cpus, dmesg, sched_alive)),
+        ("mixed",    lambda: _trace_phase_mixed(nr_cpus, dmesg, sched_alive)),
+        ("deadline", lambda: _trace_phase_deadline(nr_cpus, dmesg, sched_alive)),
+        ("ipc",      lambda: _trace_phase_ipc(nr_cpus, dmesg, sched_alive)),
+        ("launch",   lambda: _trace_phase_launch(nr_cpus, dmesg, sched_alive)),
+    ]
+
+    crashed = False
+    for name, fn in phases:
+        alive = fn()
+        if not alive:
+            crashed = True
+            if dmesg.crashed:
+                log_error(f"{label}CRASH DETECTED during '{name}': {dmesg.crash_msg}")
+            else:
+                log_error(f"{label}Scheduler died during '{name}' (no dmesg crash)")
+            break
+        log_info(f"  '{name}' passed, scheduler alive")
+    else:
+        log_info(f"{label}ALL PHASES COMPLETE -- scheduler survived")
+
+    stress.stop()
+    _trace_stop_scheduler(sched_proc)
+    dmesg.save()
+
+    return not crashed
+
+
+def cmd_bench_trace(args) -> int:
+    """Crash-detection stress test with trace capture.
+
+    Iterates core counts, runs all 7 workload phases per core count,
+    live crash detection via DmesgMonitor between phases, TraceCapture
+    always active. Reports survived/crashed per core count.
+    """
+
+    subprocess.run(["sudo", "true"])
+
+    nuke_stale_build()
+
+    if not build():
+        return 1
+
+    max_cpus = os.cpu_count() or 2
+
+    if args.core_counts:
+        core_counts = [int(c.strip()) for c in args.core_counts.split(",")]
+        core_counts = [c for c in core_counts if 2 <= c <= max_cpus]
+        core_counts = sorted(set(core_counts))
+    else:
+        core_counts = compute_core_counts(max_cpus)
+
+    if not core_counts:
+        log_error(f"no valid core counts (host has {max_cpus} CPUs, minimum is 2)")
+        return 1
+
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    trace_path = LOG_DIR / f"trace-{stamp}.log"
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    ver = get_version()
+    git = get_git_info()
+    dirty = " (dirty)" if git["dirty"] else ""
+    log_info(f"bench-trace v{ver} [{git['commit']}{dirty}], "
+             f"core_counts={core_counts}, iterations={args.iterations}, "
+             f"host_cpus={max_cpus}")
+
+    trace = TraceCapture(trace_path)
+    results = {}
+
+    try:
+        trace_ok = trace.start()
+        if not trace_ok:
+            log_warn("trace capture unavailable, continuing with dmesg monitoring only")
+
+        for nr_cpus in core_counts:
+            log_info(f"[{nr_cpus}C] Restricting to {nr_cpus} cores")
+            if nr_cpus < max_cpus:
+                if not restrict_cpus(nr_cpus, max_cpus):
+                    log_error(f"[{nr_cpus}C] failed to offline CPUs, skipping")
+                    results[nr_cpus] = (0, args.iterations)
+                    restore_all_cpus(max_cpus)
+                    continue
+            time.sleep(1)
+
+            survived = 0
+            crashed = 0
+
+            for i in range(1, args.iterations + 1):
+                if args.iterations > 1:
+                    log_info(f"[{nr_cpus}C] ITERATION {i}/{args.iterations}")
+                ok = _trace_run_iteration(i, args.iterations, nr_cpus)
+                if ok:
+                    survived += 1
+                else:
+                    crashed += 1
+                if i < args.iterations:
+                    log_info("Settling 3s before next iteration...")
+                    time.sleep(3)
+
+            results[nr_cpus] = (survived, crashed)
+            log_info(f"[{nr_cpus}C] RESULTS: {survived}/{args.iterations} survived")
+
+            if nr_cpus < max_cpus:
+                restore_all_cpus(max_cpus)
+                time.sleep(1)
+
+    except KeyboardInterrupt:
+        log_info("Interrupted")
+    finally:
+        restore_all_cpus(max_cpus)
+        trace.stop()
+
+        total_survived = 0
+        total_crashed = 0
+        if results:
+            log_info("SUMMARY")
+            for nr_cpus in sorted(results.keys()):
+                s, c = results[nr_cpus]
+                total_survived += s
+                total_crashed += c
+                status = "PASS" if c == 0 else "FAIL"
+                log_info(f"  {nr_cpus:>3}C: {s}/{s+c} survived  {status}")
+            log_info(f"  TOTAL: {total_survived}/{total_survived+total_crashed}")
+
+        log_info(f"Trace events: {trace.count}")
+        log_info(f"Trace log:    {trace_path}")
+
+        if trace_path.exists():
+            lines = trace_path.read_text().splitlines()
+            if lines:
+                tail = lines[-20:]
+                log_info(f"Last {len(tail)} trace events:")
+                for line in tail:
+                    log_info(f"  {line.rstrip()}")
+
+    return 0 if total_crashed == 0 else 1
+
+
+# BENCH-CONTENTION PHASES
+
+def _contention_phase_regime_sweep(nr_cpus, dmesg, sched_alive_fn, duration=30):
+    """Force regime transitions under load: LIGHT -> HEAVY -> MIXED -> LIGHT, 3 cycles."""
+    cycles = 3
+    log_info(f"PHASE: regime-sweep ({cycles} cycles, {duration}s)")
+    per_phase = duration // (cycles * 3)
+
+    for cycle in range(1, cycles + 1):
+        if not sched_alive_fn():
+            return {"survived": False, "cycles": cycle - 1}
+
+        # LIGHT: IDLE
+        log_info(f"  cycle {cycle}/{cycles}: LIGHT ({per_phase}s idle)")
+        time.sleep(per_phase)
+        if dmesg.check():
+            return {"survived": False, "cycles": cycle - 1}
+
+        # HEAVY: SATURATE ALL CPUS
+        log_info(f"  cycle {cycle}/{cycles}: HEAVY ({per_phase}s saturated)")
+        stress = _StressWorkers(nr_cpus)
+        stress.start()
+        time.sleep(per_phase)
+        if dmesg.check() or not sched_alive_fn():
+            stress.stop()
+            return {"survived": False, "cycles": cycle - 1}
+
+        # MIXED: KILL HALF
+        half = max(1, nr_cpus // 2)
+        log_info(f"  cycle {cycle}/{cycles}: MIXED (kill {half}/{nr_cpus} stress)")
+        for p in stress.procs[:half]:
+            p.kill()
+            p.wait()
+        time.sleep(per_phase)
+        if dmesg.check() or not sched_alive_fn():
+            stress.stop()
+            return {"survived": False, "cycles": cycle - 1}
+
+        stress.stop()
+
+    log_info(f"  regime-sweep: {cycles} cycles complete, scheduler alive")
+    alive = sched_alive_fn()
+    return {"survived": alive, "cycles": cycles}
+
+
+def _contention_phase_deficit_storm(nr_cpus, dmesg, sched_alive_fn, duration=20):
+    """Saturate deficit counter: ncpu interactive + ncpu*2 batch."""
+    n_interactive = nr_cpus
+    n_batch = nr_cpus * 2
+    log_info(f"PHASE: deficit-storm ({n_interactive} interactive + {n_batch} batch, {duration}s)")
+
+    # BATCH: TIGHT CPU SPIN
+    batch_workers = _StressWorkers(n_batch)
+    batch_workers.start()
+
+    # INTERACTIVE: 1MS SLEEP CYCLES (HIGH WAKEUP RATE)
+    interactive_probe = _LatencyProbe(duration)
+    interactive_probe.start()
+
+    # ALSO SPAWN EXTRA INTERACTIVE THREADS FOR WAKE PRESSURE
+    extra_script = (
+        f"import time\n"
+        f"end = time.monotonic() + {duration}\n"
+        "while time.monotonic() < end:\n"
+        "    time.sleep(0.001)\n"
+    )
+    extras = []
+    for _ in range(n_interactive - 1):
+        p = subprocess.Popen(
+            [sys.executable, "-c", extra_script],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        extras.append(p)
+
+    samples = interactive_probe.collect()
+    batch_workers.stop()
+    for p in extras:
+        try:
+            p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            p.kill()
+
+    if dmesg.check():
+        return {"survived": False, "samples": 0}
+
+    result = {"survived": sched_alive_fn(), "samples": len(samples)}
+    if samples:
+        p99 = percentile(samples, 99)
+        med = percentile(samples, 50)
+        result["median_us"] = med
+        result["p99_us"] = p99
+        log_info(f"  deficit-storm: {len(samples)} samples, median={med:.0f}us P99={p99:.0f}us")
+    else:
+        log_info("  deficit-storm: no latency samples collected")
+
+    return result
+
+
+def _contention_phase_sojourn_pressure(nr_cpus, dmesg, sched_alive_fn, duration=15):
+    """Deep batch queuing to stress sojourn rescue."""
+    n_batch = nr_cpus * 4
+    log_info(f"PHASE: sojourn-pressure ({n_batch} batch, {duration}s)")
+
+    # PHASE A: PURE BATCH FLOOD (10S)
+    batch_duration = duration - 5
+    runners = _LongRunners(n_batch)
+    runners.start(batch_duration)
+    time.sleep(batch_duration - 5)
+
+    if dmesg.check() or not sched_alive_fn():
+        runners.collect(timeout=5)
+        return {"survived": False, "samples": 0}
+
+    # PHASE B: ADD 4 INTERACTIVE PROBES INTO THE BATCH FLOOD (5S)
+    log_info(f"  adding 4 interactive probes into batch flood")
+    probe = _LatencyProbe(5)
+    probe.start()
+    samples = probe.collect()
+    work = runners.collect(timeout=batch_duration + 10)
+
+    if dmesg.check():
+        return {"survived": False, "samples": 0}
+
+    min_work = min(work) if work else 0
+    max_work = max(work) if work else 0
+    result = {
+        "survived": sched_alive_fn(), "samples": len(samples),
+        "work_min": min_work, "work_max": max_work,
+    }
+    if samples:
+        p99 = percentile(samples, 99)
+        result["p99_us"] = p99
+        log_info(f"  sojourn-pressure: P99={p99:.0f}us, batch_work=[{min_work}..{max_work}]")
+    else:
+        log_info(f"  sojourn-pressure: no latency samples, batch_work=[{min_work}..{max_work}]")
+
+    return result
+
+
+def _contention_phase_longrun_interactive(nr_cpus, dmesg, sched_alive_fn, duration=20):
+    """Sustained long-runners + interactive probe. Triggers longrun_mode."""
+    n_runners = max(2, nr_cpus // 2)
+    log_info(f"PHASE: longrun-interactive ({n_runners} runners + probe, {duration}s)")
+
+    runners = _LongRunners(n_runners)
+    runners.start(duration)
+
+    # LET LONGRUN_MODE ACTIVATE (NEEDS >2S OF SUSTAINED BATCH)
+    time.sleep(3)
+    if dmesg.check() or not sched_alive_fn():
+        runners.collect(timeout=5)
+        return {"survived": False, "samples": 0}
+
+    # INTERACTIVE PROBE DURING LONGRUN MODE
+    probe_duration = duration - 5
+    probe = _LatencyProbe(probe_duration)
+    probe.start()
+    samples = probe.collect()
+    work = runners.collect(timeout=duration + 10)
+
+    if dmesg.check():
+        return {"survived": False, "samples": 0}
+
+    min_work = min(work) if work else 0
+    max_work = max(work) if work else 0
+    fairness = min_work / max_work if max_work > 0 else 0
+
+    result = {
+        "survived": sched_alive_fn(), "samples": len(samples),
+        "work_min": min_work, "work_max": max_work, "fairness": fairness,
+    }
+    if samples:
+        p99 = percentile(samples, 99)
+        med = percentile(samples, 50)
+        result["median_us"] = med
+        result["p99_us"] = p99
+        log_info(f"  longrun-interactive: median={med:.0f}us P99={p99:.0f}us "
+                 f"work=[{min_work}..{max_work}] fairness={fairness:.2f}")
+    else:
+        log_info(f"  longrun-interactive: no samples, work=[{min_work}..{max_work}]")
+
+    return result
+
+
+def _contention_phase_burst_recovery(nr_cpus, dmesg, sched_alive_fn):
+    """Burst with explicit recovery verification."""
+    burst_size = nr_cpus * 8
+    log_info(f"PHASE: burst-recovery ({burst_size} burst processes)")
+
+    # BASELINE (5S)
+    baseline_probe = _LatencyProbe(5)
+    baseline_probe.start()
+    baseline_samples = baseline_probe.collect()
+    if dmesg.check() or not sched_alive_fn():
+        return {"survived": False}
+
+    baseline_p99 = percentile(baseline_samples, 99) if baseline_samples else 0
+    log_info(f"  baseline: P99={baseline_p99:.0f}us ({len(baseline_samples)} samples)")
+
+    # FIRE BURST
+    log_info(f"  firing {burst_size} burst processes")
+    burst_procs = _burst_processes(burst_size)
+    burst_probe = _LatencyProbe(10)
+    burst_probe.start()
+    burst_samples = burst_probe.collect()
+    for p in burst_procs:
+        try:
+            p.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            p.kill()
+
+    if dmesg.check() or not sched_alive_fn():
+        return {"survived": False}
+
+    burst_p99 = percentile(burst_samples, 99) if burst_samples else 0
+    log_info(f"  burst: P99={burst_p99:.0f}us ({len(burst_samples)} samples)")
+
+    # RECOVERY (5S)
+    recovery_probe = _LatencyProbe(5)
+    recovery_probe.start()
+    recovery_samples = recovery_probe.collect()
+
+    if dmesg.check():
+        return {"survived": False}
+
+    recovery_p99 = percentile(recovery_samples, 99) if recovery_samples else 0
+    within_2x = recovery_p99 <= max(baseline_p99 * 2, 500)
+    log_info(f"  recovery: P99={recovery_p99:.0f}us "
+             f"(baseline*2={baseline_p99*2:.0f}us) {'OK' if within_2x else 'ELEVATED'}")
+
+    return {
+        "survived": sched_alive_fn(),
+        "baseline_p99_us": baseline_p99, "baseline_samples": len(baseline_samples),
+        "burst_p99_us": burst_p99, "burst_samples": len(burst_samples),
+        "recovery_p99_us": recovery_p99, "recovery_samples": len(recovery_samples),
+        "recovery_within_2x": within_2x,
+    }
+
+
+def _contention_phase_mixed_storm(nr_cpus, dmesg, sched_alive_fn, duration=30):
+    """Everything at once: long-runners + burst + interactive + deadline."""
+    n_runners = max(2, nr_cpus // 2)
+    burst_size = nr_cpus * 4
+    n_interactive = nr_cpus
+    log_info(f"PHASE: mixed-storm ({n_runners} longrun + {burst_size} burst + "
+             f"{n_interactive} interactive + deadline, {duration}s)")
+
+    # LONG-RUNNERS (FULL DURATION)
+    runners = _LongRunners(n_runners)
+    runners.start(duration)
+
+    # INTERACTIVE PROBES
+    probe = _LatencyProbe(duration)
+    probe.start()
+
+    # EXTRA INTERACTIVE THREADS
+    extra_script = (
+        f"import time\n"
+        f"end = time.monotonic() + {duration}\n"
+        "while time.monotonic() < end:\n"
+        "    time.sleep(0.001)\n"
+    )
+    extras = []
+    for _ in range(n_interactive - 1):
+        p = subprocess.Popen(
+            [sys.executable, "-c", extra_script],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        extras.append(p)
+
+    # DEADLINE THREAD (16.6MS FRAME TARGET)
+    deadline_script = (
+        f"import time, sys\n"
+        f"target_ns = 16_666_667\n"
+        f"misses = 0\n"
+        f"total = 0\n"
+        f"end = time.monotonic() + {duration}\n"
+        "while time.monotonic() < end:\n"
+        "    t0 = time.monotonic()\n"
+        "    time.sleep(target_ns / 1e9)\n"
+        "    actual = (time.monotonic() - t0) * 1e9\n"
+        "    jitter = actual - target_ns\n"
+        "    total += 1\n"
+        "    if jitter > 500_000:\n"
+        "        misses += 1\n"
+        "print(f'{misses}/{total}', flush=True)\n"
+    )
+    deadline_proc = subprocess.Popen(
+        [sys.executable, "-c", deadline_script],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+    )
+
+    # WAIT 5S, THEN FIRE BURST INTO THE STORM
+    time.sleep(5)
+    if dmesg.check() or not sched_alive_fn():
+        runners.collect(timeout=5)
+        for p in extras:
+            p.kill()
+        deadline_proc.kill()
+        return {"survived": False}
+
+    log_info(f"  firing {burst_size} burst into storm")
+    burst_procs = _burst_processes(burst_size)
+
+    # WAIT FOR REMAINING DURATION
+    time.sleep(max(1, duration - 10))
+
+    # COLLECT EVERYTHING
+    samples = probe.collect()
+    work = runners.collect(timeout=duration + 15)
+    for p in burst_procs:
+        try:
+            p.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            p.kill()
+    for p in extras:
+        try:
+            p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            p.kill()
+
+    deadline_out = ""
+    try:
+        deadline_out, _ = deadline_proc.communicate(timeout=duration + 10)
+    except subprocess.TimeoutExpired:
+        deadline_proc.kill()
+
+    if dmesg.check():
+        return {"survived": False}
+
+    # REPORT
+    min_work = min(work) if work else 0
+    max_work = max(work) if work else 0
+    result = {
+        "survived": sched_alive_fn(), "samples": len(samples),
+        "work_min": min_work, "work_max": max_work,
+    }
+    if samples:
+        p99 = percentile(samples, 99)
+        med = percentile(samples, 50)
+        result["median_us"] = med
+        result["p99_us"] = p99
+        log_info(f"  mixed-storm: median={med:.0f}us P99={p99:.0f}us "
+                 f"work=[{min_work}..{max_work}]")
+    else:
+        log_info(f"  mixed-storm: no samples, work=[{min_work}..{max_work}]")
+
+    if deadline_out.strip():
+        log_info(f"  deadline: {deadline_out.strip()}")
+        try:
+            parts = deadline_out.strip().split("/")
+            result["deadline_misses"] = int(parts[0])
+            result["deadline_total"] = int(parts[1])
+            if int(parts[1]) > 0:
+                result["deadline_miss_ratio"] = int(parts[0]) / int(parts[1])
+        except (ValueError, IndexError):
+            pass
+
+    return result
+
+
+# BENCH-CONTENTION ORCHESTRATOR
+
+def _contention_run_iteration(iteration, total, nr_cpus):
+    """Run one full contention iteration. Returns (survived: bool, phase_results: dict)."""
+    dmesg = DmesgMonitor()
+    phase_results = {}
+
+    label = f"[{iteration}/{total}] " if total > 1 else ""
+    log_info(f"{label}Starting scheduler")
+
+    sched_proc = _trace_start_scheduler(nr_cpus=nr_cpus)
+    if sched_proc is None:
+        return False, phase_results
+
+    def sched_alive():
+        return sched_proc is not None and sched_proc.poll() is None
+
+    log_info(f"{label}Starting contention sequence at {nr_cpus}C")
+
+    phases = [
+        ("regime-sweep",        lambda: _contention_phase_regime_sweep(nr_cpus, dmesg, sched_alive)),
+        ("deficit-storm",       lambda: _contention_phase_deficit_storm(nr_cpus, dmesg, sched_alive)),
+        ("sojourn-pressure",    lambda: _contention_phase_sojourn_pressure(nr_cpus, dmesg, sched_alive)),
+        ("longrun-interactive", lambda: _contention_phase_longrun_interactive(nr_cpus, dmesg, sched_alive)),
+        ("burst-recovery",      lambda: _contention_phase_burst_recovery(nr_cpus, dmesg, sched_alive)),
+        ("mixed-storm",         lambda: _contention_phase_mixed_storm(nr_cpus, dmesg, sched_alive)),
+    ]
+
+    crashed = False
+    for name, fn in phases:
+        result = fn()
+        phase_results[name] = result
+        if not result.get("survived", False):
+            crashed = True
+            if dmesg.crashed:
+                log_error(f"{label}CRASH DETECTED during '{name}': {dmesg.crash_msg}")
+            else:
+                log_error(f"{label}Scheduler died during '{name}' (no dmesg crash)")
+            break
+        log_info(f"  '{name}' passed, scheduler alive")
+    else:
+        log_info(f"{label}ALL PHASES COMPLETE -- scheduler survived")
+
+    _trace_stop_scheduler(sched_proc)
+    dmesg.save()
+
+    return not crashed, phase_results
+
+
+def _write_contention_prometheus(version, git, stamp, max_cpus, iterations,
+                                  core_counts, results, all_phase_data) -> Path:
+    """Write Prometheus exposition format (.prom) for bench-contention."""
+    lines = []
+    emitted = set()
+
+    def gauge(name, help_text, value, labels=None):
+        if name not in emitted:
+            lines.append(f"# HELP {name} {help_text}")
+            lines.append(f"# TYPE {name} gauge")
+            emitted.add(name)
+        if labels:
+            label_str = ",".join(f'{k}="{v}"' for k, v in labels.items())
+            lines.append(f"{name}{{{label_str}}} {value}")
+        else:
+            lines.append(f"{name} {value}")
+
+    dirty = "true" if git["dirty"] else "false"
+    gauge("pandemonium_contention_info", "Build and run metadata", 1,
+          {"version": version, "git_commit": git["commit"], "git_dirty": dirty})
+    gauge("pandemonium_contention_timestamp_seconds", "Test start time",
+          int(datetime.strptime(stamp, "%Y%m%d-%H%M%S").timestamp()))
+    gauge("pandemonium_contention_iterations", "Iterations per core count", iterations)
+    gauge("pandemonium_contention_max_cpus", "Maximum CPUs available", max_cpus)
+
+    for nr_cpus in sorted(results.keys()):
+        s, c = results[nr_cpus]
+        cl = {"cores": str(nr_cpus)}
+        gauge("pandemonium_contention_survived", "Iterations survived", s, cl)
+        gauge("pandemonium_contention_crashed", "Iterations crashed", c, cl)
+
+        phases = all_phase_data.get(nr_cpus, {})
+        for phase_name, pd in phases.items():
+            pl = {"cores": str(nr_cpus), "phase": phase_name}
+            survived = 1 if pd.get("survived") else 0
+            gauge("pandemonium_contention_phase_survived",
+                  "Phase survived (1=OK, 0=CRASH)", survived, pl)
+
+            if "samples" in pd:
+                gauge("pandemonium_contention_phase_samples",
+                      "Latency samples collected", pd["samples"], pl)
+            if "p99_us" in pd:
+                gauge("pandemonium_contention_phase_p99_us",
+                      "P99 wakeup latency", pd["p99_us"], pl)
+            if "median_us" in pd:
+                gauge("pandemonium_contention_phase_median_us",
+                      "Median wakeup latency", pd["median_us"], pl)
+            if "work_min" in pd:
+                gauge("pandemonium_contention_phase_work_min",
+                      "Minimum work by any worker", pd["work_min"], pl)
+            if "work_max" in pd:
+                gauge("pandemonium_contention_phase_work_max",
+                      "Maximum work by any worker", pd["work_max"], pl)
+            if "fairness" in pd:
+                gauge("pandemonium_contention_phase_fairness",
+                      "Work fairness ratio (min/max)", f"{pd['fairness']:.4f}", pl)
+            if "baseline_p99_us" in pd:
+                gauge("pandemonium_contention_phase_baseline_p99_us",
+                      "Baseline P99 before burst", pd["baseline_p99_us"], pl)
+            if "burst_p99_us" in pd:
+                gauge("pandemonium_contention_phase_burst_p99_us",
+                      "P99 during burst", pd["burst_p99_us"], pl)
+            if "recovery_p99_us" in pd:
+                gauge("pandemonium_contention_phase_recovery_p99_us",
+                      "P99 during post-burst recovery", pd["recovery_p99_us"], pl)
+            if "recovery_within_2x" in pd:
+                gauge("pandemonium_contention_phase_recovery_ok",
+                      "Recovery within 2x baseline (1=OK, 0=ELEVATED)",
+                      1 if pd["recovery_within_2x"] else 0, pl)
+            if "deadline_misses" in pd:
+                gauge("pandemonium_contention_phase_deadline_misses",
+                      "Frame deadline misses", pd["deadline_misses"], pl)
+            if "deadline_total" in pd:
+                gauge("pandemonium_contention_phase_deadline_total",
+                      "Total frame cycles", pd["deadline_total"], pl)
+            if "deadline_miss_ratio" in pd:
+                gauge("pandemonium_contention_phase_deadline_miss_ratio",
+                      "Fraction of frames missed", f"{pd['deadline_miss_ratio']:.4f}", pl)
+
+    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    path = ARCHIVE_DIR / f"contention-{version}-{stamp}.prom"
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def cmd_bench_contention(args) -> int:
+    """Contention stress test targeting v5.4.x adaptive features.
+
+    6 phases per core count: regime-sweep, deficit-storm, sojourn-pressure,
+    longrun-interactive, burst-recovery, mixed-storm. Each phase targets
+    a specific adaptive mechanism.
+    """
+
+    subprocess.run(["sudo", "true"])
+
+    nuke_stale_build()
+
+    if not build():
+        return 1
+
+    max_cpus = os.cpu_count() or 2
+
+    if args.core_counts:
+        core_counts = [int(c.strip()) for c in args.core_counts.split(",")]
+        core_counts = [c for c in core_counts if 2 <= c <= max_cpus]
+        core_counts = sorted(set(core_counts))
+    else:
+        core_counts = compute_core_counts(max_cpus)
+
+    if not core_counts:
+        log_error(f"no valid core counts (host has {max_cpus} CPUs, minimum is 2)")
+        return 1
+
+    # FILTER PHASES IF --phase SPECIFIED
+    phase_filter = getattr(args, "phase", None)
+
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    ver = get_version()
+    git = get_git_info()
+    dirty = " (dirty)" if git["dirty"] else ""
+    log_info(f"bench-contention v{ver} [{git['commit']}{dirty}], "
+             f"core_counts={core_counts}, iterations={args.iterations}, "
+             f"host_cpus={max_cpus}")
+    if phase_filter:
+        log_info(f"Phase filter: {phase_filter}")
+    print()
+
+    results = {}
+    all_phase_data = {}
+    total_survived = 0
+    total_crashed = 0
+
+    try:
+        for nr_cpus in core_counts:
+            log_info(f"[{nr_cpus}C] Restricting to {nr_cpus} cores")
+            if nr_cpus < max_cpus:
+                if not restrict_cpus(nr_cpus, max_cpus):
+                    log_error(f"[{nr_cpus}C] failed to offline CPUs, skipping")
+                    results[nr_cpus] = (0, args.iterations)
+                    restore_all_cpus(max_cpus)
+                    continue
+            time.sleep(1)
+
+            survived = 0
+            crashed = 0
+            core_phases = {}
+
+            for i in range(1, args.iterations + 1):
+                if args.iterations > 1:
+                    log_info(f"[{nr_cpus}C] ITERATION {i}/{args.iterations}")
+                ok, phase_results = _contention_run_iteration(i, args.iterations, nr_cpus)
+                if ok:
+                    survived += 1
+                else:
+                    crashed += 1
+                # KEEP LAST ITERATION'S PHASE DATA FOR THIS CORE COUNT
+                core_phases = phase_results
+                if i < args.iterations:
+                    log_info("Settling 3s before next iteration...")
+                    time.sleep(3)
+
+            results[nr_cpus] = (survived, crashed)
+            all_phase_data[nr_cpus] = core_phases
+            log_info(f"[{nr_cpus}C] RESULTS: {survived}/{args.iterations} survived")
+
+            if nr_cpus < max_cpus:
+                restore_all_cpus(max_cpus)
+                time.sleep(1)
+
+    except KeyboardInterrupt:
+        log_info("Interrupted")
+    finally:
+        restore_all_cpus(max_cpus)
+
+        if results:
+            print()
+            log_info("SUMMARY")
+            for nr_cpus in sorted(results.keys()):
+                s, c = results[nr_cpus]
+                total_survived += s
+                total_crashed += c
+                status = "PASS" if c == 0 else "FAIL"
+                log_info(f"  {nr_cpus:>3}C: {s}/{s+c} survived  {status}")
+            log_info(f"  TOTAL: {total_survived}/{total_survived+total_crashed}")
+
+        # WRITE PROMETHEUS .prom
+        prom_path = _write_contention_prometheus(
+            ver, git, stamp, max_cpus, args.iterations,
+            core_counts, results, all_phase_data,
+        )
+        log_info(f"Prometheus: {prom_path}")
+
+        # WRITE HUMAN-READABLE .log
+        report_path = LOG_DIR / f"bench-contention-{stamp}.log"
+        report_lines = [f"bench-contention v{ver} [{git['commit']}]",
+                        f"cores: {core_counts}  iterations: {args.iterations}  host: {max_cpus}C",
+                        ""]
+        for nr_cpus in sorted(results.keys()):
+            s, c = results[nr_cpus]
+            status = "PASS" if c == 0 else "FAIL"
+            report_lines.append(f"{nr_cpus:>3}C: {s}/{s+c} survived  {status}")
+            phases = all_phase_data.get(nr_cpus, {})
+            for phase_name, pd in phases.items():
+                surv = "OK" if pd.get("survived") else "CRASH"
+                extras = []
+                if "p99_us" in pd:
+                    extras.append(f"P99={pd['p99_us']:.0f}us")
+                if "median_us" in pd:
+                    extras.append(f"med={pd['median_us']:.0f}us")
+                if "samples" in pd:
+                    extras.append(f"n={pd['samples']}")
+                if "work_min" in pd:
+                    extras.append(f"work=[{pd['work_min']}..{pd.get('work_max', 0)}]")
+                if "fairness" in pd:
+                    extras.append(f"fair={pd['fairness']:.2f}")
+                if "baseline_p99_us" in pd:
+                    extras.append(f"base={pd['baseline_p99_us']:.0f}us")
+                    extras.append(f"burst={pd.get('burst_p99_us', 0):.0f}us")
+                    extras.append(f"recov={pd.get('recovery_p99_us', 0):.0f}us")
+                if "deadline_misses" in pd:
+                    extras.append(f"dl={pd['deadline_misses']}/{pd['deadline_total']}")
+                detail = "  ".join(extras)
+                report_lines.append(f"    {phase_name}: {surv}  {detail}")
+        report_lines.append("")
+        report_lines.append(f"TOTAL: {total_survived}/{total_survived+total_crashed}")
+        report = "\n".join(report_lines) + "\n"
+        report_path.write_text(report)
+        log_info(f"Report: {report_path}")
+
+    return 0 if total_crashed == 0 else 1
+
+
+# BENCH-CS2: AUTOMATED GAME WORKLOAD DIAGNOSIS
+
+CS2_CAPTURE_S = 120     # DEFAULT CAPTURE DURATION
+CS2_LAUNCH_TIMEOUT = 120  # MAX WAIT FOR CS2 PROCESS TO APPEAR
+GAP_THRESH_MS = 50      # SCHEDULING GAPS ABOVE THIS ARE FLAGGED (1 FRAME @ 20FPS)
+
+
+def _find_process(name: str) -> int | None:
+    """Find PID of a running process by name. Returns None if not found."""
+    try:
+        r = subprocess.run(["pgrep", "-x", name],
+                           capture_output=True, text=True)
+        if r.returncode == 0:
+            pids = r.stdout.strip().splitlines()
+            return int(pids[0]) if pids else None
+    except (ValueError, FileNotFoundError):
+        pass
+    return None
+
+
+def _wait_for_process(name: str, timeout: float) -> int | None:
+    """Poll until process appears. Returns PID or None on timeout."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        pid = _find_process(name)
+        if pid is not None:
+            return pid
+        time.sleep(0.5)
+    return None
+
+
+def _kill_process(name: str):
+    """Gracefully kill a process by name (SIGTERM, then SIGKILL)."""
+    pid = _find_process(name)
+    if pid is None:
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if _find_process(name) is None:
+            return
+        time.sleep(0.2)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def _cs2_parse_trace(trace_path: Path) -> dict:
+    """Parse a trace log into structured event data."""
+    events = []       # (timestamp_s, event_type, raw_line)
+    type_counts = {}  # event_type -> count
+
+    if not trace_path.exists():
+        return {"events": events, "type_counts": type_counts}
+
+    # trace_pipe: "<task>-<pid> [<cpu>] <flags> <timestamp>: ... PAND: <type> <rest>"
+    ts_pattern = re.compile(r"\s+([\d.]+):\s+.*PAND:\s+(.+)")
+
+    for line in trace_path.read_text().splitlines():
+        m = ts_pattern.search(line)
+        if m:
+            ts = float(m.group(1))
+            msg = m.group(2).strip()
+            # Full event type: "enq tier1 cpu=3" -> "enq tier1"
+            parts = msg.split()
+            if len(parts) >= 2 and parts[0] == "enq":
+                etype = f"{parts[0]} {parts[1]}"
+            else:
+                etype = parts[0] if parts else msg
+            events.append((ts, etype, msg))
+            type_counts[etype] = type_counts.get(etype, 0) + 1
+
+    events.sort(key=lambda e: e[0])
+    return {"events": events, "type_counts": type_counts}
+
+
+def _cs2_write_prometheus(version, git, stamp, target, elapsed,
+                          trace_data, latency_samples, crashed,
+                          crash_msg) -> Path:
+    """Write Prometheus .prom for bench-cs2."""
+    lines = []
+    emitted = set()
+
+    def gauge(name, help_text, value, labels=None):
+        if name not in emitted:
+            lines.append(f"# HELP {name} {help_text}")
+            lines.append(f"# TYPE {name} gauge")
+            emitted.add(name)
+        if labels:
+            label_str = ",".join(f'{k}="{v}"' for k, v in labels.items())
+            lines.append(f"{name}{{{label_str}}} {value}")
+        else:
+            lines.append(f"{name} {value}")
+
+    dirty = "true" if git["dirty"] else "false"
+    gauge("pandemonium_cs2_info", "Build and run metadata", 1,
+          {"version": version, "git_commit": git["commit"],
+           "git_dirty": dirty, "target": target})
+    gauge("pandemonium_cs2_timestamp_seconds", "Test start time",
+          int(time.time()))
+    gauge("pandemonium_cs2_elapsed_seconds", "Total capture duration",
+          f"{elapsed:.1f}")
+    gauge("pandemonium_cs2_crashed", "Scheduler crashed (1=yes 0=no)",
+          1 if crashed else 0)
+
+    # Trace event counts
+    events = trace_data["events"]
+    type_counts = trace_data["type_counts"]
+    gauge("pandemonium_cs2_trace_total", "Total trace events", len(events))
+
+    for etype, count in sorted(type_counts.items()):
+        gauge("pandemonium_cs2_trace_by_type", "Trace events by type",
+              count, {"type": etype})
+
+    # Event rate
+    if len(events) >= 2:
+        t0 = events[0][0]
+        duration_s = events[-1][0] - t0
+        if duration_s > 0:
+            gauge("pandemonium_cs2_trace_rate_avg",
+                  "Average trace events per second",
+                  f"{len(events) / duration_s:.1f}")
+
+    # Gaps
+    gap_thresh = GAP_THRESH_MS / 1000.0
+    gaps = []
+    for i in range(1, len(events)):
+        dt = events[i][0] - events[i - 1][0]
+        if dt > gap_thresh:
+            gaps.append(dt)
+    gauge("pandemonium_cs2_gaps_total",
+          f"Scheduling gaps >{GAP_THRESH_MS}ms", len(gaps))
+    if gaps:
+        gauge("pandemonium_cs2_gap_max_ms", "Largest scheduling gap (ms)",
+              f"{max(gaps) * 1000:.1f}")
+        gauge("pandemonium_cs2_gap_median_ms", "Median scheduling gap (ms)",
+              f"{percentile(gaps, 50) * 1000:.1f}")
+
+    # Latency probe
+    if latency_samples:
+        p50 = percentile(latency_samples, 50)
+        p99 = percentile(latency_samples, 99)
+        worst = max(latency_samples)
+        gauge("pandemonium_cs2_latency_samples", "Wakeup latency samples",
+              len(latency_samples))
+        gauge("pandemonium_cs2_latency_p50_us", "Median wakeup latency (us)",
+              f"{p50:.0f}")
+        gauge("pandemonium_cs2_latency_p99_us", "P99 wakeup latency (us)",
+              f"{p99:.0f}")
+        gauge("pandemonium_cs2_latency_worst_us", "Worst wakeup latency (us)",
+              f"{worst:.0f}")
+
+    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    path = ARCHIVE_DIR / f"cs2-{version}-{stamp}.prom"
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def cmd_bench_cs2(args) -> int:
+    """Automated game workload diagnosis.
+
+    Patches BPF trace filter at build time, waits for the game to launch,
+    captures trace + latency data, produces Prometheus + human-readable output.
+    """
+    subprocess.run(["sudo", "true"])
+    nuke_stale_build()
+
+    target = args.target
+    capture_duration = args.duration or CS2_CAPTURE_S
+
+    # ---- PHASE 1: PATCH + BUILD + RESTORE ----
+
+    original = patch_bpf_trace_filter(target)
+    if original is None:
+        return 1
+    try:
+        ok = build(force=True)
+    finally:
+        restore_bpf_source(original)
+    if not ok:
+        return 1
+
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    ver = get_version()
+    git = get_git_info()
+    dirty = " (dirty)" if git["dirty"] else ""
+    log_info(f"bench-cs2 v{ver} [{git['commit']}{dirty}]  "
+             f"target='{target}'  capture={capture_duration}s")
+    print()
+
+    # ---- PHASE 2: START SCHEDULER + MONITORING ----
+
+    dmesg = DmesgMonitor()
+    trace_path = LOG_DIR / f"cs2-trace-{stamp}.log"
+    sched_proc = None
+    trace = None
+    probe = None
+    crashed = False
+    game_exited = False
+    total_elapsed = 0
+    latency_samples = []
+
+    try:
+        sched_proc = _trace_start_scheduler()
+        if sched_proc is None:
+            return 1
+
+        trace = TraceCapture(trace_path)
+        if not trace.start():
+            log_warn("Trace capture failed, continuing without trace data")
+
+        # ---- PHASE 3: WAIT FOR GAME ----
+
+        already_running = _find_process(target) is not None
+        if already_running:
+            log_info(f"'{target}' already running")
+        else:
+            print()
+            log_info(f">>> Please launch '{target}' now. <<<")
+            log_info(f"Waiting for '{target}' process "
+                     f"(timeout {CS2_LAUNCH_TIMEOUT}s)...")
+            print()
+
+        pid = _wait_for_process(target, CS2_LAUNCH_TIMEOUT)
+        if pid is None:
+            log_error(f"'{target}' did not appear "
+                      f"within {CS2_LAUNCH_TIMEOUT}s")
+            return 1
+        log_info(f"'{target}' detected (PID {pid})")
+
+        # ---- PHASE 4: CAPTURE (STARTS IMMEDIATELY) ----
+
+        log_info(f"CAPTURING: {capture_duration}s with latency probe")
+        probe = _LatencyProbe(capture_duration)
+        probe.start()
+
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < capture_duration:
+            time.sleep(2)
+            elapsed = time.monotonic() - t0
+
+            if dmesg.check():
+                log_error(f"SCHEDULER CRASH at {elapsed:.0f}s: "
+                          f"{dmesg.crash_msg}")
+                crashed = True
+                break
+
+            if sched_proc.poll() is not None:
+                log_error(f"Scheduler exited at {elapsed:.0f}s "
+                          f"(code {sched_proc.returncode})")
+                crashed = True
+                break
+
+            if _find_process(target) is None:
+                log_warn(f"'{target}' exited at {elapsed:.0f}s")
+                game_exited = True
+                break
+
+            log_info(f"  [{elapsed:.0f}s] events={trace.count}")
+
+        total_elapsed = time.monotonic() - t0
+
+    except KeyboardInterrupt:
+        log_info("Interrupted by user")
+    finally:
+        # ---- CLEANUP (ALWAYS RUNS) ----
+
+        log_info("Stopping...")
+
+        if probe and probe.proc and probe.proc.poll() is None:
+            probe.proc.kill()
+        if probe:
+            latency_samples = probe.collect()
+
+        if trace:
+            trace.stop()
+        _trace_stop_scheduler(sched_proc)
+
+        if _find_process(target):
+            log_info(f"Killing '{target}'")
+            _kill_process(target)
+
+        # ---- REPORT (ALWAYS RUNS) ----
+
+        print()
+        trace_data = _cs2_parse_trace(trace_path)
+        events = trace_data["events"]
+        type_counts = trace_data["type_counts"]
+
+        report_lines = []
+        report_lines.append(f"bench-cs2 v{ver} [{git['commit']}{dirty}]")
+        if crashed:
+            report_lines.append(
+                f"SCHEDULER CRASHED at {total_elapsed:.1f}s")
+            if dmesg.crash_msg:
+                report_lines.append(f"  dmesg: {dmesg.crash_msg}")
+        elif game_exited:
+            report_lines.append(f"GAME EXITED at {total_elapsed:.1f}s")
+        else:
+            report_lines.append(
+                f"Completed: {total_elapsed:.1f}s capture")
+        report_lines.append("")
+
+        report_lines.append(f"Trace events: {len(events)}")
+        for etype in sorted(type_counts, key=type_counts.get,
+                            reverse=True):
+            report_lines.append(
+                f"  {etype:30s} {type_counts[etype]:>8d}")
+        report_lines.append("")
+
+        if len(events) >= 2:
+            t_start = events[0][0]
+            t_end = events[-1][0]
+            duration_s = t_end - t_start
+            if duration_s > 0:
+                buckets = {}
+                for ts, _, _ in events:
+                    sec = int(ts - t_start)
+                    buckets[sec] = buckets.get(sec, 0) + 1
+                rates = list(buckets.values())
+                report_lines.append(
+                    f"Event rate: avg={len(events)/duration_s:.1f}/s  "
+                    f"min={min(rates)}/s  max={max(rates)}/s  "
+                    f"over {duration_s:.1f}s")
+                total_secs = int(duration_s) + 1
+                dead = total_secs - len(buckets)
+                if dead > 0:
+                    report_lines.append(
+                        f"Dead seconds (0 events): {dead}/{total_secs}")
+                report_lines.append("")
+
+        gap_thresh = GAP_THRESH_MS / 1000.0
+        gaps = []
+        if len(events) >= 2:
+            t_start = events[0][0]
+            for i in range(1, len(events)):
+                dt = events[i][0] - events[i - 1][0]
+                if dt > gap_thresh:
+                    gaps.append((events[i - 1][0] - t_start,
+                                 events[i][0] - t_start, dt))
+
+        if gaps:
+            report_lines.append(
+                f"GAPS (>{GAP_THRESH_MS}ms): {len(gaps)} detected")
+            for start, end, dt in gaps[:30]:
+                report_lines.append(
+                    f"  {start:8.3f}s .. {end:8.3f}s  "
+                    f"gap={dt*1000:.0f}ms")
+            if len(gaps) > 30:
+                report_lines.append(
+                    f"  ... and {len(gaps) - 30} more")
+        else:
+            report_lines.append(
+                f"No gaps >{GAP_THRESH_MS}ms detected.")
+        report_lines.append("")
+
+        if latency_samples:
+            p50 = percentile(latency_samples, 50)
+            p99 = percentile(latency_samples, 99)
+            worst = max(latency_samples)
+            report_lines.append(
+                f"Wakeup latency: n={len(latency_samples)}  "
+                f"med={p50:.0f}us  P99={p99:.0f}us  "
+                f"worst={worst:.0f}us")
+        else:
+            report_lines.append(
+                "Wakeup latency: no samples collected")
+        report_lines.append("")
+
+        for line in report_lines:
+            log_info(line)
+
+        report_path = LOG_DIR / f"bench-cs2-{stamp}.log"
+        report_path.write_text("\n".join(report_lines) + "\n")
+        log_info(f"Report: {report_path}")
+        log_info(f"Raw trace: {trace_path}")
+
+        prom_path = _cs2_write_prometheus(
+            ver, git, stamp, target, total_elapsed,
+            trace_data, latency_samples, crashed,
+            dmesg.crash_msg if crashed else "")
+        log_info(f"Prometheus: {prom_path}")
+
+        dmesg.save(stamp)
+
+        if crashed:
+            status = "CRASH"
+        elif game_exited:
+            status = "GAME EXITED"
+        else:
+            status = "PASS"
+        print()
+        log_info(f"RESULT: {status}")
+
+        fix_ownership()
+
+    return 1 if crashed else 0
+
+
 # MAIN
+
+# SCX CI COMPATIBILITY TEST
+
+# FAILURE PATTERNS FROM scx .github/include/scripts/test_sched
+# Scheduler output is scanned for these (case-insensitive).
+# Known false positives (Spectre, RETBleed) are excluded.
+SCX_CI_FAIL_PATTERNS = ["BUG:", "WARNING:"]
+SCX_CI_FAIL_ICASE = ["error", "stall", "timeout"]
+SCX_CI_FALSE_POSITIVES = [
+    "Speculative Return Stack Overflow",
+    "RETBleed",
+    "spectre",
+    "retbleed",
+    "mitigation",
+]
+
+
+def _scx_ci_check_output(text: str) -> list[str]:
+    """Scan scheduler output for scx CI failure patterns.
+    Returns list of matching failure lines (empty = pass)."""
+    failures = []
+    for line in text.splitlines():
+        # SKIP KNOWN FALSE POSITIVES
+        if any(fp.lower() in line.lower() for fp in SCX_CI_FALSE_POSITIVES):
+            continue
+        # EXACT CASE PATTERNS
+        for pat in SCX_CI_FAIL_PATTERNS:
+            if pat in line:
+                failures.append(line.strip())
+                break
+        else:
+            # CASE-INSENSITIVE PATTERNS
+            lower = line.lower()
+            for pat in SCX_CI_FAIL_ICASE:
+                if pat in lower:
+                    failures.append(line.strip())
+                    break
+    return failures
+
+
+def cmd_bench_scx(args) -> int:
+    """scx CI compatibility test.
+
+    Mimics the upstream sched-ext/scx GitHub Actions CI:
+      functional: Run scheduler for 30s, scan output for failure patterns
+      stress:     Run stress-ng with affinity pinning for 31s under scheduler
+
+    Pass criteria match .github/include/scripts/test_sched and
+    .github/include/scripts/run_stress_tests from sched-ext/scx.
+    """
+    subprocess.run(["sudo", "true"])
+    nuke_stale_build()
+    if not build():
+        return 1
+
+    max_cpus = os.cpu_count() or 2
+
+    if args.core_counts:
+        core_counts = [int(c.strip()) for c in args.core_counts.split(",")]
+        core_counts = [c for c in core_counts if 2 <= c <= max_cpus]
+        core_counts = sorted(set(core_counts))
+    else:
+        core_counts = compute_core_counts(max_cpus)
+
+    version = get_version()
+    git = get_git_info()
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+    # FUNCTIONAL TEST DURATION (scx CI uses 30s)
+    func_duration = args.duration
+    # STRESS TEST DURATION (scx CI uses 31s stress-ng + 45s timeout)
+    stress_duration = args.stress_duration
+
+    log_info(f"PANDEMONIUMv{version} BENCH-SCX (CI COMPAT)")
+    log_info(f"Core counts: {core_counts}")
+    log_info(f"Functional: {func_duration}s, Stress: {stress_duration}s")
+
+    all_results = {}
+    overall_pass = True
+
+    try:
+        for nr_cpus in core_counts:
+            log_info(f"[{nr_cpus}C] scx CI compatibility tests")
+
+            if nr_cpus < max_cpus:
+                if not restrict_cpus(nr_cpus, max_cpus):
+                    log_error(f"[{nr_cpus}C] Failed to restrict CPUs")
+                    restore_all_cpus(max_cpus)
+                    continue
+            time.sleep(1)
+
+            core_results = {"functional": {}, "stress": {}}
+
+            # TEST 1: FUNCTIONAL (test_sched equivalent)
+            # Run scheduler for func_duration seconds. Scan combined
+            # stdout+stderr for BUG:/WARNING:/error/stall/timeout.
+            log_info(f"[{nr_cpus}C] Functional: running {func_duration}s")
+            dmesg = DmesgMonitor()
+
+            guard = start_and_wait(
+                [str(BINARY), "--nr-cpus", str(nr_cpus)],
+                "PANDEMONIUM", settle_secs=2)
+            if guard is None:
+                log_error(f"[{nr_cpus}C] Functional: scheduler failed to start")
+                core_results["functional"] = {
+                    "pass": False, "survived": False, "failures": ["STARTUP FAILED"],
+                }
+                overall_pass = False
+            else:
+                time.sleep(func_duration)
+
+                crashed = dmesg.check()
+                alive = guard.proc.poll() is None
+
+                stdout = guard.drain_stdout()
+                stderr = guard.read_stderr(limit=64000)
+                combined = stdout + "\n" + stderr
+
+                failures = _scx_ci_check_output(combined)
+                if crashed:
+                    failures.append(f"DMESG CRASH: {dmesg.crash_msg}")
+                if not alive:
+                    failures.append(
+                        f"SCHEDULER EXITED (code {guard.proc.returncode})")
+
+                func_pass = len(failures) == 0 and alive
+                core_results["functional"] = {
+                    "pass": func_pass,
+                    "survived": alive,
+                    "failures": failures,
+                    "duration_s": func_duration,
+                }
+                if not func_pass:
+                    overall_pass = False
+                    for f in failures[:10]:
+                        log_error(f"[{nr_cpus}C] Functional FAIL: {f}")
+
+                dmesg.save()
+                stop_and_wait(guard)
+                time.sleep(2)
+
+            # TEST 2: STRESS (run_stress_tests equivalent)
+            # Start scheduler, then run stress-ng with affinity pinning.
+            # Pass = scheduler survives (no crash, no non-zero exit).
+            log_info(f"[{nr_cpus}C] Stress: stress-ng {stress_duration}s "
+                     f"w/ affinity pinning")
+            dmesg2 = DmesgMonitor()
+
+            guard = start_and_wait(
+                [str(BINARY), "--nr-cpus", str(nr_cpus)],
+                "PANDEMONIUM", settle_secs=2)
+            if guard is None:
+                log_error(f"[{nr_cpus}C] Stress: scheduler failed to start")
+                core_results["stress"] = {
+                    "pass": False, "survived": False,
+                    "failures": ["STARTUP FAILED"],
+                }
+                overall_pass = False
+            else:
+                # stress-ng command from scx stress_tests.ini
+                stress_cmd = [
+                    "stress-ng",
+                    "-t", str(stress_duration),
+                    "--aggressive",
+                    "-M",
+                    "-c", str(nr_cpus),
+                    "-f", str(nr_cpus),
+                    "--affinity", "1",
+                    "--affinity-delay", "1",
+                    "--affinity-pin",
+                ]
+                log_info(f"  {' '.join(stress_cmd)}")
+                stress_timeout = stress_duration + 15
+
+                try:
+                    stress_ret = subprocess.run(
+                        stress_cmd,
+                        timeout=stress_timeout,
+                        capture_output=True,
+                        text=True,
+                    )
+                    stress_exit = stress_ret.returncode
+                except subprocess.TimeoutExpired:
+                    log_warn(f"[{nr_cpus}C] stress-ng timed out at "
+                             f"{stress_timeout}s")
+                    stress_exit = 143  # SIGTERM equivalent
+
+                crashed = dmesg2.check()
+                alive = guard.proc.poll() is None
+
+                # scx CI: exit 0 or 143 (SIGTERM from timeout) = pass
+                stress_ok = stress_exit in (0, 143)
+                stress_failures = []
+                if not stress_ok:
+                    stress_failures.append(
+                        f"stress-ng exit code {stress_exit}")
+                if crashed:
+                    stress_failures.append(
+                        f"DMESG CRASH: {dmesg2.crash_msg}")
+                if not alive:
+                    stress_failures.append(
+                        f"SCHEDULER DIED (code {guard.proc.returncode})")
+
+                stress_pass = len(stress_failures) == 0 and alive
+                core_results["stress"] = {
+                    "pass": stress_pass,
+                    "survived": alive,
+                    "stress_exit": stress_exit,
+                    "failures": stress_failures,
+                    "duration_s": stress_duration,
+                }
+                if not stress_pass:
+                    overall_pass = False
+                    for f in stress_failures[:10]:
+                        log_error(f"[{nr_cpus}C] Stress FAIL: {f}")
+
+                dmesg2.save()
+                stop_and_wait(guard)
+                time.sleep(2)
+
+            all_results[nr_cpus] = core_results
+
+            if nr_cpus < max_cpus:
+                restore_all_cpus(max_cpus)
+                time.sleep(1)
+
+    except KeyboardInterrupt:
+        log_info("Interrupted")
+        overall_pass = False
+    finally:
+        restore_all_cpus(max_cpus)
+
+    # REPORT
+    log_info("")
+    log_info(f"PANDEMONIUMv{version} BENCH-SCX RESULTS")
+    log_info("")
+
+    for nr_cpus in sorted(all_results.keys()):
+        cr = all_results[nr_cpus]
+        log_info(f"  {nr_cpus}C:")
+        for test_name in ["functional", "stress"]:
+            r = cr.get(test_name, {})
+            label = "PASS" if r.get("pass", False) else "FAIL"
+            detail = ""
+            if test_name == "functional":
+                detail = f"duration={r.get('duration_s', '?')}s"
+                n_fail = len(r.get("failures", []))
+                if n_fail:
+                    detail += f" violations={n_fail}"
+            elif test_name == "stress":
+                detail = (f"duration={r.get('duration_s', '?')}s "
+                          f"exit={r.get('stress_exit', '?')}")
+            log_info(f"    {test_name:20s} {label}  {detail}")
+
+    log_info("")
+    if overall_pass:
+        log_info("OVERALL: PASS (scx CI compatible)")
+    else:
+        log_info("OVERALL: FAIL")
+
+    # PROMETHEUS OUTPUT
+    prom_path = LOG_DIR / f"bench-scx-{stamp}.prom"
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(prom_path, "w") as f:
+        f.write(f'# PANDEMONIUM bench-scx v{version}\n')
+        f.write(f'# {datetime.now().isoformat()}\n')
+        for nr_cpus in sorted(all_results.keys()):
+            cr = all_results[nr_cpus]
+            for test_name in ["functional", "stress"]:
+                r = cr.get(test_name, {})
+                label = f'test="{test_name}",cpus="{nr_cpus}"'
+                f.write(f'pandemonium_scx_pass{{{label}}} '
+                        f'{1 if r.get("pass", False) else 0}\n')
+                f.write(f'pandemonium_scx_survived{{{label}}} '
+                        f'{1 if r.get("survived", False) else 0}\n')
+                if test_name == "functional":
+                    f.write(f'pandemonium_scx_violations{{{label}}} '
+                            f'{len(r.get("failures", []))}\n')
+                elif test_name == "stress":
+                    f.write(f'pandemonium_scx_stress_exit{{{label}}} '
+                            f'{r.get("stress_exit", -1)}\n')
+    log_info(f"Prometheus: {prom_path}")
+
+    return 0 if overall_pass else 1
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(
@@ -1765,6 +5641,46 @@ def main() -> int:
     bench.add_argument("--core-counts", type=str, default=None,
                        help="Comma-separated core counts "
                             "(default: auto 2,4,8,...,max)")
+    bench.add_argument("--burst", action="store_true",
+                       help="Burst-only mode: skip latency and throughput, "
+                            "run only burst measurement")
+    bench.add_argument("--longrun", action="store_true",
+                       help="Long-run only mode: skip latency, throughput, "
+                            "and burst; run only long-running process test")
+    bench.add_argument("--mixed", action="store_true",
+                       help="Mixed-only mode: skip latency, throughput; "
+                            "run only burst+longrun combined test")
+    bench.add_argument("--deadline", action="store_true",
+                       help="Deadline-only mode: run only periodic frame "
+                            "scheduling jitter test")
+    bench.add_argument("--ipc", action="store_true",
+                       help="IPC-only mode: run only pipe round-trip "
+                            "latency test")
+    bench.add_argument("--launch", action="store_true",
+                       help="Launch-only mode: run only fork+exec latency "
+                            "test under load")
+    bench.add_argument("--trace", action="store_true",
+                       help="Enable bpf_printk trace capture during benchmark")
+
+    trace_bench = sub.add_parser("bench-trace",
+                                  help="Crash-detection stress test with trace capture")
+    trace_bench.add_argument("--iterations", type=int, default=1,
+                             help="Full workload iterations per core count (default: 1)")
+    trace_bench.add_argument("--core-counts", type=str, default=None,
+                             help="Comma-separated core counts "
+                                  "(default: auto 2,4,8,...,max)")
+
+    contention_bench = sub.add_parser("bench-contention",
+                                      help="Contention stress test for v5.4.x adaptive features")
+    contention_bench.add_argument("--iterations", type=int, default=1,
+                                  help="Full workload iterations per core count (default: 1)")
+    contention_bench.add_argument("--core-counts", type=str, default=None,
+                                  help="Comma-separated core counts "
+                                       "(default: auto 2,4,8,...,max)")
+    contention_bench.add_argument("--phase", type=str, default=None,
+                                  help="Run single phase: regime-sweep, deficit-storm, "
+                                       "sojourn-pressure, longrun-interactive, "
+                                       "burst-recovery, mixed-storm")
 
     sys_bench = sub.add_parser("bench-sys",
                                help="Live system telemetry capture")
@@ -1778,6 +5694,31 @@ def main() -> int:
                            help="Additional compositor process names "
                                 "(PANDEMONIUM modes only)")
 
+    pcpu_bench = sub.add_parser("bench-pcpu",
+                                help="Per-CPU DSQ visibility stress test (v5.4.8)")
+    pcpu_bench.add_argument("--iterations", type=int, default=1,
+                            help="Iterations per core count (default: 1)")
+    pcpu_bench.add_argument("--core-counts", type=str, default=None,
+                            help="Comma-separated core counts "
+                                 "(default: auto 2,4,8,...,max)")
+
+    cs2_bench = sub.add_parser("bench-cs2",
+                                help="Automated game workload diagnosis")
+    cs2_bench.add_argument("--target", type=str, default="cs2",
+                           help="Process name to trace and detect (default: cs2)")
+    cs2_bench.add_argument("--duration", type=int, default=0,
+                           help="Capture duration in seconds (default: 120)")
+
+    scx_bench = sub.add_parser("bench-scx",
+                                help="scx CI compatibility test")
+    scx_bench.add_argument("--duration", type=int, default=30,
+                           help="Functional test duration in seconds (default: 30)")
+    scx_bench.add_argument("--stress-duration", type=int, default=31,
+                           help="Stress test duration in seconds (default: 31)")
+    scx_bench.add_argument("--core-counts", type=str, default=None,
+                           help="Comma-separated core counts "
+                                "(default: auto 2,4,8,...,max)")
+
     args = parser.parse_args()
 
     if args.command is None:
@@ -1790,8 +5731,18 @@ def main() -> int:
 
     if args.command == "bench-scale":
         return cmd_bench_scale(args)
+    if args.command == "bench-trace":
+        return cmd_bench_trace(args)
+    if args.command == "bench-contention":
+        return cmd_bench_contention(args)
     if args.command == "bench-sys":
         return cmd_bench_sys(args)
+    if args.command == "bench-pcpu":
+        return cmd_bench_pcpu(args)
+    if args.command == "bench-cs2":
+        return cmd_bench_cs2(args)
+    if args.command == "bench-scx":
+        return cmd_bench_scx(args)
 
     log_error(f"Unknown command: {args.command}")
     return 1
