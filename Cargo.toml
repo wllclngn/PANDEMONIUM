@@ -1,7 +1,9 @@
 [package]
 name = "pandemonium"
-version = "5.4.12"
+version = "5.5.0"
 edition = "2021"
+description = "A behavioral, adaptive sched_ext scheduler with three-tier classification, L2 affinity, and process learning"
+license = "GPL-2.0-only"
 
 [dependencies]
 libbpf-rs = { version = "=0.26.1", default-features = false }

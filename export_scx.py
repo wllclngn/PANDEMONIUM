@@ -37,11 +37,7 @@ INCLUDE = [
     "LICENSE",
     "README.md",
     "build.rs",
-    "pandemonium.py",
-    "pandemonium_common.py",
-    "include/",
     "src/",
-    "tests/",
 ]
 
 # FILES TO SKIP (NEVER EXPORT)
@@ -144,7 +140,40 @@ def strip_profile_release(dst_root):
 
 
 SCX_BUILD_RS = """\
+use std::process::Command;
+
 fn main() {
+    // BUILD ID: GIT SHA, DIRTY FLAG, TARGET TRIPLE
+    // MATCHES scx_utils::build_id FORMAT USED BY OTHER SCX SCHEDULERS.
+    let git_sha = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+
+    let git_dirty = Command::new("git")
+        .args(["status", "--porcelain"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| !o.stdout.is_empty())
+        .unwrap_or(false);
+
+    let build_id = if git_sha.is_empty() {
+        String::new()
+    } else if git_dirty {
+        format!("-g{}-dirty", git_sha)
+    } else {
+        format!("-g{}", git_sha)
+    };
+
+    let target = std::env::var("TARGET").unwrap_or_default();
+
+    println!("cargo:rustc-env=PANDEMONIUM_BUILD_ID={}", build_id);
+    println!("cargo:rustc-env=PANDEMONIUM_TARGET={}", target);
+
     scx_cargo::BpfBuilder::new()
         .unwrap()
         .enable_intf("src/bpf/intf.h", "bpf_intf.rs")
@@ -386,12 +415,23 @@ def main():
         print(f"  FMT: cargo fmt failed ({result.stderr.strip()})")
         print("  FMT: run manually: cargo fmt --manifest-path", os.path.join(dst_root, "Cargo.toml"))
 
+    # STEP 7: UPDATE CARGO.LOCK (CI BUILDS WITH --locked)
+    print("\n[7] UPDATE CARGO.LOCK")
+    result = subprocess.run(
+        ["cargo", "update", "-p", CRATE_NEW],
+        capture_output=True, text=True, cwd=scx_root,
+    )
+    if result.returncode == 0:
+        print(f"  LOCK: cargo update -p {CRATE_NEW} succeeded")
+    else:
+        print(f"  LOCK: cargo update failed ({result.stderr.strip()})")
+        print(f"  LOCK: run manually: cd {scx_root} && cargo update -p {CRATE_NEW}")
+
     # SUMMARY
     print(f"\nDONE: {copied} files copied, {renamed} crate renames, "
           f"{stripped} profile stripped, {registered} workspace update")
     print(f"\nNext steps:")
     print(f"  cd {scx_root}")
-    print(f"  cargo update -p {CRATE_NEW}")
     print(f"  cargo build -p {CRATE_NEW} --release")
     print(f"  git add -A && git diff --cached --stat")
 
