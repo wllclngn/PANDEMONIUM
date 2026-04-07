@@ -40,7 +40,7 @@ from pandemonium_common import (
 
 # CONFIGURATION
 
-DEFAULT_EXTERNALS = ["scx_bpfland"]
+DEFAULT_EXTERNALS = ["scx_bpfland", "scx_flow", "scx_lavd", "scx_cosmos", "scx_rusty"]
 
 
 # DMESG MONITORING
@@ -2981,7 +2981,8 @@ def cmd_bench_pcpu(args) -> int:
     if not build():
         return 1
 
-    max_cpus = os.cpu_count() or 2
+    max_cpus = get_possible_cpus()
+    restore_all_cpus(max_cpus)
 
     if args.core_counts:
         core_counts = [int(c.strip()) for c in args.core_counts.split(",")]
@@ -3010,7 +3011,7 @@ def cmd_bench_pcpu(args) -> int:
                     log_error(f"[{nr_cpus}C] Failed to restrict CPUs")
                     restore_all_cpus(max_cpus)
                     continue
-            time.sleep(1)
+            time.sleep(2)
 
             core_results = {"burst": [], "steal": [], "sojourn": []}
 
@@ -3079,7 +3080,7 @@ def cmd_bench_pcpu(args) -> int:
 
             if nr_cpus < max_cpus:
                 restore_all_cpus(max_cpus)
-                time.sleep(1)
+                time.sleep(2)
 
     except KeyboardInterrupt:
         log_info("Interrupted")
@@ -3236,20 +3237,26 @@ def cmd_bench_scale(args) -> int:
     log_info("Pre-flight PASSED")
     print()
 
-    # Build entry list: EEVDF + PANDEMONIUM (BPF) + PANDEMONIUM (ADAPTIVE) + externals
-    base_entries: list[tuple[str, list[str] | None]] = [
-        ("EEVDF", None),
-        ("PANDEMONIUM (BPF)", [str(BINARY), "--verbose", "--no-adaptive"]),
-        ("PANDEMONIUM (ADAPTIVE)", [str(BINARY), "--verbose"]),
-    ]
-
-    for name in args.schedulers:
-        path = find_scheduler(name)
-        if path:
-            log_info(f"Found: {name} ({path})")
-            base_entries.append((name, [name]))
-        else:
-            log_warn(f"SKIPPING {name} (not installed)")
+    # Build entry list
+    if getattr(args, "pandemonium_only", False):
+        base_entries: list[tuple[str, list[str] | None]] = [
+            ("PANDEMONIUM (BPF)", [str(BINARY), "--verbose", "--no-adaptive"]),
+            ("PANDEMONIUM (ADAPTIVE)", [str(BINARY), "--verbose"]),
+        ]
+        log_info("PANDEMONIUM-ONLY MODE: skipping EEVDF and external schedulers")
+    else:
+        base_entries: list[tuple[str, list[str] | None]] = [
+            ("EEVDF", None),
+            ("PANDEMONIUM (BPF)", [str(BINARY), "--verbose", "--no-adaptive"]),
+            ("PANDEMONIUM (ADAPTIVE)", [str(BINARY), "--verbose"]),
+        ]
+        for name in args.schedulers:
+            path = find_scheduler(name)
+            if path:
+                log_info(f"Found: {name} ({path})")
+                base_entries.append((name, [name]))
+            else:
+                log_warn(f"SKIPPING {name} (not installed)")
 
     # Workload
     workload_cmd = args.cmd or f"CARGO_TARGET_DIR={TARGET_DIR} cargo build --release"
@@ -3257,8 +3264,8 @@ def cmd_bench_scale(args) -> int:
     if not args.cmd:
         clean_cmd = f"cargo clean --target-dir {TARGET_DIR}"
 
-    # Core counts
-    max_cpus = get_online_cpus()
+    # Core counts (use possible, not online -- previous crash may have left CPUs offline)
+    max_cpus = get_possible_cpus()
     if args.core_counts:
         core_counts = [int(c.strip()) for c in args.core_counts.split(",")]
         core_counts = [c for c in core_counts if 2 <= c <= max_cpus]
@@ -3592,7 +3599,8 @@ def cmd_bench_sys(args) -> int:
                 log_error("Could not deactivate sched_ext")
                 return 1
 
-    max_cpus = get_online_cpus()
+    max_cpus = get_possible_cpus()
+    restore_all_cpus(max_cpus)
 
     # Build scheduler command
     guard = None
@@ -4081,7 +4089,7 @@ def _trace_start_scheduler(nr_cpus=None):
             name = SCX_OPS.read_text().strip()
             if name == "pandemonium":
                 log_info("Scheduler activated")
-                time.sleep(2.0)
+                time.sleep(3.0)
                 if proc.poll() is not None:
                     err = proc.stderr.read() if proc.stderr else ""
                     log_error(f"scheduler died during settle (code {proc.returncode})")
@@ -4187,7 +4195,8 @@ def cmd_bench_trace(args) -> int:
     if not build():
         return 1
 
-    max_cpus = os.cpu_count() or 2
+    max_cpus = get_possible_cpus()
+    restore_all_cpus(max_cpus)
 
     if args.core_counts:
         core_counts = [int(c.strip()) for c in args.core_counts.split(",")]
@@ -4249,7 +4258,7 @@ def cmd_bench_trace(args) -> int:
 
             if nr_cpus < max_cpus:
                 restore_all_cpus(max_cpus)
-                time.sleep(1)
+                time.sleep(2)
 
     except KeyboardInterrupt:
         log_info("Interrupted")
@@ -4333,6 +4342,9 @@ def _contention_phase_deficit_storm(nr_cpus, dmesg, sched_alive_fn, duration=20)
     n_interactive = nr_cpus
     n_batch = nr_cpus * 2
     log_info(f"PHASE: deficit-storm ({n_interactive} interactive + {n_batch} batch, {duration}s)")
+
+    # WARMUP: LET SCHEDULER CLASSIFY WORKLOADS BEFORE MAXIMUM STRESS
+    time.sleep(2)
 
     # BATCH: TIGHT CPU SPIN
     batch_workers = _StressWorkers(n_batch)
@@ -4648,7 +4660,6 @@ def _contention_phase_mixed_storm(nr_cpus, dmesg, sched_alive_fn, duration=30):
 
 def _contention_run_iteration(iteration, total, nr_cpus):
     """Run one full contention iteration. Returns (survived: bool, phase_results: dict)."""
-    dmesg = DmesgMonitor()
     phase_results = {}
 
     label = f"[{iteration}/{total}] " if total > 1 else ""
@@ -4657,6 +4668,8 @@ def _contention_run_iteration(iteration, total, nr_cpus):
     sched_proc = _trace_start_scheduler(nr_cpus=nr_cpus)
     if sched_proc is None:
         return False, phase_results
+
+    dmesg = DmesgMonitor()
 
     def sched_alive():
         return sched_proc is not None and sched_proc.poll() is None
@@ -4793,7 +4806,8 @@ def cmd_bench_contention(args) -> int:
     if not build():
         return 1
 
-    max_cpus = os.cpu_count() or 2
+    max_cpus = get_possible_cpus()
+    restore_all_cpus(max_cpus)
 
     if args.core_counts:
         core_counts = [int(c.strip()) for c in args.core_counts.split(",")]
@@ -4836,7 +4850,7 @@ def cmd_bench_contention(args) -> int:
                     results[nr_cpus] = (0, args.iterations)
                     restore_all_cpus(max_cpus)
                     continue
-            time.sleep(1)
+            time.sleep(2)
 
             survived = 0
             crashed = 0
@@ -4862,7 +4876,7 @@ def cmd_bench_contention(args) -> int:
 
             if nr_cpus < max_cpus:
                 restore_all_cpus(max_cpus)
-                time.sleep(1)
+                time.sleep(2)
 
     except KeyboardInterrupt:
         log_info("Interrupted")
@@ -5388,7 +5402,8 @@ def cmd_bench_scx(args) -> int:
     if not build():
         return 1
 
-    max_cpus = os.cpu_count() or 2
+    max_cpus = get_possible_cpus()
+    restore_all_cpus(max_cpus)
 
     if args.core_counts:
         core_counts = [int(c.strip()) for c in args.core_counts.split(",")]
@@ -5557,7 +5572,7 @@ def cmd_bench_scx(args) -> int:
 
             if nr_cpus < max_cpus:
                 restore_all_cpus(max_cpus)
-                time.sleep(1)
+                time.sleep(2)
 
     except KeyboardInterrupt:
         log_info("Interrupted")
@@ -5661,6 +5676,9 @@ def main() -> int:
                             "test under load")
     bench.add_argument("--trace", action="store_true",
                        help="Enable bpf_printk trace capture during benchmark")
+    bench.add_argument("--pandemonium-only", action="store_true",
+                       help="Skip EEVDF and external schedulers, run only "
+                            "PANDEMONIUM (BPF) and PANDEMONIUM (ADAPTIVE)")
 
     trace_bench = sub.add_parser("bench-trace",
                                   help="Crash-detection stress test with trace capture")

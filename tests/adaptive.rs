@@ -119,7 +119,7 @@ fn demotion_threshold_in_knobs() {
 // TUNING KNOBS ABI
 
 #[test]
-fn tuning_knobs_size_is_8_u64() {
+fn tuning_knobs_size_is_10_u64() {
     // MUST MATCH struct tuning_knobs IN intf.h (10 x u64 = 80 BYTES)
     assert_eq!(std::mem::size_of::<TuningKnobs>(), 80);
 }

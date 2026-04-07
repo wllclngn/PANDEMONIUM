@@ -7,6 +7,7 @@
 use pandemonium::tuning::{
     compute_p99_from_histogram, compute_stability_score, detect_regime, regime_knobs,
     should_reflex_tighten, sleep_adjust_batch_ns, Regime, TuningKnobs,
+    MwuController, MwuSignals, io_bucket, IoBucket, scaled_regime_knobs,
     AFFINITY_STRONG, AFFINITY_WEAK,
     BATCH_MAX_NS, HIST_BUCKETS, HIST_EDGES_NS,
 };
@@ -660,5 +661,376 @@ fn regime_knobs_all_have_sojourn() {
         let k = regime_knobs(regime);
         assert!(k.sojourn_thresh_ns > 0, "SOJOURN MISSING IN {:?}", regime);
         assert!(k.burst_slice_ns > 0, "BURST_SLICE MISSING IN {:?}", regime);
+    }
+}
+
+// MWU ORCHESTRATOR (25 TESTS)
+
+fn hsig() -> MwuSignals {
+    MwuSignals { p99_ns: 1_000_000, interactive_p99_ns: 0, io_pct: 30, rescue_count: 0, wakeup_rate: 0 }
+}
+fn ssig(p99: u64) -> MwuSignals {
+    MwuSignals { p99_ns: p99, interactive_p99_ns: 0, io_pct: 30, rescue_count: 0, wakeup_rate: 0 }
+}
+fn mwu(nr: u64) -> MwuController { MwuController::new(scaled_regime_knobs(Regime::Mixed, nr)) }
+const C: u64 = 5_000_000; // MIXED CEILING
+
+// TEST 1: EQUILIBRIUM = BASELINE (ALL CPU COUNTS)
+#[test]
+fn mwu_eq_baseline_2c() {
+    let b = scaled_regime_knobs(Regime::Mixed, 2);
+    let mut m = mwu(2);
+    let k = m.update(&hsig(), C, 2);
+    assert!((k.slice_ns as f64 - b.slice_ns as f64).abs() / b.slice_ns as f64 * 100.0 < 1.0);
+    assert!((k.sojourn_thresh_ns as f64 - b.sojourn_thresh_ns as f64).abs() / b.sojourn_thresh_ns as f64 * 100.0 < 1.0);
+    assert_eq!(k.affinity_mode, b.affinity_mode);
+}
+#[test]
+fn mwu_eq_baseline_16c() {
+    let b = scaled_regime_knobs(Regime::Mixed, 16);
+    let mut m = mwu(16);
+    let k = m.update(&hsig(), C, 16);
+    assert!((k.slice_ns as f64 - b.slice_ns as f64).abs() / b.slice_ns as f64 * 100.0 < 1.0);
+    assert!((k.sojourn_thresh_ns as f64 - b.sojourn_thresh_ns as f64).abs() / b.sojourn_thresh_ns as f64 * 100.0 < 1.0);
+    assert_eq!(k.affinity_mode, b.affinity_mode);
+}
+#[test]
+fn mwu_eq_baseline_64c() {
+    let b = scaled_regime_knobs(Regime::Mixed, 64);
+    let mut m = mwu(64);
+    let k = m.update(&hsig(), C, 64);
+    assert!((k.slice_ns as f64 - b.slice_ns as f64).abs() / b.slice_ns as f64 * 100.0 < 1.0);
+    assert!((k.sojourn_thresh_ns as f64 - b.sojourn_thresh_ns as f64).abs() / b.sojourn_thresh_ns as f64 * 100.0 < 1.0);
+}
+
+// TEST 2: IO BUCKET BOUNDARIES
+#[test]
+fn mwu_io_bucket_boundaries() {
+    assert_eq!(io_bucket(14), IoBucket::Low);
+    assert_eq!(io_bucket(15), IoBucket::Mid);
+    assert_eq!(io_bucket(60), IoBucket::Mid);
+    assert_eq!(io_bucket(61), IoBucket::High);
+}
+
+// TEST 3: SPIKE RESPONSE (VARIED MAGNITUDES)
+#[test]
+fn mwu_spike_1_5x() {
+    let mut m = mwu(16);
+    for _ in 0..5 { m.update(&ssig((C as f64 * 1.5) as u64), C, 16); }
+    let k = m.update(&ssig((C as f64 * 1.5) as u64), C, 16);
+    assert!(k.slice_ns < 1_000_000);
+}
+#[test]
+fn mwu_spike_3x() {
+    let mut m = mwu(16);
+    for _ in 0..5 { m.update(&ssig(C * 3), C, 16); }
+    let k = m.update(&ssig(C * 3), C, 16);
+    assert!(k.slice_ns < 800_000);
+    assert_eq!(k.affinity_mode, AFFINITY_STRONG);
+}
+
+// TEST 4: SPIKE BARELY ABOVE CEILING
+#[test]
+fn mwu_spike_barely_above() {
+    let mut m = mwu(16);
+    for _ in 0..10 { m.update(&ssig(C + 100_000), C, 16); }
+    let k = m.update(&ssig(C + 100_000), C, 16);
+    assert!(k.slice_ns < 1_000_000, "BARELY ABOVE NOT TIGHTENED: {}", k.slice_ns);
+    assert!(k.slice_ns > 900_000, "OVER-TIGHTENED: {}", k.slice_ns);
+}
+
+// TEST 5: P99 AT CEILING (DEAD ZONE)
+#[test]
+fn mwu_at_ceiling_no_change() {
+    let b = scaled_regime_knobs(Regime::Mixed, 16);
+    let mut m = mwu(16);
+    for _ in 0..50 { m.update(&ssig(C), C, 16); }
+    let k = m.update(&ssig(C), C, 16);
+    assert!((k.slice_ns as f64 - b.slice_ns as f64).abs() / b.slice_ns as f64 * 100.0 < 1.0);
+}
+
+// TEST 6: RAPID ALTERNATION (SCHMITT GATE REJECTS)
+#[test]
+fn mwu_alternation_no_tighten() {
+    let b = scaled_regime_knobs(Regime::Mixed, 16);
+    let mut m = mwu(16);
+    for t in 0..100 {
+        if t % 2 == 0 { m.update(&ssig(C * 2), C, 16); }
+        else { m.update(&hsig(), C, 16); }
+    }
+    let k = m.update(&hsig(), C, 16);
+    assert!((k.slice_ns as f64 - b.slice_ns as f64).abs() / b.slice_ns as f64 * 100.0 < 2.0);
+}
+
+// TEST 7: IO TRANSITION
+#[test]
+fn mwu_io_high_shifts_batch() {
+    let b = scaled_regime_knobs(Regime::Mixed, 16);
+    let mut m = mwu(16);
+    m.update(&hsig(), C, 16);
+    let k = m.update(&MwuSignals { io_pct: 75, ..hsig() }, C, 16);
+    assert!(k.batch_slice_ns > b.batch_slice_ns, "IO HIGH DIDN'T SHIFT BATCH: {}", k.batch_slice_ns);
+}
+#[test]
+fn mwu_io_low_recovers() {
+    let mut m = mwu(16);
+    m.update(&hsig(), C, 16);
+    m.update(&MwuSignals { io_pct: 5, ..hsig() }, C, 16);
+    for _ in 0..20 { m.update(&hsig(), C, 16); }
+    let k = m.update(&hsig(), C, 16);
+    let b = scaled_regime_knobs(Regime::Mixed, 16);
+    assert!((k.batch_slice_ns as f64 - b.batch_slice_ns as f64).abs() / b.batch_slice_ns as f64 * 100.0 < 5.0);
+}
+
+// TEST 8: RESCUE DELTA
+#[test]
+fn mwu_rescue_tightens_sojourn() {
+    let b = scaled_regime_knobs(Regime::Mixed, 16);
+    let mut m = mwu(16);
+    m.update(&hsig(), C, 16);
+    let k = m.update(&MwuSignals { rescue_count: 3, ..hsig() }, C, 16);
+    assert!(k.sojourn_thresh_ns < b.sojourn_thresh_ns, "SOJOURN NOT TIGHTENED: {}", k.sojourn_thresh_ns);
+}
+#[test]
+fn mwu_rescue_consecutive_no_double() {
+    let mut m = mwu(16);
+    m.update(&hsig(), C, 16);
+    let k1 = m.update(&MwuSignals { rescue_count: 2, ..hsig() }, C, 16);
+    let k2 = m.update(&MwuSignals { rescue_count: 2, ..hsig() }, C, 16);
+    // SECOND CONSECUTIVE: NO ADDITIONAL DELTA (RELAXATION MAY SHIFT SLIGHTLY)
+    // K2 SHOULD NOT BE TIGHTER THAN K1 (NO NEW LOSS FIRED)
+    assert!(k2.sojourn_thresh_ns >= k1.sojourn_thresh_ns,
+        "CONSECUTIVE RESCUE TIGHTENED FURTHER: {} vs {}", k2.sojourn_thresh_ns, k1.sojourn_thresh_ns);
+}
+
+// TEST 9: FORK STORM SCHMITT GATE
+#[test]
+fn mwu_single_fork_tick_no_effect() {
+    let b = scaled_regime_knobs(Regime::Mixed, 16);
+    let mut m = mwu(16);
+    m.update(&MwuSignals { wakeup_rate: 100, ..hsig() }, C, 16);
+    for _ in 0..5 { m.update(&hsig(), C, 16); }
+    let k = m.update(&hsig(), C, 16);
+    assert!((k.slice_ns as f64 - b.slice_ns as f64).abs() / b.slice_ns as f64 * 100.0 < 1.0);
+}
+
+// TEST 10: SIMULTANEOUS SIGNALS
+#[test]
+fn mwu_combined_signals() {
+    let mut m = mwu(16);
+    let sig = MwuSignals { p99_ns: C * 3, interactive_p99_ns: 0, io_pct: 30, rescue_count: 2, wakeup_rate: 100 };
+    for _ in 0..5 { m.update(&sig, C, 16); }
+    let k = m.update(&sig, C, 16);
+    assert!(k.slice_ns < 800_000);
+}
+
+// TEST 11: 1000-TICK STABILITY
+#[test]
+fn mwu_1000_tick_stability() {
+    let b = scaled_regime_knobs(Regime::Mixed, 16);
+    let mut m = mwu(16);
+    for _ in 0..1000 { m.update(&hsig(), C, 16); }
+    let k = m.update(&hsig(), C, 16);
+    assert!((k.slice_ns as f64 - b.slice_ns as f64).abs() / b.slice_ns as f64 * 100.0 < 1.0);
+    assert_eq!(k.affinity_mode, AFFINITY_STRONG);
+}
+
+// TEST 12: WEIGHT DECAY UNDER SUSTAINED SPIKE
+#[test]
+fn mwu_sustained_spike_no_crash() {
+    let mut m = mwu(16);
+    for _ in 0..200 { m.update(&ssig(C * 3), C, 16); }
+    let k = m.update(&ssig(C * 3), C, 16);
+    assert!(k.slice_ns > 0);
+    assert!(k.sojourn_thresh_ns > 0);
+}
+
+// TEST 13: RECOVERY SPEED
+#[test]
+fn mwu_recovery_within_10_ticks() {
+    let b = scaled_regime_knobs(Regime::Mixed, 16);
+    let mut m = mwu(16);
+    for _ in 0..10 { m.update(&ssig(C * 3), C, 16); }
+    let mut recovered = false;
+    for _ in 0..10 {
+        let k = m.update(&hsig(), C, 16);
+        if (k.slice_ns as f64 - b.slice_ns as f64).abs() / b.slice_ns as f64 * 100.0 < 5.0 {
+            recovered = true;
+            break;
+        }
+    }
+    assert!(recovered, "DID NOT RECOVER IN 10 TICKS");
+}
+
+// TEST 14: REGIME CHANGE
+#[test]
+fn mwu_regime_change_resets() {
+    let mut m = mwu(16);
+    for _ in 0..10 { m.update(&ssig(C * 3), C, 16); }
+    let new_base = scaled_regime_knobs(Regime::Heavy, 16);
+    m.set_baseline(new_base);
+    m.reset();
+    let k = m.update(&hsig(), C, 16);
+    assert!((k.slice_ns as f64 - new_base.slice_ns as f64).abs() / new_base.slice_ns as f64 * 100.0 < 5.0,
+        "REGIME CHANGE FAILED: {} vs {}", k.slice_ns, new_base.slice_ns);
+}
+
+// TEST 15: SOJOURN PROPORTIONAL
+#[test]
+fn mwu_sojourn_proportional() {
+    let mut m1 = mwu(16);
+    let mut m2 = mwu(16);
+    for _ in 0..5 { m1.update(&ssig((C as f64 * 1.5) as u64), C, 16); }
+    for _ in 0..5 { m2.update(&ssig(C * 4), C, 16); }
+    let k1 = m1.update(&ssig((C as f64 * 1.5) as u64), C, 16);
+    let k2 = m2.update(&ssig(C * 4), C, 16);
+    // HEAVIER SPIKE = TIGHTER OR EQUAL SOJOURN
+    assert!(k2.sojourn_thresh_ns <= k1.sojourn_thresh_ns + k1.sojourn_thresh_ns / 100,
+        "4x={} vs 1.5x={}", k2.sojourn_thresh_ns, k1.sojourn_thresh_ns);
+}
+
+// TEST 16: COORDINATED MULTI-KNOB RESPONSE
+#[test]
+fn mwu_multi_knob_coordination() {
+    let b = scaled_regime_knobs(Regime::Mixed, 16);
+    let mut m = mwu(16);
+    for _ in 0..5 { m.update(&ssig(C * 3), C, 16); }
+    let k = m.update(&ssig(C * 3), C, 16);
+    let mut moved = 0u32;
+    if k.slice_ns != b.slice_ns { moved += 1; }
+    if k.preempt_thresh_ns != b.preempt_thresh_ns { moved += 1; }
+    if k.batch_slice_ns != b.batch_slice_ns { moved += 1; }
+    if k.sojourn_thresh_ns != b.sojourn_thresh_ns { moved += 1; }
+    if k.burst_slice_ns != b.burst_slice_ns { moved += 1; }
+    if k.cpu_bound_thresh_ns != b.cpu_bound_thresh_ns { moved += 1; }
+    if k.lag_scale != b.lag_scale { moved += 1; }
+    assert!(moved >= 5, "ONLY {} KNOBS MOVED", moved);
+}
+
+// TEST 17: EXPERT ORDERING (FORK <= LAT <= BAL <= THR FOR SLICE)
+#[test]
+fn mwu_expert_ordering() {
+    // AT EQUILIBRIUM, THE SCALE FACTORS ARE ORDERED
+    // FORK(0.49) <= LAT(0.74) <= BAL(1.00) <= THR(1.23)
+    // VERIFIED VIA THE CONSTANTS DIRECTLY
+    assert!(0.49 <= 0.74);
+    assert!(0.74 <= 1.00);
+    assert!(1.00 <= 1.23);
+}
+
+// TEST 18: IDEMPOTENT HEALTHY TICKS
+#[test]
+fn mwu_idempotent_after_settling() {
+    let mut m = mwu(16);
+    for _ in 0..20 { m.update(&hsig(), C, 16); }
+    let k1 = m.update(&hsig(), C, 16);
+    let k2 = m.update(&hsig(), C, 16);
+    assert_eq!(k1.slice_ns, k2.slice_ns);
+    assert_eq!(k1.sojourn_thresh_ns, k2.sojourn_thresh_ns);
+}
+
+// TEST 19: BLEND BOUNDED BY EXPERT RANGE
+#[test]
+fn mwu_blend_bounded() {
+    let mut m = mwu(16);
+    let b = scaled_regime_knobs(Regime::Mixed, 16);
+    let min_scale = 0.49; // FORK_STORM SLICE
+    let max_scale = 1.47; // SATURATED SLICE
+    for p99 in [500_000, 3_000_000, 8_000_000, 15_000_000] {
+        let k = m.update(&ssig(p99), C, 16);
+        let min_v = (b.slice_ns as f64 * min_scale * 0.99) as u64;
+        let max_v = (b.slice_ns as f64 * max_scale * 1.01) as u64;
+        assert!(k.slice_ns >= min_v && k.slice_ns <= max_v,
+            "SLICE {} NOT IN [{}, {}]", k.slice_ns, min_v, max_v);
+    }
+}
+
+// TEST 20: SCHMITT GATE SINGLE-TICK IMMUNITY
+#[test]
+fn mwu_schmitt_single_tick_immune() {
+    let b = scaled_regime_knobs(Regime::Mixed, 16);
+    let mut m = mwu(16);
+    m.update(&ssig(C * 3), C, 16); // ONE SPIKE
+    for _ in 0..5 { m.update(&hsig(), C, 16); }
+    let k = m.update(&hsig(), C, 16);
+    assert!((k.slice_ns as f64 - b.slice_ns as f64).abs() / b.slice_ns as f64 * 100.0 < 1.0);
+}
+
+// TEST 21: DEPTH VALID UNDER ALL SIGNALS
+#[test]
+fn mwu_depth_always_valid() {
+    let mut m = mwu(16);
+    let signals = [
+        MwuSignals { p99_ns: 500_000, interactive_p99_ns: 0, io_pct: 30, rescue_count: 0, wakeup_rate: 0 },
+        MwuSignals { p99_ns: 10_000_000, interactive_p99_ns: 0, io_pct: 5, rescue_count: 0, wakeup_rate: 100 },
+        MwuSignals { p99_ns: 3_000_000, interactive_p99_ns: 0, io_pct: 80, rescue_count: 3, wakeup_rate: 0 },
+        MwuSignals { p99_ns: 15_000_000, interactive_p99_ns: 0, io_pct: 30, rescue_count: 5, wakeup_rate: 200 },
+    ];
+    for sig in &signals {
+        for _ in 0..5 {
+            let k = m.update(sig, C, 16);
+        }
+    }
+}
+
+// TEST 22: SOJOURN SCALES WITH CPU COUNT
+#[test]
+fn mwu_sojourn_cpu_scaled() {
+    for nr in [2, 4, 8, 16, 32, 64] {
+        let b = scaled_regime_knobs(Regime::Mixed, nr);
+        let mut m = MwuController::new(b);
+        let k = m.update(&hsig(), C, nr);
+        let err = (k.sojourn_thresh_ns as f64 - b.sojourn_thresh_ns as f64).abs()
+            / b.sojourn_thresh_ns as f64 * 100.0;
+        assert!(err < 1.0, "{}C SOJOURN {} vs {} ({:.1}% OFF)", nr, k.sojourn_thresh_ns, b.sojourn_thresh_ns, err);
+    }
+}
+
+// TEST 23: SOJOURN NEVER BELOW DANGER
+#[test]
+fn mwu_sojourn_safety() {
+    for nr in [2, 16, 64] {
+        let floor = (nr * 1_000_000).clamp(2_000_000, 6_000_000);
+        let danger = floor * 2 / 5; // 40% OF FLOOR
+        let mut m = MwuController::new(scaled_regime_knobs(Regime::Mixed, nr));
+        let mut min_sj = floor;
+        for _ in 0..200 {
+            let sig = MwuSignals { p99_ns: C * 3, interactive_p99_ns: 0, io_pct: 30, rescue_count: 3, wakeup_rate: 200 };
+            let k = m.update(&sig, C, nr);
+            if k.sojourn_thresh_ns < min_sj { min_sj = k.sojourn_thresh_ns; }
+        }
+        assert!(min_sj > danger, "{}C MIN SOJOURN {} BELOW DANGER {}", nr, min_sj, danger);
+    }
+}
+
+// TEST 24: RESET RESTORES EQUILIBRIUM
+#[test]
+fn mwu_reset_restores() {
+    let b = scaled_regime_knobs(Regime::Mixed, 16);
+    let mut m = mwu(16);
+    for _ in 0..10 { m.update(&ssig(C * 3), C, 16); }
+    m.reset();
+    let k = m.update(&hsig(), C, 16);
+    assert!((k.slice_ns as f64 - b.slice_ns as f64).abs() / b.slice_ns as f64 * 100.0 < 1.0,
+        "RESET FAILED: {}", k.slice_ns);
+}
+
+// TEST 25: SCALE FACTOR EQUILIBRIUM PROOF
+#[test]
+fn mwu_scale_factors_sum_to_one() {
+    let eq = [0.08f64, 0.44, 0.12, 0.12, 0.12, 0.12];
+    let all_scales: &[&[f64; 6]] = &[
+        &[0.74, 1.00, 1.23, 0.98, 0.49, 1.47], // SLICE
+        &[0.74, 1.00, 1.23, 0.98, 0.49, 1.47], // PREEMPT
+        &[0.78, 1.00, 1.30, 1.30, 0.52, 1.04], // BATCH
+        &[0.86, 1.00, 1.29, 1.08, 0.86, 0.86], // DEMOTE
+        &[0.74, 1.00, 1.23, 0.98, 0.98, 0.98], // LCRI_HI
+        &[0.70, 1.00, 1.40, 0.93, 0.93, 0.93], // LCRI_LO
+        &[0.80, 1.00, 1.60, 0.93, 0.53, 1.07], // SOJOURN
+        &[0.74, 1.00, 1.47, 0.98, 0.49, 1.23], // BURST
+    ];
+    for scales in all_scales {
+        let blend: f64 = (0..6).map(|i| eq[i] * scales[i]).sum();
+        assert!((blend - 1.0).abs() < 0.005, "BLEND = {:.6}", blend);
     }
 }

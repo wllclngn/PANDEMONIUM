@@ -263,6 +263,13 @@ fn run_scheduler(
                 if let Err(e) = topo.populate_l2_siblings_map(&sched) {
                     log_warn!("L2 SIBLINGS MAP WRITE FAILED: {}", e);
                 }
+                // RESISTANCE AFFINITY: COMPUTE R_EFF VIA LAPLACIAN PSEUDOINVERSE
+                // AND POPULATE BPF AFFINITY RANK MAP
+                let (reff, rank) = topo.compute_resistance_affinity();
+                topo.log_resistance_affinity(&reff, &rank);
+                if let Err(e) = topo.populate_affinity_rank_map(&sched, &rank) {
+                    log_warn!("AFFINITY RANK MAP WRITE FAILED: {}", e);
+                }
             }
             Err(e) => log_warn!("CACHE TOPOLOGY DETECT FAILED: {}", e),
         }

@@ -38,6 +38,7 @@ INCLUDE = [
     "README.md",
     "build.rs",
     "src/",
+    "veristat/",
 ]
 
 # FILES TO SKIP (NEVER EXPORT)
@@ -248,6 +249,47 @@ def fix_libbpf_vendoring(dst_root):
     return 0
 
 
+def normalize_dep_versions(dst_root):
+    """Normalize dependency versions to API boundaries (e.g. "0.2.175" -> "0.2").
+
+    Tejun Heo's convention for the scx monorepo: only specify the API-breaking
+    boundary, not exact versions. Cargo.lock pins the exact versions.
+    """
+    cargo_path = os.path.join(dst_root, "Cargo.toml")
+    text = open(cargo_path).read()
+
+    def normalize_version(m):
+        """Reduce "X.Y.Z" to "X.Y" for 0.x or "X" for 1.x+."""
+        prefix = m.group(1)
+        ver = m.group(2)
+        parts = ver.split(".")
+        if len(parts) >= 2 and parts[0] == "0":
+            # 0.x.y -> 0.x (minor is breaking for 0.x)
+            normalized = f"{parts[0]}.{parts[1]}"
+        elif len(parts) >= 1 and int(parts[0]) >= 1:
+            # X.y.z -> X (major is breaking for 1.x+)
+            normalized = parts[0]
+        else:
+            normalized = ver
+        return f'{prefix}"{normalized}"'
+
+    # Match: key = "X.Y.Z" (simple string version deps)
+    new_text = re.sub(
+        r'((?:libc|anyhow|clap|ctrlc|flate2|regex|libbpf-rs)\s*=\s*(?:\{[^}]*version\s*=\s*|))"(\d+\.\d+\.\d+)"',
+        normalize_version,
+        text,
+    )
+    # Also handle exact pin: "=X.Y.Z" -> "=X.Y.Z" (leave exact pins alone)
+    # The regex above won't match "=0.26.1" because of the = prefix, so we're safe.
+
+    if new_text != text:
+        open(cargo_path, "w").write(new_text)
+        print("  NORMALIZE: dependency versions reduced to API boundaries")
+        return 1
+    print("  NORMALIZE: versions already normalized")
+    return 0
+
+
 def patch_intf_types(dst_root):
     """Add portable type definitions so bindgen can parse intf.h without vmlinux.h."""
     intf_path = os.path.join(dst_root, "src", "bpf", "intf.h")
@@ -281,6 +323,253 @@ def patch_intf_types(dst_root):
     new_text = text.replace(anchor, anchor + type_compat)
     open(intf_path, "w").write(new_text)
     print("  PATCH: intf.h type compatibility (u64/u8 for bindgen)")
+    return 1
+
+
+def patch_dsq_move_to_local(dst_root):
+    """Add enq_flags=0 to scx_bpf_dsq_move_to_local() calls for scx monorepo.
+
+    Standalone uses a 1-arg compat macro. scx monorepo uses the 2-arg native API.
+    """
+    bpf_path = os.path.join(dst_root, "src", "bpf", "main.bpf.c")
+    if not os.path.exists(bpf_path):
+        print("  WARNING: src/bpf/main.bpf.c not found")
+        return 0
+
+    text = open(bpf_path).read()
+    token = "scx_bpf_dsq_move_to_local("
+    parts = []
+    count = 0
+    i = 0
+
+    while i < len(text):
+        j = text.find(token, i)
+        if j == -1:
+            parts.append(text[i:])
+            break
+
+        parts.append(text[i:j + len(token)])
+        i = j + len(token)
+
+        # find matching close paren
+        depth = 1
+        k = i
+        while k < len(text) and depth > 0:
+            if text[k] == '(':
+                depth += 1
+            elif text[k] == ')':
+                depth -= 1
+            k += 1
+
+        inner = text[i:k - 1]
+        if not inner.rstrip().endswith(", 0"):
+            parts.append(inner + ", 0)")
+            count += 1
+        else:
+            parts.append(inner + ")")
+        i = k
+
+    if count:
+        open(bpf_path, "w").write("".join(parts))
+        print(f"  PATCH: scx_bpf_dsq_move_to_local -> 2-arg ({count} calls)")
+        return count
+    print("  PATCH: scx_bpf_dsq_move_to_local already 2-arg")
+    return 0
+
+
+def read_scx_utils_version(scx_root):
+    """Read scx_utils version from the monorepo's rust/scx_utils/Cargo.toml."""
+    cargo_path = os.path.join(scx_root, "rust", "scx_utils", "Cargo.toml")
+    if not os.path.exists(cargo_path):
+        print(f"  WARNING: {cargo_path} not found, falling back to wildcard version")
+        return "*"
+    text = open(cargo_path).read()
+    m = re.search(r'^version\s*=\s*"([^"]+)"', text, re.MULTILINE)
+    if not m:
+        print(f"  WARNING: no version found in {cargo_path}, falling back to wildcard")
+        return "*"
+    return m.group(1)
+
+
+def add_scx_utils_dep(dst_root, scx_root):
+    """Add scx_utils dependency to Cargo.toml [dependencies]."""
+    version = read_scx_utils_version(scx_root)
+    cargo_path = os.path.join(dst_root, "Cargo.toml")
+    text = open(cargo_path).read()
+
+    if "scx_utils" in text:
+        print("  DEP: scx_utils already present")
+        return 0
+
+    scx_utils_line = f'scx_utils = {{ path = "../../../rust/scx_utils", version = "{version}" }}'
+    # Insert after the [dependencies] header
+    new_text = text.replace(
+        "[dependencies]\n",
+        f"[dependencies]\n{scx_utils_line}\n",
+    )
+    if new_text != text:
+        open(cargo_path, "w").write(new_text)
+        print(f"  DEP: added scx_utils (version {version})")
+        return 1
+    print("  WARNING: could not find [dependencies] section")
+    return 0
+
+
+def patch_version_display(dst_root):
+    """Patch main.rs to use scx_utils::build_id for version display.
+
+    Replaces custom PANDEMONIUM_BUILD_ID/PANDEMONIUM_TARGET env vars with
+    scx_utils::build_id::full_version(), matching other scx schedulers.
+    """
+    main_path = os.path.join(dst_root, "src", "main.rs")
+    if not os.path.exists(main_path):
+        print("  WARNING: src/main.rs not found")
+        return 0
+
+    text = open(main_path).read()
+    changes = 0
+
+    # Add use scx_utils::build_id import after existing use statements
+    if "use scx_utils::build_id" not in text:
+        text = text.replace(
+            "use scheduler::Scheduler;",
+            "use scheduler::Scheduler;\nuse scx_utils::build_id;",
+        )
+        changes += 1
+
+    # Replace clap version attribute with disable_version_flag + manual flag
+    old_clap = (
+        '#[command(version = concat!(env!("CARGO_PKG_VERSION"), '
+        'env!("PANDEMONIUM_BUILD_ID"), " ", env!("PANDEMONIUM_TARGET")))]\n'
+        '#[command(about = "PANDEMONIUM -- ADAPTIVE LINUX SCHEDULER")]'
+    )
+    new_clap = (
+        "#[command(\n"
+        "    version,\n"
+        "    disable_version_flag = true,\n"
+        '    about = "PANDEMONIUM -- ADAPTIVE LINUX SCHEDULER"\n'
+        ")]"
+    )
+    if old_clap in text:
+        text = text.replace(old_clap, new_clap)
+        changes += 1
+
+    # Add --version flag to Cli struct (after verbose field)
+    version_field = (
+        "    /// Print scheduler version and exit.\n"
+        "    #[arg(long)]\n"
+        "    version: bool,"
+    )
+    if "version: bool" not in text:
+        text = text.replace(
+            "    #[arg(short, long)]\n    verbose: bool,",
+            "    #[arg(short, long)]\n    verbose: bool,\n\n" + version_field,
+        )
+        changes += 1
+
+    # Replace banner log_info with build_id::full_version
+    old_banner = (
+        '    log_info!(\n'
+        '        "scx_pandemonium {}{} {} SMT {}",\n'
+        '        env!("CARGO_PKG_VERSION"),\n'
+        '        env!("PANDEMONIUM_BUILD_ID"),\n'
+        '        env!("PANDEMONIUM_TARGET"),\n'
+        '        if smt_on { "on" } else { "off" }\n'
+        '    );'
+    )
+    new_banner = (
+        '    log_info!(\n'
+        '        "scx_pandemonium {} SMT {}",\n'
+        '        build_id::full_version(env!("CARGO_PKG_VERSION")),\n'
+        '        if smt_on { "on" } else { "off" }\n'
+        '    );'
+    )
+    if old_banner in text:
+        text = text.replace(old_banner, new_banner)
+        changes += 1
+
+    # Add --version handler in main() before the match block
+    version_handler = (
+        '\n    if cli.version {\n'
+        '        println!(\n'
+        '            "scx_pandemonium {}",\n'
+        '            build_id::full_version(env!("CARGO_PKG_VERSION"))\n'
+        '        );\n'
+        '        return Ok(());\n'
+        '    }\n'
+    )
+    if "if cli.version {" not in text:
+        text = text.replace(
+            "    match cli.command {",
+            version_handler + "\n    match cli.command {",
+        )
+        changes += 1
+
+    if changes:
+        open(main_path, "w").write(text)
+        print(f"  PATCH: main.rs version display -> scx_utils::build_id ({changes} changes)")
+        return changes
+    print("  PATCH: main.rs version display already patched")
+    return 0
+
+
+def patch_ops_version_suffix(dst_root):
+    """Inject version suffix into struct_ops name for scx_loader GUI display.
+
+    scx_loader reads /sys/kernel/sched_ext/root/ops to get the scheduler name
+    and version. Without this, the version appears in logs but not in the GUI.
+    Matches the pattern used by scx_cake, scx_flash, etc.
+    """
+    sched_path = os.path.join(dst_root, "src", "scheduler.rs")
+    if not os.path.exists(sched_path):
+        print("  WARNING: src/scheduler.rs not found")
+        return 0
+
+    text = open(sched_path).read()
+
+    if "ops_version_suffix" in text:
+        print("  PATCH: ops version suffix already present")
+        return 0
+
+    # Insert version suffix injection between open and load
+    inject_block = (
+        '        let mut open_skel = builder.open(open_object)?;\n'
+        '\n'
+        '        // INJECT VERSION SUFFIX INTO OPS NAME FOR scx_loader GUI\n'
+        '        {\n'
+        '            let ops = open_skel.struct_ops.pandemonium_ops_mut();\n'
+        '            let name_field = &mut ops.name;\n'
+        '            let version_suffix = scx_utils::build_id::ops_version_suffix(env!("CARGO_PKG_VERSION"));\n'
+        '            let bytes = version_suffix.as_bytes();\n'
+        '            let mut i = 0;\n'
+        '            let mut bytes_idx = 0;\n'
+        '            let mut found_null = false;\n'
+        '            while i < name_field.len() - 1 {\n'
+        '                found_null |= name_field[i] == 0;\n'
+        '                if !found_null {\n'
+        '                    i += 1;\n'
+        '                    continue;\n'
+        '                }\n'
+        '                if bytes_idx < bytes.len() {\n'
+        '                    name_field[i] = bytes[bytes_idx] as i8;\n'
+        '                    bytes_idx += 1;\n'
+        '                } else {\n'
+        '                    break;\n'
+        '                }\n'
+        '                i += 1;\n'
+        '            }\n'
+        '            name_field[i] = 0;\n'
+        '        }'
+    )
+
+    old_anchor = '        let mut open_skel = builder.open(open_object)?;'
+    if old_anchor not in text:
+        print("  WARNING: could not find open_skel anchor in scheduler.rs")
+        return 0
+
+    new_text = text.replace(old_anchor, inject_block)
+    open(sched_path, "w").write(new_text)
+    print("  PATCH: scheduler.rs ops version suffix (scx_loader GUI)")
     return 1
 
 
@@ -396,8 +685,13 @@ def main():
     replace_build_rs(dst_root)
     swap_build_deps(dst_root, scx_root)
     fix_libbpf_vendoring(dst_root)
+    normalize_dep_versions(dst_root)
     patch_bpf_skel_include(dst_root)
     patch_intf_types(dst_root)
+    patch_dsq_move_to_local(dst_root)
+    add_scx_utils_dep(dst_root, scx_root)
+    patch_version_display(dst_root)
+    patch_ops_version_suffix(dst_root)
 
     # STEP 5: WORKSPACE REGISTRATION
     print("\n[5] WORKSPACE REGISTRATION")

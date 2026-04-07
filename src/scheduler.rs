@@ -189,6 +189,7 @@ impl<'a> Scheduler<'a> {
                 if stats.longrun_mode_active > total.longrun_mode_active {
                     total.longrun_mode_active = stats.longrun_mode_active;
                 }
+                total.nr_overflow_rescue += stats.nr_overflow_rescue;
             }
         }
 
@@ -295,6 +296,19 @@ impl<'a> Scheduler<'a> {
         self.skel
             .maps
             .l2_siblings
+            .update(&key, &val, libbpf_rs::MapFlags::ANY)?;
+        Ok(())
+    }
+
+    // POPULATE RESISTANCE AFFINITY RANK MAP
+    // affinity_rank[cpu * MAX_AFFINITY_CANDIDATES + slot] = target_cpu
+    // SORTED BY ASCENDING R_EFF FROM LAPLACIAN PSEUDOINVERSE
+    pub fn write_affinity_rank(&self, cpu: u32, slot: u32, target_cpu: u32) -> Result<()> {
+        let key = (cpu * 16 + slot).to_ne_bytes(); // MAX_AFFINITY_CANDIDATES = 16
+        let val = target_cpu.to_ne_bytes();
+        self.skel
+            .maps
+            .affinity_rank
             .update(&key, &val, libbpf_rs::MapFlags::ANY)?;
         Ok(())
     }
