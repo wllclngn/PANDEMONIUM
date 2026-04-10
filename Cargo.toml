@@ -6,7 +6,7 @@ description = "A behavioral, adaptive sched_ext scheduler with three-tier classi
 license = "GPL-2.0-only"
 
 [dependencies]
-libbpf-rs = { version = "=0.26.1", default-features = false }
+libbpf-rs = { version = "=0.26.2", default-features = false }
 libc = "0.2.175"
 anyhow = "1.0.65"
 clap = { version = "4.5.41", features = ["derive"] }
@@ -18,7 +18,7 @@ regex = "1.11.2"
 libc = "0.2.175"
 
 [build-dependencies]
-libbpf-cargo = "0.26"
+libbpf-cargo = "=0.26.2"
 
 [profile.release]
 opt-level = 3
