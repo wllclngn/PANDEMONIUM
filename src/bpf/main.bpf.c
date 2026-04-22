@@ -30,13 +30,7 @@ const volatile u64 nr_cpu_ids = 1;
 
 // BEHAVIORAL CONSTANTS
 
-// TEST: CUMULATIVE BURST COUNTER FOR RUST TELEMETRY VISIBILITY.
-// INCREMENTS PER-CPU STAT EACH TICK BURST IS DETECTED INSTEAD OF
-// SNAPSHOT (WHICH THE 1HZ RUST POLL ALWAYS MISSES). DISABLE FOR
-// PRODUCTION -- THE PER-TICK INCREMENT IS UNNECESSARY OVERHEAD
-// ONCE TELEMETRY VALIDATION IS COMPLETE.
-#define BURST_COUNTER_TEST 1
-#define TRACE_SCHED 1
+#define TRACE_SCHED 0
 
 #define TIER_BATCH        0
 #define TIER_INTERACTIVE  1
@@ -57,9 +51,29 @@ const volatile u64 nr_cpu_ids = 1;
 #define LAG_CAP_NS           (40ULL * 1000000ULL)
 
 #define SLICE_MIN_NS 100000     // 100US FLOOR
-#define STARVATION_RESCUE_NS (500ULL * 1000000ULL) // 500MS HARD LIMIT
-// OVERFLOW SOJOURN RESCUE: COMPUTED IN init() FROM nr_cpu_ids
-// 2C: 4MS, 4C: 8MS, 5C+: 10MS. SEE pandemonium_init().
+// starvation_rescue_ns AND overflow_sojourn_rescue_ns ARE DERIVED FROM
+// knobs->topology_tau_ns VIA scale_tau() AT THE FIRST CPU-0 TICK. SEE
+// apply_tau_scaling() AND pandemonium_init().
+
+// FIEDLER-SCALED TIMING CONSTANTS (Q16 FIXED-POINT DIMENSIONLESS RATIOS).
+// EACH k_i ENCODES (target_ns / tau_ns) AT THE 12C REFERENCE TOPOLOGY WHERE
+// tau = 40MS. scale_tau(tau, k_i) REPRODUCES THE TARGET VALUE.
+#define K_Q16_SHIFT             16
+#define K_SOJOURN_INTERVAL       19661u   // 0.30   (12MS @ tau=40MS)
+#define K_OVERFLOW_RESCUE        16384u   // 0.25   (10MS @ tau=40MS)
+#define K_CODEL_FLOOR             1147u   // 0.0175 (700US @ tau=40MS)
+#define K_STARVATION_RESCUE     273285u   // 4.17   (166MS @ tau=40MS)
+#define K_LONGRUN              3276800u   // 50.0   (2000MS @ tau=40MS)
+#define K_CODEL_MAX               3277u   // 0.05   (2MS @ tau=40MS)
+
+// OSCILLATOR DYNAMICS DERIVED FROM tau SO THE CONTROLLER RUNS ON THE SAME
+// TIME CONSTANT AS THE CoDel TARGET RANGE IT MODULATES. pull_scale AND
+// damping_shift ARE SMALL INTEGERS (1-4 AND 1-5 RESPECTIVELY) SO THEY USE
+// DIRECT-DIVIDE RATHER THAN Q16 (Q16 LOSES PRECISION FOR SMALL-INTEGER
+// OUTPUTS). velocity_cap COUPLES TO pull_scale: vcap = 50000 * pull.
+#define K_OSC_PULL_THRESH_NS    10000000u  // 10MS PER pull-scale STEP
+#define K_OSC_DAMP_THRESH_NS     8000000u  //  8MS PER damping-shift STEP
+#define OSC_VELOCITY_CAP_PER_PULL  50000u  // vcap = OSC_VELOCITY_CAP_PER_PULL * pull
 
 
 // GLOBALS
@@ -70,7 +84,13 @@ static u64 vtime_now;
 // TICK-BASED INTERACTIVE PREEMPTION SIGNAL
 // SET BY enqueue() WHEN NON-BATCH TASK HITS OVERFLOW DSQ.
 // CLEARED BY tick() AFTER PREEMPTING A BATCH TASK.
+// latcrit_waiting IS A SHARPER VARIANT: SET WHEN A TIER_LAT_CRITICAL TASK
+// SPECIFICALLY IS WAITING. tick() USES IT TO TIGHTEN THE PREEMPT THRESHOLD
+// SO AUDIO / COMPOSITOR / OTHER TIGHT-DEADLINE WAKERS DON'T SIT BEHIND A
+// FULL BATCH SLICE WORTH OF PREEMPT-WAIT. TIER INFO ALREADY AVAILABLE AT
+// THE enqueue() SITE -- WE'RE JUST PROPAGATING IT INTO THE SAFETY NET.
 static bool interactive_waiting;
+static bool latcrit_waiting;
 
 // SOJOURN TRACKERS: RECORD WHEN OVERFLOW DSQs TRANSITION FROM EMPTY.
 // DISPATCH STEP 0 CHECKS THESE TO RESCUE OVERFLOW TASKS AGING PAST
@@ -95,64 +115,47 @@ static u64 starvation_rescue_ns;
 static u64 overflow_sojourn_rescue_ns;
 static u32 pcpu_depth_base;
 
-// UNIFIED SIGMOID + DAMPED OSCILLATION STALL DETECTION
-// VARIABLE MARGIN INTERPOLATES BETWEEN CODEL AND SMOOTH SIGMOID:
-//   SMALL MARGIN (2C): SHARP TRANSITION -> NEAR-BINARY CODEL BEHAVIOR
-//   LARGE MARGIN (12C): SMOOTH TRANSITION -> ADAPTIVE SIGMOID BEHAVIOR
-// ONE CODE PATH. NO MODE SPLIT. CORE COUNT BAKED INTO CONSTANTS AT INIT.
-// THREE ZONES: FLOWING (P<25%), UNCERTAIN (25-75%), STALLED (P>75%)
-// CENTER ADAPTS VIA DAMPED OSCILLATION: RESCUE TIGHTENS, QUIET RELAXES.
-// DAMPING + PULL STRENGTH ALSO CORE-SCALED:
-//   2C: HEAVY DAMPING, WEAK PULL -> CENTER BARELY MOVES (FIXED THRESHOLD)
-//   12C: LIGHT DAMPING, STRONG PULL -> CENTER TRACKS STALL POINT
-// REFERENCE: VAN JACOBSON CODEL (RFC 8289) + DAMPED HARMONIC OSCILLATOR
-#define SOJOURN_TARGET_NS     500000   // 500us: INITIAL SIGMOID CENTER
-#define SIGMOID_P_MAX         256      // FIXED-POINT 1.0
-#define SIGMOID_LOW_THRESH    64       // 25%: BELOW = FLOWING
-#define SIGMOID_HIGH_THRESH   192      // 75%: ABOVE = STALLED
-#define SIGMOID_CENTER_MAX    2000000  // 2ms: CEILING
-#define SIGMOID_PULL_NS       8000     // BASE TIGHTEN IMPULSE
-#define SIGMOID_RELAX_NS      1000     // RELAX IMPULSE PER QUIET TICK
+// CODEL STALL DETECTION WITH OSCILLATOR-ADAPTED TARGET
+// BINARY FLOWING/STALLED DECISION (CoDel): IF MIN SOJOURN STAYS ABOVE THE
+// TARGET FOR AN INTERVAL, THE DSQ IS DECLARED STALLED AND RESCUE FIRES.
+// THE TARGET ITSELF IS ADAPTED BY A DAMPED HARMONIC OSCILLATOR:
+//   RESCUE EVENTS APPLY A NEGATIVE IMPULSE (TIGHTEN: DETECT STALLS SOONER)
+//   QUIET TICKS APPLY A POSITIVE IMPULSE (RELAX: TOLERATE MORE SOJOURN)
+//   VELOCITY DECAYS VIA BIT-SHIFT DAMPING FOR STABILITY
+// ALL OSCILLATOR PARAMETERS (MARGIN, DAMPING, PULL SCALE, VELOCITY CAP,
+// TARGET FLOOR) ARE CORE-SCALED AT init() AND HELD CONSTANT AT RUNTIME.
+// REFERENCE: VAN JACOBSON CoDel (RFC 8289) + DAMPED HARMONIC OSCILLATOR.
+#define OSCILLATOR_PULL_NS  8000     // BASE TIGHTEN IMPULSE
+#define OSCILLATOR_RELAX_NS 1000     // RELAX IMPULSE PER QUIET TICK
 // CORE-SCALED CONSTANTS (SET ONCE IN init())
-static u64 sigmoid_margin_ns;          // TRANSITION HALF-WIDTH
-static u32 sigmoid_p_shift;            // log2(margin/128) FOR BPF-SAFE DIVISION
-static u32 sigmoid_damping;            // VELOCITY DECAY SHIFT
-static u32 sigmoid_pull_scale;         // RESCUE IMPULSE MULTIPLIER
-static s64 sigmoid_velocity_cap;       // VELOCITY CLAMP
-static u64 sigmoid_center_min;         // CORE-SCALED FLOOR FOR TARGET
+static u32 oscillator_damping_shift;      // VELOCITY DECAY SHIFT
+static u32 oscillator_pull_scale;         // RESCUE IMPULSE MULTIPLIER
+static s64 oscillator_velocity_cap;       // VELOCITY CLAMP
+static u64 codel_target_floor_ns;         // CORE-SCALED FLOOR FOR TARGET
 // ADAPTIVE STATE
 static u64 sojourn_interval_ns;        // CORE-SCALED, UNCERTAIN ZONE TIMER
-static u64 sigmoid_center_ns;          // ADAPTIVE CENTER
-static s64 sigmoid_velocity_ns;        // DAMPED OSCILLATION VELOCITY
+static u64 codel_target_ns;          // ADAPTIVE CENTER
+static s64 oscillator_velocity_ns;        // DAMPED OSCILLATION VELOCITY
 static u64 prev_rescue_snapshot;       // LAST-SEEN RESCUE COUNT
 static u64 global_rescue_count;        // ATOMIC CROSS-CPU RESCUE ACCUMULATOR
 static u64 pcpu_min_sojourn_ns[MAX_CPUS];
 static u64 pcpu_stall_start_ns[MAX_CPUS];
 
-// CUSUM BURST DETECTION (TOTAL-ENQUEUE)
-// MONITORS ENQUEUE RATE TO DETECT FORK/EXEC STORMS.
-// SAMPLES EVERY 64TH ENQUEUE: TRACKS TIME INTERVAL (SHORTER = BURST).
-// EFFECTIVE FOR BPF-ONLY (1MS SLICES). RATE-BOUNDED UNDER ADAPTIVE (4MS).
-static u64 cusum_enq_count;
-static u64 cusum_last_check_ns;
-static u64 cusum_interval_ewma;
-static u64 cusum_s;
-static u64 cusum_lock;
-static bool burst_mode;
-
-// WAKEUP RATE COUNTER: ABSOLUTE BURST DETECTION FOR ADAPTIVE MODE.
-// TOTAL-ENQUEUE CUSUM IS RATE-BOUNDED BY NCPU/SLICE_NS -- WITH 4MS HEAVY
-// SLICES, FORK STORMS DON'T CHANGE THE RATE ENOUGH TO TRIGGER.
-// ABSOLUTE RATE COUNTER: COUNT WAKEUPS SINCE LAST tick(). IF COUNT EXCEEDS
-// THRESHOLD (nr_cpu_ids * 2), THAT'S A FORK STORM. NO CALIBRATION NEEDED.
-static u64 wake_rate_count;
-
 // LONGRUN DETECTION
 // TRACKS SUSTAINED BATCH DSQ PRESSURE. WHEN BATCH DSQ IS NON-EMPTY
-// FOR > LONGRUN_THRESH_NS, TIGHTEN DEFICIT RATIO TO INCREASE BATCH SHARE.
+// FOR > longrun_thresh_ns, TIGHTEN DEFICIT RATIO TO INCREASE BATCH SHARE.
 // CLEARS WHEN BATCH DSQ EMPTIES.
-#define LONGRUN_THRESH_NS (2000ULL * 1000000ULL)
+// longrun_thresh_ns AND codel_target_max_ns ARE PROMOTED FROM #define TO
+// RUNTIME STATICS SO THEY CAN BE REDERIVED FROM knobs->topology_tau_ns
+// WHEN TAU-SCALING IS ACTIVE. LEGACY DEFAULTS ARE 2s AND 2ms.
+static u64 longrun_thresh_ns = 2000000000ULL;     // 2s -- legacy default
+static u64 codel_target_max_ns = 2000000ULL;      // 2ms -- legacy default
 static bool longrun_mode;
+
+// TAU-SCALING: SNAPSHOT OF LAST knobs->topology_tau_ns APPLIED.
+// TICK() ON CPU 0 COMPARES AGAINST CURRENT KNOB VALUE; IF CHANGED, ALL
+// TAU-DERIVED STATICS ARE REDERIVED. ZERO = LEGACY FORMULAS IN EFFECT.
+static u64 last_tau_snapshot;
 
 // USER EXIT
 
@@ -369,7 +372,15 @@ static __always_inline s32 find_idle_l2_sibling(const struct task_ctx *tctx)
 // NO DEPTH GATE. NO DSQ DISPATCH. PURE IDLE SEARCH.
 // REFERENCE: KYNG ET AL. EFFECTIVE RESISTANCE (STOC 2011, FOCS 2022)
 
-#define AFFINITY_SEARCH_LIMIT 3
+// BUDGET IS ONLINE CANDIDATES CHECKED, NOT TOTAL SLOTS WALKED.
+// affinity_rank IS BUILT AT INIT AND KEEPS OFFLINE ENTRIES AFTER HOTPLUG.
+// WALKING FROM RANK 0 MAY HIT SEVERAL OFFLINE SLOTS BEFORE AN ONLINE ONE;
+// THOSE SLOTS ARE CHEAP TO SKIP (ONE MAP LOOKUP EACH, NO IDLE CHECK).
+// THE EXPENSIVE OP IS scx_bpf_test_and_clear_cpu_idle; CAP THAT AT 3.
+// THIS IS ROBUST TO ANY HOTPLUG TOPOLOGY (12C->8C, 32C->4C, ETC.) --
+// OFFLINE ENTRIES DON'T ROB THE BUDGET, SO THE COST IS THE SAME ON A
+// FULLY-ONLINE SYSTEM AS THE ORIGINAL LIMIT=3 WAS.
+#define AFFINITY_SEARCH_ONLINE 3
 
 static __always_inline s32 find_idle_by_affinity(s32 src_cpu)
 {
@@ -377,13 +388,23 @@ static __always_inline s32 find_idle_by_affinity(s32 src_cpu)
 		return -1;
 
 	u32 base = (u32)src_cpu * MAX_AFFINITY_CANDIDATES;
-	for (int i = 0; i < AFFINITY_SEARCH_LIMIT; i++) {
+	u32 checked = 0;
+	for (int i = 0; i < MAX_AFFINITY_CANDIDATES; i++) {
 		u32 key = base + (u32)i;
 		u32 *val = bpf_map_lookup_elem(&affinity_rank, &key);
-		if (!val || *val == (u32)-1 || *val >= nr_cpu_ids)
+		// SENTINEL OR MISSING -> END OF LIST, STOP.
+		if (!val || *val == (u32)-1)
 			break;
+		// OFFLINE CPU POST-HOTPLUG -> SKIP WITHOUT COSTING BUDGET.
+		// affinity_rank IS BUILT AT INIT FROM THE FULL TOPOLOGY;
+		// HOTPLUG DOESN'T REBUILD IT.
+		if (*val >= nr_cpu_ids)
+			continue;
 		if (scx_bpf_test_and_clear_cpu_idle((s32)*val))
 			return (s32)*val;
+		// BUDGET IS ONLINE CANDIDATES, NOT SLOTS WALKED.
+		if (++checked >= AFFINITY_SEARCH_ONLINE)
+			break;
 	}
 
 	return -1;
@@ -401,7 +422,7 @@ static __always_inline void update_pcpu_sojourn(u32 cpu, u64 now)
 }
 
 // CODEL STALL DETECTION: MIN SOJOURN ABOVE DYNAMIC TARGET FOR INTERVAL = STALLED.
-// THE TARGET (sigmoid_center_ns) IS MODULATED BY DAMPED OSCILLATION IN tick().
+// THE TARGET (codel_target_ns) IS MODULATED BY DAMPED OSCILLATION IN tick().
 // RESCUES PULL THE TARGET DOWN (TIGHTEN). QUIET PUSHES IT UP (RELAX).
 // THE TARGET ADAPTS TO WHAT "NORMAL SOJOURN" IS ON THIS SYSTEM RIGHT NOW.
 static __always_inline bool pcpu_dsq_is_stalled(u32 cpu, u64 now)
@@ -409,7 +430,7 @@ static __always_inline bool pcpu_dsq_is_stalled(u32 cpu, u64 now)
 	if (cpu >= MAX_CPUS) return false;
 	u64 min_s = pcpu_min_sojourn_ns[cpu];
 
-	if (min_s < sigmoid_center_ns) {
+	if (min_s < codel_target_ns) {
 		pcpu_stall_start_ns[cpu] = 0;
 		pcpu_min_sojourn_ns[cpu] = ~0ULL;
 		return false;
@@ -427,6 +448,114 @@ static __always_inline bool pcpu_dsq_is_stalled(u32 cpu, u64 now)
 	}
 
 	return false;
+}
+
+// SOJOURN GATE: RETURNS TRUE IF BOTH OVERFLOW DSQs ARE WITHIN THE RESCUE
+// WINDOW (i.e. IT IS SAFE TO RETURN FROM dispatch() AFTER A STEP 0/1/1b HIT
+// WITHOUT STARVING A SHARED OVERFLOW DSQ). CALLERS SHORT-CIRCUIT AS
+// `if (sojourn_gate_pass(now)) return;` TO KEEP THE HOT PATH FLAT.
+static __always_inline bool sojourn_gate_pass(u64 now)
+{
+	u64 ie = interactive_enqueue_ns;
+	u64 be = batch_enqueue_ns;
+	return (ie == 0 || (now - ie) <= overflow_sojourn_rescue_ns) &&
+	       (be == 0 || (now - be) <= overflow_sojourn_rescue_ns);
+}
+
+// TAU-SCALED TIMING CONSTANT DERIVATION.
+//   tau_ns * k_q16 / 65536. When tau_ns is 0 (feature-flag off), callers are
+//   expected to skip this and use their legacy formula. No div, no float --
+//   verifier-clean. The multiply cannot overflow u64 for any sane (tau, k_i)
+//   pair (tau <= 40e6 ns, k_i <= ~3.3e6 Q16 -> product ~1.3e14, fits in u64).
+static __always_inline u64 scale_tau(u64 tau_ns, u64 k_q16)
+{
+	return (tau_ns * k_q16) >> K_Q16_SHIFT;
+}
+
+// TAU-SCALING RE-DERIVATION.
+//   Init runs before Rust writes topology_tau_ns, so pandemonium_init() uses
+//   legacy core-scaled formulas. First tick on CPU 0 calls this after reading
+//   knobs; if tau differs from last_tau_snapshot, every tau-scaled static is
+//   re-derived via scale_tau() and clamped to its legacy safety rail.
+//   Hotplug flows through the same path (Rust re-writes tau, next tick picks
+//   it up). tau == 0 reverts to legacy formulas unchanged.
+static __always_inline void apply_tau_scaling(u64 tau_ns)
+{
+	// SHORT-CIRCUIT ON UNCHANGED OR ZERO tau. THE ZERO CASE COVERS THE
+	// ~1MS WINDOW BEFORE RUST WRITES THE KNOB AFTER struct_ops ATTACH;
+	// INIT-TIME MIDPOINT CONSTANTS STAND UNTIL tau ARRIVES. AFTER THAT,
+	// EVERY CHANGE TO tau (HOTPLUG) RE-DERIVES THE FULL SET.
+	if (tau_ns == 0 || tau_ns == last_tau_snapshot)
+		return;
+	last_tau_snapshot = tau_ns;
+
+	// DERIVE EACH TIMING CONSTANT VIA k_i * tau, THEN APPLY THE CLAMP AS
+	// A SAFETY RAIL DURING ROLLOUT (KILL SWITCH IF A k_i IS MISCALIBRATED).
+	u64 v;
+
+	v = scale_tau(tau_ns, K_SOJOURN_INTERVAL);
+	if (v < 2000000ULL) v = 2000000ULL;
+	if (v > 12000000ULL) v = 12000000ULL;
+	sojourn_interval_ns = v;
+
+	v = scale_tau(tau_ns, K_OVERFLOW_RESCUE);
+	if (v < 4000000ULL) v = 4000000ULL;
+	if (v > 10000000ULL) v = 10000000ULL;
+	overflow_sojourn_rescue_ns = v;
+
+	v = scale_tau(tau_ns, K_STARVATION_RESCUE);
+	if (v < 20000000ULL) v = 20000000ULL;
+	if (v > 500000000ULL) v = 500000000ULL;
+	starvation_rescue_ns = v;
+
+	v = scale_tau(tau_ns, K_CODEL_FLOOR);
+	if (v < 200000ULL) v = 200000ULL;
+	if (v > 800000ULL) v = 800000ULL;
+	codel_target_floor_ns = v;
+
+	v = scale_tau(tau_ns, K_LONGRUN);
+	if (v < 500000000ULL) v = 500000000ULL;       // FLOOR 500MS (HALF LEGACY)
+	if (v > 8000000000ULL) v = 8000000000ULL;     // CEILING 8S (4X LEGACY)
+	longrun_thresh_ns = v;
+
+	v = scale_tau(tau_ns, K_CODEL_MAX);
+	if (v < 1000000ULL) v = 1000000ULL;           // FLOOR 1MS
+	if (v > 8000000ULL) v = 8000000ULL;           // CEILING 8MS
+	codel_target_max_ns = v;
+
+	// OSCILLATOR DYNAMICS: DERIVED FROM tau SO THE CONTROLLER RUNS ON THE
+	// SAME TIME CONSTANT AS ITS TARGET RANGE. DIRECT-DIVIDE (NOT Q16)
+	// BECAUSE pull_scale (1-4) AND damping_shift (1-5) ARE SMALL INTEGERS.
+	// REFERENCE: tau=40MS (12C HETEROGENEOUS) -> pull=4, damp=5 MATCHING
+	// PRIOR 12C VALUES.
+	u32 pull = (u32)(tau_ns / K_OSC_PULL_THRESH_NS);
+	if (pull < 1) pull = 1;
+	if (pull > 4) pull = 4;
+	oscillator_pull_scale = pull;
+
+	u32 damp = (u32)(tau_ns / K_OSC_DAMP_THRESH_NS);
+	if (damp < 1) damp = 1;
+	if (damp > 5) damp = 5;
+	oscillator_damping_shift = damp;
+
+	// velocity_cap PRESERVES COUPLING TO pull_scale.
+	oscillator_velocity_cap = (s64)((u64)OSC_VELOCITY_CAP_PER_PULL * (u64)pull);
+}
+
+// PCPU DSQ DRAIN-AND-CLEAR: shared by STEP -1, STEP 0, STEP 1, STEP 1b.
+// CALLED AFTER A SUCCESSFUL scx_bpf_dsq_move_to_local((u64)cpu). CLEARS THE
+// PER-CPU ENQUEUE TIMESTAMP IF THE DSQ DRAINED EMPTY. CALLERS STILL OWN
+// THEIR COUNTER UPDATES (interactive_run/nr_overflow_rescue/global_rescue_count)
+// BECAUSE THOSE DIVERGE ACROSS SITES.
+static __always_inline void pcpu_drain_clear(u32 cpu)
+{
+	if (cpu >= MAX_CPUS)
+		return;
+	if (scx_bpf_dsq_nr_queued((u64)cpu) != 0)
+		return;
+	u64 old = pcpu_enqueue_ns[cpu];
+	if (old > 0)
+		__sync_val_compare_and_swap(&pcpu_enqueue_ns[cpu], old, 0);
 }
 
 // HISTOGRAM BUCKETING: MATCHES HIST_EDGES_NS AND SLEEP_EDGES_NS IN RUST
@@ -513,12 +642,16 @@ static __always_inline bool is_compositor(const struct task_struct *p)
 }
 
 // TRACE: FAST 4-BYTE COMM CHECK FOR SCHEDULER PROCESS TRACING
-// CATCHES "pandemonium" WITH ZERO MAP OVERHEAD. DISABLE VIA TRACE_SCHED=0.
+// CATCHES "pandemonium" WITH ZERO MAP OVERHEAD. GATED BY TRACE_SCHED BECAUSE
+// ALL CALL SITES ARE #if TRACE_SCHED -- WITHOUT THE GUARD ON THE DEFINITION,
+// CLANG WARNS -Wunused-function WHEN TRACE_SCHED=0 (SCX MONOREPO DEFAULT).
+#if TRACE_SCHED
 static __always_inline bool is_sched_task(const struct task_struct *p)
 {
 	return p->comm[0] == 'p' && p->comm[1] == 'a' &&
 	       p->comm[2] == 'n' && p->comm[3] == 'd';
 }
+#endif
 
 // EFFECTIVE WEIGHT: TIER-BASED MULTIPLIER ON NICE WEIGHT
 static __always_inline u64 effective_weight(const struct task_struct *p,
@@ -589,7 +722,9 @@ static __always_inline u64 task_deadline(struct task_struct *p,
 static __always_inline u64 task_slice(const struct task_ctx *tctx,
 				      const struct tuning_knobs *knobs)
 {
-	u64 base_slice = knobs ? ((burst_mode || longrun_mode)
+	// SLICE COMPRESSION: longrun_mode IS THE ONLY CONSUMER. SUSTAINED BATCH
+	// PRESSURE SWAPS IN burst_slice_ns; EVERYTHING ELSE USES slice_ns.
+	u64 base_slice = knobs ? (longrun_mode
 		? knobs->burst_slice_ns : knobs->slice_ns) : 1000000;
 	u64 base;
 
@@ -648,8 +783,6 @@ s32 BPF_STRUCT_OPS(pandemonium_select_cpu, struct task_struct *p,
 	// REFERENCE: kernel wake_wide() uses same wakee_flips signal.
 	//   Kyng et al. effective resistance for migration cost.
 	if (wake_flags & SCX_WAKE_SYNC) {
-		// COUNT WAKE_SYNC FOR BURST DETECTION (SIGMOID CONDITIONAL RELAX)
-		__sync_fetch_and_add(&wake_rate_count, 1);
 		struct task_struct *waker =
 			(struct task_struct *)bpf_get_current_task_btf();
 		if (waker) {
@@ -730,7 +863,10 @@ normal_path:;
 		struct tuning_knobs *knobs = get_knobs();
 		u64 sl = tctx ? task_slice(tctx, knobs) : 1000000;
 
-		u32 depth_thresh = burst_mode ? 1 : pcpu_depth_base;
+		// PER-CPU DSQ DEPTH GATE. STEP -1 RESCUE AND HARD STARVATION RESCUE
+		// (BOTH DRIVEN BY global_rescue_count) ARE THE STALL-RELIEF PATH;
+		// THE DEPTH=1 SPILL THAT USED TO TRIGGER HERE IS NO LONGER NEEDED.
+		u32 depth_thresh = pcpu_depth_base;
 		if ((u64)cpu < nr_cpu_ids &&
 		    scx_bpf_dsq_nr_queued((u64)cpu) < depth_thresh) {
 			// PER-CPU DSQ: CACHE-HOT, VISIBLE, STEALABLE
@@ -946,8 +1082,14 @@ void BPF_STRUCT_OPS(pandemonium_enqueue, struct task_struct *p,
 
 	// ARM TICK SAFETY NET: SIGNAL THAT INTERACTIVE TASKS ARE WAITING IN OVERFLOW.
 	// tick() CHECKS THIS FLAG TO PREEMPT BATCH TASKS VIA preempt_thresh_ns.
-	if (tctx && tctx->tier != TIER_BATCH)
+	// TIER_LAT_CRITICAL ALSO ARMS latcrit_waiting SO THE TICK PATH CAN USE A
+	// TIGHTER THRESHOLD -- AUDIO/COMPOSITOR WAKERS SHOULDN'T SIT BEHIND A FULL
+	// BATCH SLICE.
+	if (tctx && tctx->tier != TIER_BATCH) {
 		interactive_waiting = true;
+		if (tctx->tier == TIER_LAT_CRITICAL)
+			latcrit_waiting = true;
+	}
 
 	u64 kick_flags = is_wakeup ? SCX_KICK_PREEMPT : 0;
 	scx_bpf_kick_cpu(scx_bpf_task_cpu(p), kick_flags);
@@ -967,55 +1109,27 @@ void BPF_STRUCT_OPS(pandemonium_enqueue, struct task_struct *p,
 		}
 	}
 
-	// WAKEUP RATE COUNTER: INCREMENT ON EVERY WAKEUP.
-	// tick() READS AND RESETS THIS EVERY KERNEL TICK (1-4MS).
-	// THRESHOLD: nr_cpu_ids * 2 WAKEUPS PER TICK = FORK STORM.
-	if (is_wakeup)
-		__sync_fetch_and_add(&wake_rate_count, 1);
-
-	// TOTAL-ENQUEUE CUSUM: SAMPLE EVERY 64TH ENQUEUE.
-	// TRACKS TIME INTERVAL PER 64 ENQUEUES (SHORTER = HIGHER RATE).
-	// EWMA BASELINE SELF-TUNES TO ACTUAL SYSTEM CAPACITY.
-	u64 count = __sync_fetch_and_add(&cusum_enq_count, 1);
-	if ((count & 63) == 0) {
-		if (__sync_bool_compare_and_swap(&cusum_lock, 0, 1)) {
-			u64 now = bpf_ktime_get_ns();
-			u64 interval = now - cusum_last_check_ns;
-			cusum_last_check_ns = now;
-
-			if (cusum_interval_ewma == 0) {
-				cusum_interval_ewma = interval;
-			} else {
-				cusum_interval_ewma = cusum_interval_ewma
-					- (cusum_interval_ewma >> 3)
-					+ (interval >> 3);
-			}
-
-			u64 k = cusum_interval_ewma >> 2;
-			if (interval + k < cusum_interval_ewma)
-				cusum_s += (cusum_interval_ewma - interval - k);
-			else
-				cusum_s >>= 1;
-			__sync_lock_test_and_set(&cusum_lock, 0);
-		}
-	}
 }
 
 // DISPATCH: CPU IS IDLE AND NEEDS WORK
-// HYBRID PER-CPU + NODE DSQ DESIGN (v5.4.8):
+// HYBRID PER-CPU + NODE DSQ DESIGN:
 //   SELECT_CPU -> PER-CPU DSQ (DEPTH-GATED, VISIBLE, STEALABLE)
 //   ENQUEUE TIER 1/2 -> NODE DSQ (SHARED, ANY CPU DRAINS)
 //   ENQUEUE TIER 3 -> PER-NODE BATCH/INTERACTIVE DSQ
 //
-// 0. OWN PER-CPU DSQ (CACHE-HOT, ZERO CONTENTION)
-// 1. L2 WORK STEALING (SIBLING PER-CPU DSQs, SAME CACHE DOMAIN)
-// 2. DEFICIT GATE + OVERFLOW SOJOURN RESCUE (AGING OVERFLOW DSQ TASKS)
-// 3. DEFICIT CHECK (DRR: FORCE BATCH RESCUE AFTER BUDGET EXHAUSTED)
-// 4. HARD STARVATION RESCUE (ABSOLUTE SAFETY NET FOR BATCH)
-// 5. NODE INTERACTIVE OVERFLOW (ALL INTERACTIVE TASKS, VTIME-ORDERED)
-// 6. BATCH SOJOURN RESCUE + NODE BATCH OVERFLOW
-// 7. CROSS-NODE STEAL (BOTH INTERACTIVE AND BATCH PER REMOTE NODE)
-// 8. KEEP_RUNNING IF PREV STILL WANTS CPU AND NOTHING QUEUED
+// -1. GLOBAL PER-CPU DSQ STALL SCAN (v5.7.0: CLOSES KWORKER/JOURNAL CLASS)
+//  0. OWN PER-CPU DSQ (CACHE-HOT, ZERO CONTENTION)
+//  1. L2 WORK STEALING (SIBLING PER-CPU DSQs, SAME CACHE DOMAIN)
+//  1b. R_EFF CROSS-L2 FALLBACK (v5.7.0: TOPOLOGY-ASYMMETRIC CPUs)
+//  2. HARD STARVATION RESCUE (PRE-DEFICIT SAFETY NET, BOTH TIERS)
+//  3. DEFICIT GATE + OVERFLOW SOJOURN AMPLIFICATION
+//  4. BATCH OVERFLOW RESCUE (BUDGET-EXHAUSTED BATCH FORCE)
+//  5. DEFICIT COUNTER (DRR: INTERLEAVE BATCH INTO INTERACTIVE SERVICE)
+//  6. NODE INTERACTIVE OVERFLOW (LAT_CRIT + INTERACTIVE, VTIME-ORDERED)
+//  7. BATCH SOJOURN RESCUE (CODEL-BINARY STARVATION SAFETY NET)
+//  8. NODE BATCH OVERFLOW (NORMAL BATCH FALLBACK)
+//  9. CROSS-NODE STEAL (INTERACTIVE + BATCH PER REMOTE NODE)
+// 10. KEEP_RUNNING IF PREV STILL WANTS CPU AND NOTHING QUEUED
 void BPF_STRUCT_OPS(pandemonium_dispatch, s32 cpu, struct task_struct *prev)
 {
 	s32 node = __COMPAT_scx_bpf_cpu_node(cpu);
@@ -1025,18 +1139,43 @@ void BPF_STRUCT_OPS(pandemonium_dispatch, s32 cpu, struct task_struct *prev)
 	struct pandemonium_stats *s;
 	u64 now = bpf_ktime_get_ns();
 
+	// STEP -1: GLOBAL PER-CPU DSQ STALL SCAN.
+	// THE WATERFALL STEPS 0-1 ONLY TOUCH OWN + L2 SIBLING PER-CPU DSQs,
+	// SO A TASK ENQUEUED ON CPU X'S PER-CPU DSQ CAN STRAND IF CPU X AND
+	// ITS L2 SIBLINGS ALL RUN LONG-SLICE TASKS. THIS CAUSED THE
+	// 2026-04-09 (kworker/0:2, 35.2s) AND 2026-04-12
+	// (systemd-journal[430], 38.9s) WATCHDOG KILLS ON v5.6.0.
+	//
+	// FIX: BEFORE THE NORMAL WATERFALL, SCAN ALL PER-CPU DSQs. IF ANY
+	// HEAD HAS AGED PAST codel_target_ns + sojourn_interval_ns (THE
+	// OSCILLATOR-ADAPTED CoDel STALL WINDOW), DRAIN IT REGARDLESS OF
+	// WHICH CPU OWNS IT. SINGLE BOUNDED LOOP, MINIMAL STATE ->
+	// VERIFIER-FRIENDLY.
+	{
+		u64 threshold = codel_target_ns + sojourn_interval_ns;
+		for (u32 i = 0; i < MAX_CPUS; i++) {
+			if (i >= nr_cpu_ids) break;
+			u64 enq = pcpu_enqueue_ns[i];
+			if (enq == 0) continue;
+			if ((now - enq) < threshold) continue;
+			if (!scx_bpf_dsq_move_to_local((u64)i)) continue;
+			pcpu_drain_clear(i);
+			__sync_fetch_and_add(&global_rescue_count, 1);
+			s = get_stats();
+			if (s) {
+				s->nr_dispatches += 1;
+				s->nr_overflow_rescue += 1;
+			}
+			return;
+		}
+	}
+
 	// STEP 0: OWN PER-CPU DSQ -- HIGHEST PRIORITY, CACHE-HOT
 	if ((u64)cpu < nr_cpu_ids &&
 	    scx_bpf_dsq_move_to_local((u64)cpu)) {
 		// CODEL: UPDATE DRAIN RATE BEFORE CLEARING TIMESTAMP
 		update_pcpu_sojourn((u32)cpu, now);
-		if ((u32)cpu < MAX_CPUS &&
-		    scx_bpf_dsq_nr_queued((u64)cpu) == 0) {
-			u64 old = pcpu_enqueue_ns[cpu];
-			if (old > 0)
-				__sync_val_compare_and_swap(
-					&pcpu_enqueue_ns[cpu], old, 0);
-		}
+		pcpu_drain_clear((u32)cpu);
 		__sync_fetch_and_add(&interactive_run, 1);
 		s = get_stats();
 		if (s)
@@ -1044,19 +1183,15 @@ void BPF_STRUCT_OPS(pandemonium_dispatch, s32 cpu, struct task_struct *prev)
 		// SOJOURN GATE: ONLY RETURN IF SHARED DSQs ARE NOT STARVING.
 		// IF EITHER OVERFLOW DSQ HAS TASKS AGING PAST THRESHOLD,
 		// FALL THROUGH SO DOWNSTREAM RESCUE LOGIC CAN FIRE.
-		{
-			u64 ie = interactive_enqueue_ns;
-			u64 be = batch_enqueue_ns;
-			if ((ie == 0 || (now - ie) <= overflow_sojourn_rescue_ns) &&
-			    (be == 0 || (now - be) <= overflow_sojourn_rescue_ns))
-				return;
-		}
+		if (sojourn_gate_pass(now))
+			return;
 	}
 
 	// STEP 1: L2 WORK STEALING -- PULL FROM SIBLING PER-CPU DSQs
 	// SAME L2 CACHE DOMAIN = MINIMAL CACHE PENALTY ON STEAL.
 	// BOUNDED LOOP (MAX_L2_SIBLINGS), SAME PATTERN AS find_idle_l2_sibling.
 	u32 my_cpu = (u32)cpu;
+	bool stolen = false;
 	u32 *group = bpf_map_lookup_elem(&cache_domain, &my_cpu);
 	if (group) {
 		u32 base = *group * MAX_L2_SIBLINGS;
@@ -1071,28 +1206,56 @@ void BPF_STRUCT_OPS(pandemonium_dispatch, s32 cpu, struct task_struct *prev)
 			if (scx_bpf_dsq_move_to_local((u64)sibling)) {
 				// CODEL: UPDATE DRAIN RATE BEFORE CLEARING
 				update_pcpu_sojourn(sibling, now);
-				if (sibling < MAX_CPUS &&
-				    scx_bpf_dsq_nr_queued((u64)sibling) == 0) {
-					u64 old = pcpu_enqueue_ns[sibling];
-					if (old > 0)
-						__sync_val_compare_and_swap(
-							&pcpu_enqueue_ns[sibling],
-							old, 0);
-				}
+				pcpu_drain_clear(sibling);
 				__sync_fetch_and_add(&interactive_run, 1);
 				s = get_stats();
 				if (s)
 					s->nr_dispatches += 1;
+				stolen = true;
 				// SOJOURN GATE: SAME CHECK AS STEP 0.
-				{
-					u64 ie = interactive_enqueue_ns;
-					u64 be = batch_enqueue_ns;
-					if ((ie == 0 || (now - ie) <= overflow_sojourn_rescue_ns) &&
-					    (be == 0 || (now - be) <= overflow_sojourn_rescue_ns))
-						return;
-				}
+				if (sojourn_gate_pass(now))
+					return;
 				break;
 			}
+		}
+	}
+
+	// STEP 1b: R_EFF CROSS-L2 FALLBACK -- STEAL FROM NEAREST ONLINE PEERS.
+	// FIRES ONLY IF L2 STEAL FOUND NOTHING. NECESSARY FOR TOPOLOGY-
+	// ASYMMETRIC CPUs (e.g. SOLO AFTER HOTPLUG): A CPU WHOSE L2 PARTNER
+	// IS OFFLINE HAS NO L2 STEAL PATH AND ITS PEERS CAN'T REACH ITS WORK.
+	// WALKS affinity_rank (R_EFF-ORDERED) WITH THE SAME ONLINE-BUDGET
+	// PATTERN AS find_idle_by_affinity -- OFFLINE ENTRIES SKIPPED FREE,
+	// UP TO AFFINITY_SEARCH_ONLINE ONLINE CANDIDATES TESTED.
+	if (!stolen) {
+		u32 rbase = my_cpu * MAX_AFFINITY_CANDIDATES;
+		u32 rchecked = 0;
+		for (int i = 0; i < MAX_AFFINITY_CANDIDATES; i++) {
+			u32 key = rbase + (u32)i;
+			u32 *val = bpf_map_lookup_elem(&affinity_rank, &key);
+			if (!val || *val == (u32)-1)
+				break;
+			u32 peer = *val;
+			if (peer >= nr_cpu_ids)
+				continue;
+			if (peer == my_cpu) {
+				if (++rchecked >= AFFINITY_SEARCH_ONLINE)
+					break;
+				continue;
+			}
+			if (scx_bpf_dsq_move_to_local((u64)peer)) {
+				update_pcpu_sojourn(peer, now);
+				pcpu_drain_clear(peer);
+				__sync_fetch_and_add(&interactive_run, 1);
+				s = get_stats();
+				if (s)
+					s->nr_dispatches += 1;
+				if (sojourn_gate_pass(now))
+					return;
+				break;
+			}
+			if (++rchecked >= AFFINITY_SEARCH_ONLINE)
+				break;
 		}
 	}
 
@@ -1525,20 +1688,16 @@ void BPF_STRUCT_OPS(pandemonium_tick, struct task_struct *p)
 	struct pandemonium_stats *s = get_stats();
 	struct tuning_knobs *knobs = get_knobs();
 
-	// BURST DETECTION: TOTAL-ENQUEUE CUSUM OR WAKEUP RATE COUNTER.
-	// CUSUM: EFFECTIVE FOR BPF (1MS SLICES) WHERE ENQUEUE RATE SPIKES DURING BURST.
-	// WAKEUP RATE: EFFECTIVE FOR ADAPTIVE (4MS SLICES) WHERE CUSUM IS RATE-BOUNDED.
-	// ABSOLUTE THRESHOLD: nr_cpu_ids * 2 WAKEUPS PER TICK INTERVAL = FORK STORM.
-	// NO CALIBRATION NEEDED -- WORKS IMMEDIATELY ON FIRST TICK.
-	// burst_mode REDUCES SLICE (burst_slice_ns) AND PREEMPT THRESHOLD (0).
-	bool cusum_burst = cusum_interval_ewma > 0 &&
-		cusum_s > (cusum_interval_ewma << 1);
-	u64 wakeups = __sync_fetch_and_add(&wake_rate_count, 0);
-	bool wake_burst = wakeups > (nr_cpu_ids << 1);
+	// THE OSCILLATOR IS THE ONE DETECTOR. RESCUE DELTAS ARE THE ONLY SIGNAL
+	// IT CONSUMES; IT ADAPTS codel_target_ns WHICH DRIVES STEP -1 RESCUE +
+	// HARD STARVATION RESCUE. NO SEPARATE BURST DETECTOR. NO THRESHOLD FLAGS.
 	if (bpf_get_smp_processor_id() == 0) {
-		__sync_lock_test_and_set(&wake_rate_count, 0);
+		// TAU-SCALING: re-derive the timing statics if Rust wrote a new
+		// topology_tau_ns (initial detect or hotplug). Idempotent when
+		// tau is unchanged; cheap when it is (single compare + early out).
+		apply_tau_scaling(knobs ? knobs->topology_tau_ns : 0);
 
-		// SIGMOID DAMPED OSCILLATION: CORE-SCALED PULL + DAMPING
+		// DAMPED HARMONIC OSCILLATION: CORE-SCALED PULL + DAMPING
 		// 2C: HEAVY DAMPING, WEAK PULL -> CENTER BARELY MOVES
 		// 12C: LIGHT DAMPING, STRONG PULL -> CENTER TRACKS STALL POINT
 		{
@@ -1549,45 +1708,35 @@ void BPF_STRUCT_OPS(pandemonium_tick, struct task_struct *p)
 			s64 impulse;
 			if (delta > 0) {
 				u64 capped = delta > 8 ? 8 : delta;
-				impulse = -((s64)(capped * SIGMOID_PULL_NS *
-					sigmoid_pull_scale));
-			} else if (!wake_burst && !cusum_burst) {
-				impulse = (s64)SIGMOID_RELAX_NS;
+				impulse = -((s64)(capped * OSCILLATOR_PULL_NS *
+					oscillator_pull_scale));
 			} else {
-				impulse = 0;
+				impulse = (s64)OSCILLATOR_RELAX_NS;
 			}
 
-			sigmoid_velocity_ns += impulse;
-			sigmoid_velocity_ns -= sigmoid_velocity_ns >>
-				sigmoid_damping;
+			oscillator_velocity_ns += impulse;
+			oscillator_velocity_ns -= oscillator_velocity_ns >>
+				oscillator_damping_shift;
 
-			if (sigmoid_velocity_ns > sigmoid_velocity_cap)
-				sigmoid_velocity_ns = sigmoid_velocity_cap;
-			if (sigmoid_velocity_ns < -sigmoid_velocity_cap)
-				sigmoid_velocity_ns = -sigmoid_velocity_cap;
+			if (oscillator_velocity_ns > oscillator_velocity_cap)
+				oscillator_velocity_ns = oscillator_velocity_cap;
+			if (oscillator_velocity_ns < -oscillator_velocity_cap)
+				oscillator_velocity_ns = -oscillator_velocity_cap;
 
 			// MODULATE THE CODEL TARGET (WHAT COUNTS AS "ABOVE NORMAL")
 			// RESCUES -> PULL TARGET DOWN (TIGHTEN: DETECT STALLS SOONER)
 			// QUIET -> PUSH TARGET UP (RELAX: TOLERATE HIGHER SOJOURN)
 			// THE TARGET ADAPTS TO WHAT "NORMAL" IS ON THIS SYSTEM.
-			s64 nc = (s64)sigmoid_center_ns + sigmoid_velocity_ns;
-			if (nc < (s64)sigmoid_center_min)
-				nc = (s64)sigmoid_center_min;
-			if (nc > (s64)SIGMOID_CENTER_MAX)
-				nc = (s64)SIGMOID_CENTER_MAX;
-			sigmoid_center_ns = (u64)nc;
+			s64 nc = (s64)codel_target_ns + oscillator_velocity_ns;
+			if (nc < (s64)codel_target_floor_ns)
+				nc = (s64)codel_target_floor_ns;
+			if (nc > (s64)codel_target_max_ns)
+				nc = (s64)codel_target_max_ns;
+			codel_target_ns = (u64)nc;
 		}
 	}
 
-	burst_mode = cusum_burst || wake_burst;
-
 	if (s) {
-
-#if BURST_COUNTER_TEST
-		if (burst_mode) s->burst_mode_active++;
-#else
-		s->burst_mode_active = burst_mode ? 1 : 0;
-#endif
 		s->longrun_mode_active = longrun_mode ? 1 : 0;
 	}
 
@@ -1602,7 +1751,7 @@ void BPF_STRUCT_OPS(pandemonium_tick, struct task_struct *p)
 		// BATCH DSQ NON-EMPTY FOR > 2S SETS longrun_mode, WHICH
 		// TIGHTENS THE DEFICIT RATIO IN dispatch() FROM nr_cpu_ids*4
 		// TO nr_cpu_ids*1 (QUADRUPLING BATCH'S DISPATCH SHARE).
-		longrun_mode = sojourn > LONGRUN_THRESH_NS;
+		longrun_mode = sojourn > longrun_thresh_ns;
 
 		// SOJOURN ENFORCEMENT: THRESHOLD SET BY RUST ADAPTIVE LAYER
 		// FROM OBSERVED DISPATCH RATE. IF BATCH STARVING PAST THRESHOLD
@@ -1671,13 +1820,27 @@ void BPF_STRUCT_OPS(pandemonium_tick, struct task_struct *p)
 	if (!tctx)
 		return;
 
-	u64 thresh = burst_mode ? 0 : (knobs ? knobs->preempt_thresh_ns : 1000000);
+	// CORE-SCALED LONGRUN PROTECTION: 2C IS THIN ENOUGH THAT BATCH LONG-RUNNERS
+	// NEED EXTRA SLICE HEADROOM AGAINST LAT_CRIT/BATCH CONTENTION ON TWO CPUs.
+	// 4C+ HAS ENOUGH CAPACITY TO HANDLE BOTH TIERS AT BASELINE PREEMPT.
+	u64 base_thresh = knobs ? knobs->preempt_thresh_ns : 1000000;
+	u32 longrun_mult_shift = nr_cpu_ids <= 2 ? 2 : 0;
+	u64 thresh = longrun_mode ? (base_thresh << longrun_mult_shift)
+	           : base_thresh;
+
+	// LAT_CRITICAL WAITING -> TIGHTEN THRESHOLD BY 4X. AUDIO AND COMPOSITOR
+	// WAKERS ARE THE HOT CASES; THE STANDARD 1MS WAIT IS ENOUGH TO SKIP A
+	// 10MS AUDIO BUFFER. INTERACTIVE WAITERS KEEP THE CURRENT THRESHOLD SO
+	// BATCH THROUGHPUT IS NOT PENALIZED BY ORDINARY WAKEUP PATTERNS.
+	if (latcrit_waiting)
+		thresh >>= 2;
 
 	u64 on_cpu = tctx->last_run_at > 0
 		? bpf_ktime_get_ns() - tctx->last_run_at : 0;
 	if (tctx->tier == TIER_BATCH && on_cpu >= thresh) {
 		scx_bpf_kick_cpu(scx_bpf_task_cpu(p), SCX_KICK_PREEMPT);
 		interactive_waiting = false;
+		latcrit_waiting = false;
 		if (!s)
 			s = get_stats();
 		if (s)
@@ -1762,91 +1925,25 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(pandemonium_init)
 		if (interactive_budget < 2) interactive_budget = 2;
 	}
 
-	// STARVATION RESCUE: MIN OF TWO LINEAR FUNCTIONS
-	// linear_up: SHORT AT LOW CORES (FAST STARVATION)
-	// linear_down: SHORT AT HIGH CORES (DISPATCH CONTENTION)
-	// 2C: 50MS, 4C: 100MS, 8C: 200MS, 12C: 167MS, 128C: 20MS
-	{
-		u64 linear_up = nr_cpu_ids * 25000000ULL;
-		u64 sr_divisor = nr_cpu_ids / 4;
-		if (sr_divisor < 1) sr_divisor = 1;
-		u64 linear_down = 500000000ULL / sr_divisor;
-		starvation_rescue_ns = linear_up < linear_down
-			? linear_up : linear_down;
-		if (starvation_rescue_ns < 20000000ULL)
-			starvation_rescue_ns = 20000000ULL;
-		if (starvation_rescue_ns > 500000000ULL)
-			starvation_rescue_ns = 500000000ULL;
-	}
-
-	// OVERFLOW SOJOURN RESCUE: SCALE WITH CORE COUNT
-	// 2C: 4MS, 4C: 8MS, 5C+: 10MS (CAPPED AT OLD STATIC VALUE)
-	overflow_sojourn_rescue_ns = nr_cpu_ids * 2000000ULL;
-	if (overflow_sojourn_rescue_ns < 4000000ULL)
-		overflow_sojourn_rescue_ns = 4000000ULL;
-	if (overflow_sojourn_rescue_ns > 10000000ULL)
-		overflow_sojourn_rescue_ns = 10000000ULL;
-
 	// PER-CPU DSQ DEPTH GATE: 1 BELOW 4 CPUS, 2 AT 4+
 	pcpu_depth_base = (nr_cpu_ids < 4) ? 1 : 2;
 
-	// UNIFIED SIGMOID: CORE-SCALED MARGIN + DAMPING
-	// SMALL MARGIN -> SHARP TRANSITION (CODEL-LIKE AT 2C)
-	// LARGE MARGIN -> SMOOTH TRANSITION (SIGMOID-LIKE AT 12C+)
-	{
-		// CORE-SCALED INIT: TIGHT AT LOW CORES, RELAXED AT HIGH
-		// 2C: 2ms. 4C: 4ms. 8C: 8ms. 12C: 12ms. 16C+: 12ms.
-		// DAMPED OSCILLATION ADJUSTS FROM HERE.
-		u64 interval = nr_cpu_ids * 1000000ULL;
-		if (interval < 2000000ULL) interval = 2000000ULL;
-		if (interval > 12000000ULL) interval = 12000000ULL;
-		sojourn_interval_ns = interval;
-
-		// MARGIN: POWER OF 2 FOR SHIFT-BASED DIVISION
-		u64 raw_margin = nr_cpu_ids * 16000ULL;
-		if (raw_margin < 64000ULL) raw_margin = 64000ULL;
-		if (raw_margin > 512000ULL) raw_margin = 512000ULL;
-		u64 margin = 1;
-		for (u32 i = 0; i < 20 && margin < raw_margin; i++)
-			margin <<= 1;
-		sigmoid_margin_ns = margin;
-
-		// SHIFT: log2(margin / 128)
-		u64 divisor = margin >> 7;
-		u32 shift = 0;
-		u64 tmp = divisor;
-		for (u32 i = 0; i < 20 && tmp > 1; i++) {
-			tmp >>= 1;
-			shift++;
-		}
-		sigmoid_p_shift = shift;
-
-		// DAMPING: 2C=v/2 (heavy), 4C=v/3, 8C=v/5, 12C+=v/5
-		u32 damp = (nr_cpu_ids >> 1) + 1;
-		if (damp > 5) damp = 5;
-		sigmoid_damping = damp;
-
-		// PULL SCALE: 2C=2x, 4C=3x, 8C=4x, 12C=4x
-		u32 pull = (nr_cpu_ids + 2) >> 1;
-		if (pull < 1) pull = 1;
-		if (pull > 4) pull = 4;
-		sigmoid_pull_scale = pull;
-
-		// VELOCITY CAP: SCALES WITH PULL
-		sigmoid_velocity_cap = (s64)(50000ULL * pull);
-
-		// CENTER FLOOR: CORE-SCALED. HIGHER AT MORE CORES WHERE
-		// NORMAL SOJOURN IS HIGHER UNDER SATURATION.
-		// 2C: 200us. 4C: 300us. 8C: 500us. 12C: 700us. 16C+: 800us.
-		u64 cmin = nr_cpu_ids * 50000ULL + 100000ULL;
-		if (cmin < 200000ULL) cmin = 200000ULL;
-		if (cmin > 800000ULL) cmin = 800000ULL;
-		sigmoid_center_min = cmin;
-	}
+	// ALL TIMING-CONSTANT AND OSCILLATOR-DYNAMICS STATICS BELOW ARE DERIVED
+	// FROM tau (Fiedler-based time constant) VIA apply_tau_scaling() AT THE
+	// FIRST CPU-0 TICK. MIDPOINT CONSTANTS HERE PROVIDE SANE BEHAVIOR DURING
+	// THE ~1MS WINDOW BETWEEN struct_ops ATTACH AND THAT FIRST TICK. THEY
+	// ARE OVERWRITTEN IMMEDIATELY -- DON'T READ SIGNIFICANCE INTO THEM.
+	starvation_rescue_ns       = 100000000ULL;  // 100ms midpoint of [20, 500]
+	overflow_sojourn_rescue_ns =   6000000ULL;  //   6ms midpoint of [4, 10]
+	sojourn_interval_ns        =   4000000ULL;  //   4ms midpoint of [2, 12]
+	codel_target_floor_ns      =    500000ULL;  // 500us midpoint of [200, 800]
+	oscillator_damping_shift   = 3;
+	oscillator_pull_scale      = 3;
+	oscillator_velocity_cap    = (s64)((u64)OSC_VELOCITY_CAP_PER_PULL * 3);
 	// START PERMISSIVE. LET THE DAMPED OSCILLATION FIND THE RIGHT CENTER.
 	// RESCUES PULL IT DOWN. NO STATIC FORMULA. THE WAVE FUNCTION DOES THE WORK.
-	sigmoid_center_ns = SIGMOID_CENTER_MAX;
-	sigmoid_velocity_ns = 0;
+	codel_target_ns = codel_target_max_ns;
+	oscillator_velocity_ns = 0;
 	prev_rescue_snapshot = 0;
 	global_rescue_count = 0;
 	for (u32 i = 0; i < nr_cpu_ids && i < MAX_CPUS; i++) {
@@ -1854,15 +1951,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(pandemonium_init)
 		pcpu_stall_start_ns[i] = 0;
 	}
 
-	// CUSUM BURST DETECTION: CALIBRATES ON FIRST 64 ENQUEUES
-	cusum_last_check_ns = bpf_ktime_get_ns();
-	cusum_interval_ewma = 0;
-	cusum_s = 0;
-	burst_mode = false;
 	longrun_mode = false;
-
-	// WAKEUP RATE COUNTER: NO CALIBRATION NEEDED
-	wake_rate_count = 0;
 
 	// INITIALIZE DEFAULT TUNING KNOBS
 	struct tuning_knobs *knobs = bpf_map_lookup_elem(&tuning_knobs_map, &zero);
@@ -1924,6 +2013,11 @@ void BPF_STRUCT_OPS(pandemonium_cpu_online, s32 cpu)
 		pcpu_min_sojourn_ns[cpu] = ~0ULL;
 		pcpu_stall_start_ns[cpu] = 0;
 	}
+	// Force the next CPU-0 tick to re-derive tau-scaled statics. Rust will
+	// have recomputed lambda_2 against the new topology and written a fresh
+	// topology_tau_ns; clearing the snapshot makes apply_tau_scaling() pick
+	// it up instead of short-circuiting on the stale value.
+	last_tau_snapshot = 0;
 }
 
 void BPF_STRUCT_OPS(pandemonium_cpu_offline, s32 cpu)
@@ -1933,15 +2027,16 @@ void BPF_STRUCT_OPS(pandemonium_cpu_offline, s32 cpu)
 		pcpu_min_sojourn_ns[cpu] = ~0ULL;
 		pcpu_stall_start_ns[cpu] = 0;
 	}
+	last_tau_snapshot = 0;
 
 	__sync_lock_test_and_set(&interactive_enqueue_ns, 0);
 	__sync_lock_test_and_set(&batch_enqueue_ns, 0);
 	__sync_lock_test_and_set(&interactive_run, 0);
 
-	// RESET SIGMOID FEEDBACK TO AVOID STALE DELTA POST-SUSPEND
+	// RESET OSCILLATOR FEEDBACK TO AVOID STALE DELTA POST-SUSPEND
 	__sync_lock_test_and_set(&global_rescue_count, 0);
 	prev_rescue_snapshot = 0;
-	sigmoid_velocity_ns = 0;
+	oscillator_velocity_ns = 0;
 }
 
 SCX_OPS_DEFINE(pandemonium_ops,

@@ -18,6 +18,7 @@ mod procdb;
 mod scheduler;
 mod topology;
 mod tuning;
+mod watchdog;
 
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -212,6 +213,11 @@ fn run_scheduler(
         SHUTDOWN.store(true, Ordering::Relaxed);
     })?;
 
+    // WATCHDOG: ABORTS IF THE CONTROL LOOP STALLS FOR MORE THAN 10 SECONDS.
+    // LIBBPF MAP OPERATIONS CAN HANG ON KERNEL STALL / VERIFIER RELOAD /
+    // PERCPU CONTENTION; WITHOUT THIS, TELEMETRY AND KNOB WRITES STOP SILENTLY.
+    watchdog::spawn(&SHUTDOWN, Duration::from_secs(10));
+
     let nr_cpus_display =
         nr_cpus.unwrap_or_else(|| libbpf_rs::num_possible_cpus().unwrap_or(1) as u64);
     let governor = std::fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
@@ -264,11 +270,17 @@ fn run_scheduler(
                     log_warn!("L2 SIBLINGS MAP WRITE FAILED: {}", e);
                 }
                 // RESISTANCE AFFINITY: COMPUTE R_EFF VIA LAPLACIAN PSEUDOINVERSE
-                // AND POPULATE BPF AFFINITY RANK MAP
-                let (reff, rank) = topo.compute_resistance_affinity();
-                topo.log_resistance_affinity(&reff, &rank);
+                // AND POPULATE BPF AFFINITY RANK MAP. SPECTRUM CARRIES lambda_2
+                // AND tau_ns FOR UNIVERSAL TOPOLOGY-DERIVED SCALING.
+                let (reff, rank, spectrum) = topo.compute_resistance_affinity();
+                topo.log_resistance_affinity(&reff, &rank, spectrum);
                 if let Err(e) = topo.populate_affinity_rank_map(&sched, &rank) {
                     log_warn!("AFFINITY RANK MAP WRITE FAILED: {}", e);
+                }
+                // WRITE tau_ns INTO tuning_knobs. BPF'S tick() ON CPU 0 PICKS
+                // IT UP AND DERIVES THE TAU-SCALED TIMING STATICS.
+                if let Err(e) = sched.write_topology_tau_ns(spectrum.tau_ns) {
+                    log_warn!("TOPOLOGY TAU KNOB WRITE FAILED: {}", e);
                 }
             }
             Err(e) => log_warn!("CACHE TOPOLOGY DETECT FAILED: {}", e),
@@ -292,6 +304,7 @@ fn run_scheduler(
             log_info!("PANDEMONIUM IS ACTIVE (BPF ONLY, CTRL+C TO EXIT)");
             let mut prev = scheduler::PandemoniumStats::default();
             while !SHUTDOWN.load(Ordering::Relaxed) && !sched.exited() {
+                watchdog::LOOP_HEARTBEAT.fetch_add(1, Ordering::Relaxed);
                 std::thread::sleep(Duration::from_secs(1));
 
                 let stats = sched.read_stats();
@@ -368,18 +381,16 @@ fn run_scheduler(
                 };
 
                 let sojourn_ms = stats.batch_sojourn_ns / 1_000_000;
-                let delta_burst = stats.burst_mode_active.wrapping_sub(prev.burst_mode_active);
-                let burst_label = if delta_burst > 0 { " BURST" } else { "" };
                 let longrun_label = if stats.longrun_mode_active > 0 { " LONGRUN" } else { "" };
 
                 if verbose {
                     println!(
-                        "d/s: {:<8} idle: {}% shared: {:<6} preempt: {:<4} keep: {:<4} kick: H={:<4} S={:<4} enq: W={:<4} R={:<4} wake: {}us lat_idle: {}us lat_kick: {}us procdb: {} reenq: {} sjrn: {}ms l2: B={}% I={}% L={}% [BPF{}{}]",
+                        "d/s: {:<8} idle: {}% shared: {:<6} preempt: {:<4} keep: {:<4} kick: H={:<4} S={:<4} enq: W={:<4} R={:<4} wake: {}us lat_idle: {}us lat_kick: {}us procdb: {} reenq: {} sjrn: {}ms l2: B={}% I={}% L={}% [BPF{}]",
                         delta_d, idle_pct, delta_shared, delta_preempt, delta_keep,
                         delta_hard, delta_soft, delta_enq_wake, delta_enq_requeue,
                         wake_avg_us, lat_idle_us, lat_kick_us, delta_procdb,
                         delta_reenq, sojourn_ms, l2_pct_b, l2_pct_i, l2_pct_l,
-                        burst_label, longrun_label,
+                        longrun_label,
                     );
                 }
 

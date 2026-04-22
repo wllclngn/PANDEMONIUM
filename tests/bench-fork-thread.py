@@ -336,9 +336,11 @@ def main():
     except KeyboardInterrupt:
         log_info("Interrupted")
     finally:
-        log_info("Restarting pandemonium service...")
-        subprocess.run(["sudo", "systemctl", "start", "pandemonium"],
-                       capture_output=True)
+        # DISENGAGE AT END (MATCHES OTHER BENCHES). EACH PER-SCHEDULER
+        # stop_and_wait() ALREADY TORE DOWN ITS OWN INSTANCE; WE JUST MAKE
+        # SURE NOTHING LINGERS BY WAITING FOR FULL DEACTIVATION.
+        if is_scx_active():
+            wait_for_deactivation(5.0)
 
     if all_results:
         print()

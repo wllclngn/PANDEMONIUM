@@ -72,6 +72,10 @@ pub struct TuningKnobs {
     pub affinity_mode: u64,
     pub sojourn_thresh_ns: u64,
     pub burst_slice_ns: u64,
+    // FIEDLER-DERIVED TOPOLOGY TIME CONSTANT (TAU_SCALE_NS / lambda_2).
+    // 0 = TAU-SCALING DISABLED; BPF FALLS BACK TO LEGACY PER-CONSTANT FORMULAS.
+    // WRITTEN BY RUST AT TOPOLOGY DETECT AND ON HOTPLUG; READ AT BPF INIT.
+    pub topology_tau_ns: u64,
 }
 
 impl Default for TuningKnobs {
@@ -87,6 +91,7 @@ impl Default for TuningKnobs {
             affinity_mode: AFFINITY_OFF,
             sojourn_thresh_ns: 5_000_000,
             burst_slice_ns: 1_000_000,
+            topology_tau_ns: 0,
         }
     }
 }
@@ -134,6 +139,7 @@ pub fn regime_knobs(r: Regime) -> TuningKnobs {
             affinity_mode: AFFINITY_WEAK,
             sojourn_thresh_ns: 5_000_000,
             burst_slice_ns: 1_000_000,
+            topology_tau_ns: 0,
         },
         Regime::Mixed => TuningKnobs {
             slice_ns: MIXED_SLICE_NS,
@@ -146,6 +152,7 @@ pub fn regime_knobs(r: Regime) -> TuningKnobs {
             affinity_mode: AFFINITY_STRONG,
             sojourn_thresh_ns: 5_000_000,
             burst_slice_ns: 1_000_000,
+            topology_tau_ns: 0,
         },
         Regime::Heavy => TuningKnobs {
             slice_ns: HEAVY_SLICE_NS,
@@ -158,37 +165,49 @@ pub fn regime_knobs(r: Regime) -> TuningKnobs {
             affinity_mode: AFFINITY_WEAK,
             sojourn_thresh_ns: 5_000_000,
             burst_slice_ns: 1_000_000,
+            topology_tau_ns: 0,
         },
     }
 }
 
-// CORE-COUNT-AWARE REGIME KNOBS
-// AT LOW CORE COUNTS, TIME SLICES MUST BE SHORTER TO MAINTAIN ADEQUATE
-// DISPATCH FREQUENCY. HEAVY AT 2C WITH 4MS SLICES = 250 DISPATCHES/S/CORE,
-// TOO COARSE FOR DEADLINE AND IPC WORKLOADS.
-// SCALE: slice = min(BASE, nr_cpus * 500US), preempt = min(BASE, nr_cpus * 250US).
-// MIXED ALSO SCALES: BATCH_SLICE CAPS AT nr_cpus * 5MS (2C: 10MS VS 20MS BASE).
+// TAU-SCALED REGIME KNOBS
+// CAPS DIMENSIONED AS Q16 FIXED-POINT MULTIPLIERS OF tau_ns. k_i CALIBRATED
+// SO 12C HETEROGENEOUS TOPOLOGY (tau ~= 40MS) REPRODUCES THE LEGACY
+// CLAMP-CEILING VALUES:
+//   SLICE_CAP:   0.15 -> 6MS  AT tau=40MS
+//   PREEMPT_CAP: 0.075 -> 3MS AT tau=40MS
+//   BATCH_CAP:   1.5 -> 60MS  AT tau=40MS (Mixed ONLY)
+//   SOJOURN:     0.15 -> 6MS  AT tau=40MS
+// PER-CAP CLAMPS STAY AS SAFETY RAILS DURING ROLLOUT.
+const K_SLICE_CAP_Q16:   u64 = 9830;    // 0.15
+const K_PREEMPT_CAP_Q16: u64 = 4915;    // 0.075
+const K_BATCH_CAP_Q16:   u64 = 98304;   // 1.5
+const K_SOJOURN_Q16:     u64 = 9830;    // 0.15
 
-pub fn scaled_regime_knobs(r: Regime, nr_cpus: u64) -> TuningKnobs {
+#[inline]
+fn scale_tau_u64(tau_ns: u64, k_q16: u64) -> u64 {
+    (tau_ns as u128 * k_q16 as u128 >> 16) as u64
+}
+
+pub fn scaled_regime_knobs(r: Regime, _nr_cpus: u64, tau_ns: u64) -> TuningKnobs {
     let mut knobs = regime_knobs(r);
-    match r {
-        Regime::Heavy | Regime::Light => {
-            let slice_cap = nr_cpus * 500_000;
-            let preempt_cap = (nr_cpus * 250_000).max(1_000_000);
-            knobs.slice_ns = knobs.slice_ns.min(slice_cap);
-            knobs.preempt_thresh_ns = knobs.preempt_thresh_ns.min(preempt_cap);
-        }
-        Regime::Mixed => {
-            let slice_cap = nr_cpus * 500_000;
-            let preempt_cap = nr_cpus * 500_000;
-            knobs.slice_ns = knobs.slice_ns.min(slice_cap);
-            knobs.preempt_thresh_ns = knobs.preempt_thresh_ns.min(preempt_cap);
-            let batch_cap = nr_cpus * 5_000_000;
-            knobs.batch_slice_ns = knobs.batch_slice_ns.min(batch_cap);
-        }
+
+    let slice_cap_tau = scale_tau_u64(tau_ns, K_SLICE_CAP_Q16)
+        .clamp(500_000, 8_000_000);
+    let preempt_cap_tau = scale_tau_u64(tau_ns, K_PREEMPT_CAP_Q16)
+        .clamp(250_000, 4_000_000);
+    let sojourn_tau = scale_tau_u64(tau_ns, K_SOJOURN_Q16)
+        .clamp(2_000_000, 6_000_000);
+
+    knobs.slice_ns = knobs.slice_ns.min(slice_cap_tau);
+    knobs.preempt_thresh_ns = knobs.preempt_thresh_ns.min(preempt_cap_tau);
+    if matches!(r, Regime::Mixed) {
+        let batch_cap_tau = scale_tau_u64(tau_ns, K_BATCH_CAP_Q16)
+            .clamp(10_000_000, 80_000_000);
+        knobs.batch_slice_ns = knobs.batch_slice_ns.min(batch_cap_tau);
     }
-    // SOJOURN FLOOR: CPU-SCALED, SAME FORMULA THE OLD EWMA USED AS ITS FLOOR
-    knobs.sojourn_thresh_ns = (nr_cpus * 1_000_000).clamp(2_000_000, 6_000_000);
+    knobs.sojourn_thresh_ns = sojourn_tau;
+
     knobs
 }
 
@@ -285,33 +304,6 @@ pub fn compute_p99_from_histogram(counts: &[u64; HIST_BUCKETS]) -> u64 {
         }
     }
     HIST_EDGES_NS[HIST_BUCKETS - 2]
-}
-
-// REFLEX TIGHTEN DECISION: USES BOTH AGGREGATE AND INTERACTIVE P99.
-// TIGHTEN IF EITHER EXCEEDS CEILING (INTERACTIVE STARVATION HIDDEN IN AGGREGATE).
-#[allow(dead_code)]
-pub fn should_reflex_tighten(aggregate_p99: u64, interactive_p99: u64, ceiling: u64) -> bool {
-    aggregate_p99 > ceiling || interactive_p99 > ceiling
-}
-
-// SLEEP-INFORMED BATCH TUNING
-// IO-HEAVY: EXTEND BATCH SLICES (+25%) -- IO-BOUND TASKS BATCH BETWEEN FREQUENT SHORT SLEEPS
-// IDLE-HEAVY: TIGHTEN BATCH SLICES (-25%) -- SPORADIC USER INPUT NEEDS FASTER PREEMPTION
-
-#[allow(dead_code)]
-pub const BATCH_MAX_NS: u64 = 25_000_000; // 25MS CEILING
-
-#[allow(dead_code)]
-pub fn sleep_adjust_batch_ns(base_batch_ns: u64, io_pct: u64) -> u64 {
-    if io_pct > 60 {
-        // IO-HEAVY: EXTEND BATCH SLICES (+25%)
-        (base_batch_ns * 5 / 4).min(BATCH_MAX_NS)
-    } else if io_pct < 15 {
-        // IDLE-HEAVY: TIGHTEN BATCH SLICES (-25%)
-        (base_batch_ns * 3 / 4).max(base_batch_ns / 2)
-    } else {
-        base_batch_ns
-    }
 }
 
 // MWU ORCHESTRATOR
@@ -494,8 +486,13 @@ impl MwuController {
         }
         self.prev_io_bucket = cur_io;
 
-        // PATHWAY 4: FORK STORM (SCHMITT-GATED)
-        let fork_storm = sig.wakeup_rate > nr_cpus * 2;
+        // PATHWAY 4: FORK STORM (SCHMITT-GATED, PRESSURE-CONFIRMED)
+        // THE RAW WAKEUP-RATE TRIGGER LATCHES ON AT LOW CPU COUNTS (2-4C)
+        // BECAUSE sig.wakeup_rate IS ALREADY NORMALIZED BY nr_cpus, MAKING THE
+        // EFFECTIVE RAW THRESHOLD nr_cpus^2 * 2 -- A QUIET SYSTEM EASILY EXCEEDS
+        // THIS. SUBORDINATE TO THE SAME GROUND-TRUTH PRESSURE SIGNAL THE
+        // BPF-SIDE GATE USES: A CONFIRMED FORK STORM REQUIRES ACTIVE RESCUES.
+        let fork_storm = sig.wakeup_rate > nr_cpus * 2 && sig.rescue_count > 0;
         if fork_storm {
             self.fork_streak += 1;
             if self.fork_streak >= SPIKE_CONFIRM {
@@ -554,6 +551,10 @@ impl MwuController {
             affinity_mode:      majority_discrete(&DV_AFFINITY, &self.weights),
             sojourn_thresh_ns:  blend_continuous(b.sojourn_thresh_ns, &SC_SOJOURN, &self.weights),
             burst_slice_ns:     blend_continuous(b.burst_slice_ns, &SC_BURST, &self.weights),
+            // topology_tau_ns IS OWNED BY THE TOPOLOGY LAYER; MWU DOESN'T TOUCH
+            // IT. THE MONITOR LOOP OVERLAYS THE LIVE BPF VALUE BACK ONTO MWU'S
+            // OUTPUT BEFORE WRITING SO THIS FIELD IS EFFECTIVELY PASSTHROUGH.
+            topology_tau_ns:    0,
         }
     }
 

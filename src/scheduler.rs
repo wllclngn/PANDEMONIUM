@@ -49,16 +49,15 @@ pub struct PandemoniumStats {
     pub nr_l2_miss_lat_crit: u64,
     pub nr_reenqueue: u64,
     pub batch_sojourn_ns: u64,
-    pub burst_mode_active: u64,
     pub longrun_mode_active: u64,
     pub nr_overflow_rescue: u64,
 }
 
 // COMPILE-TIME ABI SAFETY: MUST MATCH STRUCT LAYOUTS IN intf.h
-const _: () = assert!(std::mem::size_of::<PandemoniumStats>() == 224);
-const _: () = assert!(std::mem::size_of::<TuningKnobs>() == 80);
+const _: () = assert!(std::mem::size_of::<PandemoniumStats>() == 216);
+const _: () = assert!(std::mem::size_of::<TuningKnobs>() == 88);
 
-// TuningKnobs lives in tuning.rs (zero BPF dependencies, testable offline)
+// TuningKnobs LIVES IN tuning.rs (ZERO BPF DEPENDENCIES, TESTABLE OFFLINE)
 
 const KNOBS_PIN: &str = "/sys/fs/bpf/pandemonium/tuning_knobs";
 
@@ -103,7 +102,7 @@ impl<'a> Scheduler<'a> {
         // ATTACH STRUCT_OPS
         let link = skel.maps.pandemonium_ops.attach_struct_ops()?;
 
-        // PIN MAPS FOR USERSPACE ACCESS (NON-FATAL: bpffs may not be mounted)
+        // PIN MAPS FOR USERSPACE ACCESS (NON-FATAL: bpffs MAY NOT BE MOUNTED)
         let pin_dir = "/sys/fs/bpf/pandemonium";
         let bpffs_ok = std::fs::create_dir_all(pin_dir).is_ok();
         if bpffs_ok {
@@ -185,7 +184,6 @@ impl<'a> Scheduler<'a> {
                 if stats.batch_sojourn_ns > total.batch_sojourn_ns {
                     total.batch_sojourn_ns = stats.batch_sojourn_ns;
                 }
-                total.burst_mode_active += stats.burst_mode_active;
                 if stats.longrun_mode_active > total.longrun_mode_active {
                     total.longrun_mode_active = stats.longrun_mode_active;
                 }
@@ -210,6 +208,17 @@ impl<'a> Scheduler<'a> {
             .tuning_knobs_map
             .update(&key, value, libbpf_rs::MapFlags::ANY)?;
         Ok(())
+    }
+
+    // WRITE ONLY topology_tau_ns, PRESERVING OTHER KNOBS.
+    // CALLED AT TOPOLOGY DETECT AND ON HOTPLUG. READ-MODIFY-WRITE BECAUSE THE
+    // tuning_knobs_map IS A SINGLE-ENTRY STRUCT AND PARTIAL UPDATES AREN'T A
+    // libbpf CONCEPT -- BUT WE NEED A NARROW SETTER SO TOPOLOGY CHANGES DON'T
+    // STOMP ON WHATEVER THE ADAPTIVE LOOP'S LATEST KNOB VALUES ARE.
+    pub fn write_topology_tau_ns(&self, tau_ns: u64) -> Result<()> {
+        let mut knobs = self.read_tuning_knobs();
+        knobs.topology_tau_ns = tau_ns;
+        self.write_tuning_knobs(&knobs)
     }
 
     // READ CURRENT TUNING KNOBS FROM BPF MAP

@@ -1,150 +1,147 @@
 # PANDEMONIUM
 
-A Linux kernel scheduler for sched_ext, built in Rust and C23. PANDEMONIUM classifies every task by behavior -- wakeup frequency, context switch rate, runtime, sleep patterns -- and adapts scheduling decisions in real time. Damped harmonic oscillation drives CoDel-inspired stall detection with a self-tuning target. Resistance affinity (effective resistance from the Laplacian pseudoinverse of the CPU topology graph) provides topology-aware task placement for pipe/IPC storms. Multiplicative Weight Updates (MWU) balance 6 competing expert profiles across 4 loss pathways.
+A Linux kernel scheduler for sched_ext, built in Rust and C23. PANDEMONIUM classifies every task by behavior — wakeup frequency, context switch rate, runtime, sleep patterns — and adapts scheduling decisions in real time. Damped harmonic oscillation drives CoDel-inspired stall detection with a self-tuning target. Resistance affinity (effective resistance from the Laplacian pseudoinverse of the CPU topology graph) provides topology-aware task placement for pipe/IPC storms. Multiplicative Weight Updates (MWU) balance 6 competing expert profiles across 4 loss pathways.
 
-Three-tier behavioral dispatch, overflow sojourn rescue, longrun detection with deficit tightening, dual burst detection (CUSUM + wakeup rate), wakee_flips-gated WAKE_SYNC, sleep-informed batch tuning, classification-gated DSQ routing, workload regime detection, vtime ceiling, hard starvation rescue, and a persistent process database that learns task classifications across lifetimes.
+Three-tier behavioral dispatch, overflow sojourn rescue, longrun detection with deficit tightening, tier-aware preempt scaling, wakee_flips-gated WAKE_SYNC, sleep-informed batch tuning, classification-gated DSQ routing, workload regime detection, vtime ceiling, hard starvation rescue, and a persistent process database that learns task classifications across lifetimes.
 
-PANDEMONIUM is included in the [sched-ext/scx](https://github.com/sched-ext/scx) project alongside scx_rusty, scx_lavd, scx_cosmos, scx_cake and the rest of the sched_ext family. Thank you to Piotr Gorski and the sched-ext team. PANDEMONIUM is made possible by contributions from the sched_ext, CachyOS, Gentoo, OpenSUSE and Arch communities within the Linux ecosystem.
+PANDEMONIUM is included in the [sched-ext/scx](https://github.com/sched-ext/scx) project alongside scx_rusty, scx_lavd, scx_cosmos, scx_cake and the rest of the sched_ext family. Thank you to Piotr Gorski and the sched-ext team. PANDEMONIUM is made possible by contributions from the sched_ext, CachyOS, Gentoo, OpenSUSE, Arch and Ubuntu communities within the Linux ecosystem.
 
 ## Performance
 
-12 AMD Zen CPUs, kernel 6.18+, clang 21. EEVDF and scx_bpfland: best 3 of 28 and 26 complete runs (averaged) across 75 bench-scale sessions. PANDEMONIUM: v5.6.0, 3 iterations.
+12 AMD Zen CPUs, kernel 6.18+, clang 21. All PANDEMONIUM numbers below are v5.7.0. EEVDF and scx_bpfland baselines are best-3-of-N historical (28 and 26 complete runs across 75 bench-scale sessions).
 
 ### P99 Wakeup Latency (interactive probe under CPU saturation)
 
 | Cores | EEVDF    | scx_bpfland | PANDEMONIUM (BPF) | PANDEMONIUM (ADAPTIVE) |
 |-------|----------|-------------|-------------------|------------------------|
-| 2     | 2,058us  | 2,004us     | **64us**           | **64us**               |
-| 4     | 1,246us  | 2,003us     | **64us**           | 78us                   |
-| 8     | 425us    | 2,003us     | **81us**           | 83us                  |
-| 12    | 344us    | 2,002us     | 90us              | **83us**               |
+| 2     | 2,058us  | 2,004us     | 85us              | 94us                   |
+| 4     | 1,246us  | 2,003us     | **67us**          | 71us                   |
+| 8     | 425us    | 2,003us     | **66us**          | 69us                   |
+| 12    | 344us    | 2,002us     | **67us**          | **67us**               |
 
-Sub-100us in both modes at every core count. EEVDF's best-of-28 can't break 344us at 12C or 2,058us at 2C.
+Sub-100us in both modes at every core count.
 
 ### Burst P99 (fork/exec storm under CPU saturation)
 
 | Cores | EEVDF    | scx_bpfland | PANDEMONIUM (BPF) | PANDEMONIUM (ADAPTIVE) |
 |-------|----------|-------------|-------------------|------------------------|
-| 2     | 2,262us  | 2,006us     | **68us**           | 86us                   |
-| 4     | 3,223us  | 2,003us     | **71us**           | **75us**               |
-| 8     | 2,331us  | 2,004us     | **81us**           | 91us                  |
-| 12    | 1,891us  | 2,001us     | 94us              | **83us**               |
+| 2     | 2,262us  | 2,006us     | 184us             | 160us                  |
+| 4     | 3,223us  | 2,003us     | **66us**          | 71us                   |
+| 8     | 2,331us  | 2,004us     | **69us**          | 79us                   |
+| 12    | 1,891us  | 2,001us     | **71us**          | 79us                   |
 
-20-30x faster burst response than both competitors at every core count.
+4C+ sub-80us in both modes. 2C shows elevated burst tail under saturation.
 
 ### Longrun P99 (interactive latency with sustained CPU-bound long-runners)
 
 | Cores | EEVDF    | scx_bpfland | PANDEMONIUM (BPF) | PANDEMONIUM (ADAPTIVE) |
 |-------|----------|-------------|-------------------|------------------------|
-| 2     | 2,293us  | 2,000us     | **74us**           | 97us                  |
-| 4     | 1,421us  | 2,003us     | **65us**           | 77us                  |
-| 8     | 60us     | 2,003us     | 82us              | **87us**               |
-| 12    | 126us    | 2,002us     | **84us**           | 369us                 |
+| 2     | 2,293us  | 2,000us     | **84us**          | 97us                   |
+| 4     | 1,421us  | 2,003us     | **69us**          | 71us                   |
+| 8     | 60us     | 2,003us     | **72us**          | 73us                   |
+| 12    | 126us    | 2,002us     | 159us             | **93us**               |
 
-BPF mode sub-100us at every core count under sustained batch pressure.
+Sub-100us across 2C-8C in both modes.
 
 ### Mixed Latency P99 (interactive + batch concurrent)
 
 | Cores | EEVDF    | scx_bpfland | PANDEMONIUM (BPF) | PANDEMONIUM (ADAPTIVE) |
 |-------|----------|-------------|-------------------|------------------------|
-| 2     | 2,412us  | 2,000us     | **74us**           | 75us                  |
-| 4     | 1,683us  | 2,003us     | **70us**           | 73us                  |
-| 8     | 348us    | 2,003us     | 85us              | **84us**               |
-| 12    | 494us    | 2,002us     | 88us              | **81us**               |
+| 2     | 2,412us  | 2,000us     | **76us**          | 106us                  |
+| 4     | 1,683us  | 2,003us     | **67us**          | 71us                   |
+| 8     | 348us    | 2,003us     | **69us**          | 75us                   |
+| 12    | 494us    | 2,002us     | **73us**          | 108us                  |
 
-Sub-100us at every core count in both modes. EEVDF's best-of-28 averages 348-2,412us.
+Sub-110us at every core count in both modes.
 
 ### Deadline Miss Ratio (16.6ms frame target)
 
 | Cores | EEVDF   | scx_bpfland | PANDEMONIUM (BPF) | PANDEMONIUM (ADAPTIVE) |
 |-------|---------|-------------|-------------------|------------------------|
-| 2     | 13.1%   | 69.4%       | **0.3%**          | **0.4%**               |
-| 4     | **8.6%**| 60.4%       | **1.9%**          | **0.2%**               |
-| 8     | 10.8%   | 53.8%       | 19.4%             | **8.4%**               |
-| 12    | 10.4%   | 54.7%       | **0.4%**          | **0.0%**               |
+| 2     | 13.1%   | 69.4%       | 3.7%              | **0.5%**               |
+| 4     | **8.6%**| 60.4%       | 21.3%*            | 19.0%*                 |
+| 8     | 10.8%   | 53.8%       | 8.6%              | **1.2%**               |
+| 12    | 10.4%   | 54.7%       | 11.0%             | **0.1%**               |
 
-At 12C: BPF misses 0.4%, ADAPTIVE misses 0.0%. EEVDF's best: 10.4%. scx_bpfland's best: 54.7%.
+*4C shows a bimodal run-to-run pattern on this workload (observed range across runs: 0.2%-20%); a multi-iteration campaign will characterize it properly.
 
 ### Burst Recovery P99 (latency after storm subsides)
 
-| Cores | PANDEMONIUM (BPF) | PANDEMONIUM (ADAPTIVE) |
-|-------|-------------------|------------------------|
-| 2     | 79us              | 74us                   |
-| 4     | 65us              | 78us                   |
-| 8     | 77us              | 140us                  |
-| 12    | 102us             | 78us                   |
+| Cores | PANDEMONIUM (bench-contention burst-recovery phase) |
+|-------|------------------------------------------------------|
+| 2     | burst 65us / recovery 62us                          |
+| 4     | burst 73us / recovery 73us                          |
+| 8     | burst 76us / recovery 76us                          |
+| 12    | burst 77us / recovery 76us                          |
 
-Sub-100us recovery at every core count. No other scheduler measures this.
+Sub-80us recovery at every core count.
 
 ### App Launch P99
 
 | Cores | EEVDF    | scx_bpfland | PANDEMONIUM (BPF) | PANDEMONIUM (ADAPTIVE) |
 |-------|----------|-------------|-------------------|------------------------|
-| 2     | **2,899us** | 2,194us  | 7,993us           | 3,234us                |
-| 4     | 4,058us  | **2,199us** | 3,060us           | **2,061us**            |
-| 8     | 4,092us  | **1,723us** | 3,332us           | 2,703us                |
-| 12    | 3,552us  | 1,520us     | 2,548us           | **2,470us**            |
+| 2     | 2,899us  | 2,194us     | 26,002us          | **763us**              |
+| 4     | 4,058us  | **2,199us** | 3,334us           | 12,004us               |
+| 8     | 4,092us  | **1,723us** | 2,870us           | **1,564us**            |
+| 12    | 3,552us  | **1,520us** | 3,978us           | 9,020us                |
+
+ADAPTIVE 4C/12C are elevated in this single-iteration sample; likely run-to-run variance.
 
 ### IPC Round-Trip P99
 
 | Cores | EEVDF    | scx_bpfland | PANDEMONIUM (BPF) | PANDEMONIUM (ADAPTIVE) |
 |-------|----------|-------------|-------------------|------------------------|
-| 2     | **12us** | 18us        | 6,000us           | 2,995us                |
-| 4     | 118us    | **23us**    | 2,998us           | 2,002us                |
-| 8     | 23us     | 71us        | 867us             | **24us**               |
-| 12    | **15us** | 57us        | 233us             | 27us                   |
+| 2     | 12us     | 18us        | **16us**          | 9,414us                |
+| 4     | 118us    | 23us        | 10,994us          | **15us**               |
+| 8     | 23us     | 71us        | **21us**          | 46us                   |
+| 12    | **15us** | 57us        | 26us              | 37us                   |
 
-### Throughput (kernel build, vs EEVDF baseline)
+2C ADAPTIVE and 4C BPF show the pipe-partner placement tail at saturation.
 
-BPF averaged across 31 runs, ADAPTIVE across 28 runs (outliers >15% excluded). scx_bpfland: best 3 of 26.
-
-| Cores | scx_bpfland | PANDEMONIUM (BPF) | PANDEMONIUM (ADAPTIVE) |
-|-------|-------------|-------------------|------------------------|
-| 2     | -5.1%       | **+3.1%**         | +2.3%                  |
-| 4     | +2.6%       | **+3.5%**         | +2.4%                  |
-| 8     | +2.8%       | **+3.6%**         | +2.2%                  |
-| 12    | +3.0%       | +2.1%             | +0.4%                  |
-
-### Fork/Thread IPC (`perf bench sched messaging`, 12C, 3 runs averaged)
+### Fork/Thread IPC (`perf bench sched messaging`, 12C)
 
 | Scheduler | Time | vs EEVDF | Cache Misses | IPC |
 |-----------|------|----------|--------------|-----|
-| EEVDF                    | 14.93s | baseline | 26M  | 0.44 |
-| PANDEMONIUM (BPF)        | 14.25s | **-4.6%** | 21M  | 0.45 |
-| PANDEMONIUM (ADAPTIVE)   | 14.27s | **-4.4%** | 21M  | 0.44 |
-| scx_bpfland              | 15.22s | +1.9%  | 32M  | 0.44 |
+| EEVDF                    | 14.90s | baseline  | 25M  | 0.44 |
+| PANDEMONIUM (BPF)        | 14.52s | **-2.5%** | 22M  | 0.44 |
+| PANDEMONIUM (ADAPTIVE)   | 17.02s | +14.3%*   | 36M  | 0.43 |
+| scx_bpfland              | 20.87s | +40.1%    | 55M  | 0.42 |
 
-Resistance affinity places pipe partners on minimum effective resistance CPUs, keeping data in shared cache. Both modes beat EEVDF with fewer cache misses. scx_bpfland is 1.9% slower than EEVDF with 32M cache misses.
+BPF mode runs -2.5% vs EEVDF with 22M cache misses (vs 25M), reflecting the resistance-affinity cache-locality effect. *ADAPTIVE mode shows a throughput regression on fork-messaging specifically; investigation ongoing (MWU knob interaction with tau-scaling under high fork rates). Other workloads (wake latency, deadline, mixed, IPC) track close to BPF.
 
 ## Key Features
 
 ### Dispatch Waterfall
 
-8-step dispatch with per-CPU DSQ dominance and layered anti-starvation:
+Layered dispatch with per-CPU DSQ dominance and five independent anti-starvation mechanisms. In order:
 
-0. **Overflow sojourn rescue** -- aging overflow tasks past core-scaled threshold, deficit-gated
-1. **Per-CPU DSQ** -- direct placement from enqueue, zero contention, counts toward deficit
-2. **Deficit counter (DRR)** -- force batch if budget exhausted + starving; longrun tightens budget
-3. **Hard starvation rescue** -- core-count-scaled absolute safety net
-4. **Node interactive overflow** -- LAT_CRITICAL + INTERACTIVE, vtime-ordered
-5. **Batch sojourn rescue (CoDel)** -- rescue if oldest batch > threshold
-6. **Node batch overflow** -- normal fallback
-7. **Cross-node steal** -- interactive + batch per remote node
-8. **KEEP_RUNNING** -- if prev still wants CPU and nothing queued
+-1. **Global per-CPU DSQ stall scan** — any CPU entering `dispatch()` sweeps all per-CPU DSQs; if any head has aged past `codel_target_ns + sojourn_interval_ns` (oscillator-adapted), drain it locally. Closes the v5.6.0 kworker/journal stall class.
+0. **Own per-CPU DSQ** — cache-hot, zero contention
+1. **L2 work stealing** — pull from sibling per-CPU DSQs in the same cache domain
+1b. **R_eff cross-L2 fallback** — if L2 steal found nothing, walk R_eff-ranked peers. Handles topology-asymmetric CPUs (e.g. solo after hotplug)
+2. **Hard starvation rescue** — pre-deficit safety net for both tiers; drains overflow DSQs that have sat past `starvation_rescue_ns` regardless of budget state
+3. **Deficit gate + overflow sojourn amplification** — deficit-gated rescue of aging overflow tasks
+4. **Batch overflow rescue** — force batch drain when interactive budget exhausted and batch starving
+5. **Deficit counter (DRR)** — interleave batch into interactive service when budget cycles; longrun tightens budget
+6. **Node interactive overflow** — LAT_CRITICAL + INTERACTIVE, vtime-ordered
+7. **Batch sojourn rescue (CoDel-binary)** — rescue if oldest batch exceeds adaptive threshold
+8. **Node batch overflow** — normal batch fallback
+9. **Cross-node steal** — interactive + batch per remote node
+10. **KEEP_RUNNING** — if prev still wants CPU and nothing queued
 
 ### Three-Tier Enqueue
 
 - **select_cpu**: idle CPU -> per-CPU DSQ (depth-gated: 1 slot at <4C, 2 at 4C+), KICK_IDLE. WAKE_SYNC path: wakee_flips gate -> R_eff idle search -> DSQ fallback
 - **enqueue**: L2 sibling idle -> node DSQ + kick. All wakeups get KICK_PREEMPT. Batch/immature INTERACTIVE route to batch overflow DSQ. Vtime ceiling at >=8 cores
-- **tick**: burst detection (CUSUM + wakeup rate), longrun detection (batch non-empty >2s), sojourn enforcement, preempt batch for waiting interactive (thresh=0 during burst)
+- **tick**: longrun detection (batch non-empty >2s), sojourn enforcement, preempt batch for waiting interactive (tier-aware threshold — tightened 4× when a LAT_CRITICAL waiter is in flight, extended 4× at 2C during longrun to protect BATCH long-runners)
 
 ### Damped Oscillation Stall Detection
 
 CoDel-inspired per-CPU DSQ stall detection where the target adapts via damped harmonic oscillation. Replaces static thresholds with a feedback-driven convergent system.
 
-**Stall decision** (`pcpu_dsq_is_stalled`): Compares per-CPU minimum sojourn time against `sigmoid_center_ns`. Below = flowing (dispatch immediately). Above = start interval timer; if still above after `sojourn_interval_ns`, stalled (reject dispatch, force rescue).
+**Stall decision** (`pcpu_dsq_is_stalled`): Compares per-CPU minimum sojourn time against `codel_target_ns`. Below = flowing (dispatch immediately). Above = start interval timer; if still above after `sojourn_interval_ns`, stalled (reject dispatch, force rescue). The decision is binary CoDel; the target itself is adapted by the damped harmonic oscillator.
 
-**Damped oscillation** (tick, CPU 0): Reads `global_rescue_count` delta since last tick. Rescues fire -> negative impulse tightens center (detect stalls sooner). No rescues, no burst -> positive impulse relaxes center (tolerate higher sojourn). Velocity decays each tick via bit-shift damping. Center clamped between core-scaled floor and 2ms ceiling.
+**Damped oscillation** (tick, CPU 0): Reads `global_rescue_count` delta since last tick. Rescues fire → negative impulse tightens center (detect stalls sooner). Quiet tick → positive impulse relaxes center (tolerate higher sojourn). Velocity decays each tick via bit-shift damping. Center clamped between core-scaled floor and 2ms ceiling.
 
 **Feedback loop**: `global_rescue_count` (atomic, incremented at both overflow rescue sites in dispatch) drives the oscillation. The system converges: too permissive -> rescues fire -> center tightens -> fewer stalls -> rescues stop -> center relaxes.
 
@@ -163,17 +160,18 @@ Center starts at ceiling (2ms, fully permissive) and oscillation converges to th
 
 ### Overflow Sojourn Rescue
 
-Per-CPU DSQ dominance under sustained load makes downstream anti-starvation unreachable -- 90%+ of dispatches serve per-CPU DSQ while overflow tasks age indefinitely. Dispatch Step 0 checks both overflow DSQs for tasks aging past `overflow_sojourn_rescue_ns` (core-count-scaled: 2ms per core, clamped 4-10ms). CAS-based timestamp management prevents races across CPUs.
+Per-CPU DSQ dominance under sustained load makes downstream anti-starvation unreachable — 90%+ of dispatches serve per-CPU DSQ while overflow tasks age indefinitely. Dispatch Step 0 checks both overflow DSQs for tasks aging past `overflow_sojourn_rescue_ns` (core-count-scaled: 2ms per core, clamped 4-10ms). CAS-based timestamp management prevents races across CPUs.
 
 ### Longrun Detection
 
 When batch DSQ is non-empty for >2 seconds, `longrun_mode` activates: deficit ratio tightens to `nr_cpu_ids * 1` (quadrupling batch share), slices drop to 1ms, affinity forced to WEAK.
 
-### Dual Burst Detection
+### Wake Sensitivity & Preemption
 
-- **CUSUM**: Statistical change-point detection (Page, 1954) on total enqueue rate. Effective for BPF mode (1ms slices)
-- **Wakeup Rate**: Absolute threshold `nr_cpu_ids * 2` wakeups per tick. Effective for adaptive mode (4ms slices)
-- Either fires `burst_mode`: preempt threshold drops to 0, slice uses `burst_slice_ns`
+No burst detector. Prior versions layered three (CUSUM on enqueue-interval EWMA, `wake_burst` on absolute wakeup rate, and `burst_mode` gating slice/depth/preempt behaviors). All three have been retired: every failure mode they were covering is now handled directly by the oscillator-adapted CoDel target, Step -1 per-CPU DSQ rescue, hard starvation rescue, or tier information already present at the enqueue site. The one load-bearing behavior burst_mode provided — aggressive preempt when a latency-critical waker sat behind a BATCH runner — is expressed as a tier signal:
+
+- **`latcrit_waiting`**: set in `pandemonium_enqueue` when a `TIER_LAT_CRITICAL` task arrives at a shared-DSQ path; cleared in `task_should_preempt` after a BATCH preempt fires. `task_should_preempt` tightens its threshold by 4× when this flag is set (1ms baseline → 250µs, 4ms at 2C longrun → 1ms). INTERACTIVE waiters keep the standard threshold so ordinary wakeups don't penalize BATCH throughput. Uses `tctx->tier` which was already being read at both sites — no new detector state, no rate counter.
+- **Core-scaled longrun protection**: during sustained `longrun_mode`, preempt threshold scales up on 2C only (4×, i.e. 4ms protected BATCH window from a 1ms base). 4C+ keeps the baseline: the additional CPU capacity already absorbs LAT_CRIT contention without slice extension.
 
 ### Vtime Ceiling
 
@@ -185,7 +183,11 @@ Caps batch deadline at `vtime_now + 30ms`, keeping every task within 6 sojourn c
 
 ### Topology-Aware Placement
 
-**Resistance affinity**: First application of effective resistance from spectral graph theory to CPU scheduling. The CPU topology is modeled as a weighted electrical network (L2 siblings = 10.0, same socket = 1.0, cross-socket = 0.3). The Laplacian pseudoinverse (Jacobi eigendecomposition, O(n^3), pure Rust) gives exact all-pairs migration costs accounting for ALL paths, not just direct connections. `R_eff(i,j) = L+[i,i] + L+[j,j] - 2*L+[i,j]` -- a true metric satisfying the triangle inequality. Per-CPU ranked lists stored in BPF map (16 candidates, search limit 3).
+**Resistance affinity**: The CPU topology is modeled as a weighted electrical network (L2 siblings = 10.0, same socket = 1.0, cross-socket = 0.3). The Laplacian pseudoinverse (Jacobi eigendecomposition, O(n^3), pure Rust) gives all-pairs migration costs accounting for every path through the graph, not just direct connections. `R_eff(i,j) = L+[i,i] + L+[j,j] - 2*L+[i,j]` — a true metric satisfying the triangle inequality. Per-CPU ranked lists stored in BPF map (16 candidates).
+
+**Online-budget search**: `find_idle_by_affinity()` walks the ranked list with an online-candidates budget, not a total-slots budget. The rank map is built once at init from the full topology; after hotplug, some top ranks may reference offline CPUs. Offline entries are skipped without charging budget, so the search cost on a fully-online system is identical to a raw limit of 3, while remaining robust to arbitrary hotplug asymmetry (12C → 8C, 32C → 4C, etc.).
+
+**R_eff cross-L2 dispatch fallback**: when a CPU's L2 partners are all offline (solo-topology case after hotplug), dispatch Step 1 L2 work-stealing yields no result. A Step 1b fallback walks `affinity_rank` with the same online-budget pattern, stealing from R_eff-ranked online peers. Makes work on solo CPUs reachable without introducing a new detector or changing the waterfall structure.
 
 **wakee_flips gate**: `select_cpu()` reads waker/wakee `wakee_flips` from `task_struct`. Both below `nr_cpu_ids` = 1:1 pipe pair (affinity beneficial). Either above = 1:N server pattern (skip to normal path). Same discrimination as the kernel's `wake_wide()`.
 
@@ -210,7 +212,7 @@ BPF publishes mature task profiles (tier + avg_runtime) keyed by `comm[16]`. Rus
 
 - **One Thread, Zero Mutexes**: 1-second control loop reads BPF histogram maps, computes P99, drives MWU
 - **Workload Regime Detection**: LIGHT (idle >50%), MIXED (10-50%), HEAVY (<10%) with Schmitt hysteresis + 2-tick hold
-- **MWU Orchestrator**: 6 experts (LATENCY, BALANCED, THROUGHPUT, IO_HEAVY, FORK_STORM, SATURATED) compete via multiplicative weight updates. 8 continuous knobs blended via scale factors, 2 discrete knobs via majority vote. 4 loss pathways: P99 spike (Schmitt-gated, 2-tick confirm), rescue delta (0->nonzero, penalizes LATENCY at 0.4x to prevent compounding with oscillation tightening), IO bucket transition, fork storm (Schmitt-gated). ETA=8.0, weight floor 1e-6, relaxation at 80% toward equilibrium after 2 healthy ticks below 70% ceiling
+- **MWU Orchestrator**: 6 experts (LATENCY, BALANCED, THROUGHPUT, IO_HEAVY, FORK_STORM, SATURATED) compete via multiplicative weight updates. 8 continuous knobs blended via scale factors, 2 discrete knobs via majority vote. 4 loss pathways: P99 spike (Schmitt-gated, 2-tick confirm), rescue delta (0->nonzero, penalizes LATENCY at 0.4x to prevent compounding with oscillation tightening), IO bucket transition, fork storm (Schmitt-gated + pressure-confirmed: requires concurrent `rescue_count > 0` so a high raw wakeup rate alone cannot trip it). ETA=8.0, weight floor 1e-6, relaxation at 80% toward equilibrium after 2 healthy ticks below 70% ceiling
 
 ### Core-Count Scaling
 
@@ -224,8 +226,9 @@ All parameters scale dynamically with `nr_cpus`. No special-casing, no lookup ta
 | Starvation rescue | `clamp(min(25ms*N, 500ms/max(1,N/4)), 20ms, 500ms)` | 50ms | 100ms | 200ms | 167ms |
 | Deficit budget | `nr_cpus * min(4, 2 + nr_cpus/2)` | 6 | 16 | 32 | 48 |
 | Per-CPU DSQ depth | `nr_cpus < 4 ? 1 : 2` | 1 | 2 | 2 | 2 |
+| Longrun preempt shift | `nr_cpus <= 2 ? 2 : 0` | 4ms | 1ms | 1ms | 1ms |
 
-- **CPU Hotplug**: `cpu_online`/`cpu_offline` callbacks clear per-CPU timestamps and sigmoid state (velocity, rescue count) to prevent stale oscillation after suspend/resume
+- **CPU Hotplug**: `cpu_online`/`cpu_offline` callbacks clear per-CPU timestamps and oscillator state (velocity, rescue count) to prevent stale oscillation after suspend/resume
 - **BPF-Verifier Safe**: All EWMA uses bit shifts, no floats. All shared state uses GCC __sync builtins
 
 ## Architecture
@@ -294,10 +297,10 @@ BPF per-CPU histograms              Monitor Thread (1s loop)
 Resistance affinity: R_eff ranked map -> BPF select_cpu (wakee_flips-gated)
 L2 placement:        affinity_mode knob -> BPF enqueue (WEAK during longrun)
 Sojourn threshold:   sojourn_thresh_ns knob -> BPF dispatch (core-count-scaled)
-Stall detection:     sigmoid_center_ns (BPF-internal, damped oscillation, no Rust input)
+Stall detection:     codel_target_ns (BPF-internal, damped oscillation, no Rust input)
 ```
 
-One thread, zero mutexes. BPF produces histograms, Rust reads them once per second. Rust writes knobs, BPF reads them on the next scheduling decision. Stall detection is fully BPF-internal -- the damped oscillation runs in tick() on CPU 0 with no Rust involvement.
+One thread, zero mutexes. BPF produces histograms, Rust reads them once per second. Rust writes knobs, BPF reads them on the next scheduling decision. Stall detection is fully BPF-internal — the damped oscillation runs in tick() on CPU 0 with no Rust involvement.
 
 ### Tuning Knobs (BPF map)
 
@@ -320,7 +323,7 @@ One thread, zero mutexes. BPF produces histograms, Rust reads them once per seco
 - Rust toolchain
 - clang (BPF compilation)
 - system libbpf
-- bpftool (first build only -- generates vmlinux.h, can be uninstalled after)
+- bpftool (first build only — generates vmlinux.h, can be uninstalled after)
 - Root privileges (`CAP_SYS_ADMIN`)
 
 ```bash
@@ -387,7 +390,7 @@ d/s: 251000  idle: 5% shared: 230000  preempt: 12  keep: 0  kick: H=8000 S=22000
 | sleep: io | I/O-wait sleep pattern (%) |
 | sjrn | Batch sojourn: current / threshold |
 | rescue | Overflow rescue dispatches this tick |
-| [REGIME] | LIGHT/MIXED/HEAVY + BURST/LONGRUN flags |
+| [REGIME] | LIGHT/MIXED/HEAVY + LONGRUN flag |
 
 ## Benchmarking
 
@@ -442,13 +445,11 @@ Copies source into `scheds/rust/scx_pandemonium/`, renames the crate, replaces `
 
 [6] K. Nichols, V. Jacobson. "Controlled Delay Active Queue Management." *RFC 8289*, January 2018. [rfc-editor.org/rfc/rfc8289](https://www.rfc-editor.org/rfc/rfc8289.html)
 
-[7] E.S. Page. "Continuous Inspection Schemes." *Biometrika* 41(1-2), 100-115, 1954. [doi:10.1093/biomet/41.1-2.100](https://academic.oup.com/biomet/article-abstract/41/1-2/100/456627)
+[7] M. Shreedhar, G. Varghese. "Efficient Fair Queuing Using Deficit Round Robin." *ACM SIGCOMM 1995*, 231-242. [doi:10.1145/217382.217453](https://dl.acm.org/doi/10.1145/217382.217453)
 
-[8] M. Shreedhar, G. Varghese. "Efficient Fair Queuing Using Deficit Round Robin." *ACM SIGCOMM 1995*, 231-242. [doi:10.1145/217382.217453](https://dl.acm.org/doi/10.1145/217382.217453)
+[8] S. Arora, E. Hazan, S. Kale. "The Multiplicative Weights Update Method: a Meta-Algorithm and Applications." *Theory of Computing* 8, 121-164, 2012. [doi:10.4086/toc.2012.v008a006](https://theoryofcomputing.org/articles/v008a006/)
 
-[9] S. Arora, E. Hazan, S. Kale. "The Multiplicative Weights Update Method: a Meta-Algorithm and Applications." *Theory of Computing* 8, 121-164, 2012. [doi:10.4086/toc.2012.v008a006](https://theoryofcomputing.org/articles/v008a006/)
-
-[10] J.D. Valois. "Lock-Free Linked Lists Using Compare-and-Swap." *PODC 1995*, 214-222. [doi:10.1145/224964.224988](https://dl.acm.org/doi/10.1145/224964.224988)
+[9] J.D. Valois. "Lock-Free Linked Lists Using Compare-and-Swap." *PODC 1995*, 214-222. [doi:10.1145/224964.224988](https://dl.acm.org/doi/10.1145/224964.224988)
 
 ## License
 

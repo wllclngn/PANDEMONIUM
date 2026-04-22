@@ -6,8 +6,8 @@
 
 use pandemonium::tuning::{
     compute_p99_from_histogram, compute_stability_score, detect_regime, regime_knobs,
-    should_print_telemetry, should_reflex_tighten, sleep_adjust_batch_ns, Regime, TuningKnobs,
-    AFFINITY_OFF, AFFINITY_STRONG, AFFINITY_WEAK, BATCH_MAX_NS,
+    should_print_telemetry, Regime, TuningKnobs,
+    AFFINITY_OFF, AFFINITY_STRONG, AFFINITY_WEAK,
     DEFAULT_LAT_CRI_THRESH_HIGH, DEFAULT_LAT_CRI_THRESH_LOW,
     HEAVY_DEMOTION_NS, HEAVY_ENTER_PCT, HEAVY_EXIT_PCT,
     HIST_BUCKETS, LIGHT_DEMOTION_NS, LIGHT_ENTER_PCT, LIGHT_EXIT_PCT, MIXED_DEMOTION_NS,
@@ -119,9 +119,10 @@ fn demotion_threshold_in_knobs() {
 // TUNING KNOBS ABI
 
 #[test]
-fn tuning_knobs_size_is_10_u64() {
-    // MUST MATCH struct tuning_knobs IN intf.h (10 x u64 = 80 BYTES)
-    assert_eq!(std::mem::size_of::<TuningKnobs>(), 80);
+fn tuning_knobs_size_is_11_u64() {
+    // MUST MATCH struct tuning_knobs IN intf.h (11 x u64 = 88 BYTES)
+    // 11th field is topology_tau_ns, added for Fiedler-derived scaling.
+    assert_eq!(std::mem::size_of::<TuningKnobs>(), 88);
 }
 
 #[test]
@@ -135,6 +136,19 @@ fn tuning_knobs_default() {
     assert_eq!(k.lat_cri_thresh_high, DEFAULT_LAT_CRI_THRESH_HIGH);
     assert_eq!(k.lat_cri_thresh_low, DEFAULT_LAT_CRI_THRESH_LOW);
     assert_eq!(k.affinity_mode, AFFINITY_OFF);
+    assert_eq!(k.topology_tau_ns, 0);
+}
+
+#[test]
+fn scaled_regime_knobs_tau_applied_mixed_40ms() {
+    // AT tau=40MS (12C HETEROGENEOUS TARGET), K_SOJOURN=0.15 -> ~6MS
+    // (Q16 ROUNDING TOLERANCE ~250NS).
+    let k = pandemonium::tuning::scaled_regime_knobs(Regime::Mixed, 12, 40_000_000);
+    let diff = (k.sojourn_thresh_ns as i64 - 6_000_000i64).abs();
+    assert!(diff < 1000, "sojourn_thresh_ns {} off target 6_000_000", k.sojourn_thresh_ns);
+    // SLICE CAP AT tau=40MS: 0.15 * 40MS = 6MS. BASELINE slice_ns=1MS IS BELOW,
+    // SO min() KEEPS 1MS.
+    assert_eq!(k.slice_ns, 1_000_000);
 }
 
 // STABILITY MODE
@@ -219,23 +233,6 @@ fn per_tier_p99_reset_clears_all() {
     assert_eq!(compute_p99_from_histogram(&empty), 0);
 }
 
-#[test]
-fn reflex_tightens_on_interactive_p99() {
-    let ceiling = Regime::Mixed.p99_ceiling(); // 5MS
-
-    // AGGREGATE BELOW CEILING, INTERACTIVE ABOVE: TIGHTEN
-    assert!(should_reflex_tighten(500_000, 6_000_000, ceiling));
-
-    // BOTH BELOW CEILING: NO TIGHTEN
-    assert!(!should_reflex_tighten(500_000, 500_000, ceiling));
-
-    // AGGREGATE ABOVE, INTERACTIVE BELOW: STILL TIGHTENS
-    assert!(should_reflex_tighten(6_000_000, 500_000, ceiling));
-
-    // BOTH ABOVE: TIGHTENS
-    assert!(should_reflex_tighten(6_000_000, 6_000_000, ceiling));
-}
-
 // CLASSIFIER THRESHOLDS
 
 #[test]
@@ -260,35 +257,5 @@ fn classifier_thresholds_in_all_regimes() {
             regime
         );
     }
-}
-
-// SLEEP-INFORMED BATCH TUNING
-
-#[test]
-fn sleep_adjust_io_heavy_extends() {
-    // IO_PCT=70 -> +25% BATCH
-    let result = sleep_adjust_batch_ns(20_000_000, 70);
-    assert_eq!(result, 25_000_000);
-}
-
-#[test]
-fn sleep_adjust_idle_heavy_tightens() {
-    // IO_PCT=10 -> -25% BATCH
-    let result = sleep_adjust_batch_ns(20_000_000, 10);
-    assert_eq!(result, 15_000_000);
-}
-
-#[test]
-fn sleep_adjust_dead_zone() {
-    // IO_PCT=30 -> NO CHANGE
-    let result = sleep_adjust_batch_ns(20_000_000, 30);
-    assert_eq!(result, 20_000_000);
-}
-
-#[test]
-fn sleep_adjust_caps_at_max() {
-    // EVEN WITH IO-HEAVY, CAN'T EXCEED BATCH_MAX_NS
-    let result = sleep_adjust_batch_ns(22_000_000, 70);
-    assert_eq!(result, BATCH_MAX_NS);
 }
 

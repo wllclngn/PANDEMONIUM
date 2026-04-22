@@ -1418,11 +1418,10 @@ def parse_tick_lines(stdout_text: str) -> list[dict]:
         # REGIME + FLAGS: [BPF], [BPF BURST], [BPF LONGRUN],
         # [BPF BURST LONGRUN], [MIXED], [MIXED BURST], [HEAVY LONGRUN], etc.
         regime_match = re.search(
-            r'\[(BPF|Light|Mixed|Heavy|LIGHT|MIXED|HEAVY)((?:\s+(?:BURST|LONGRUN))*)\]', line)
+            r'\[(BPF|Light|Mixed|Heavy|LIGHT|MIXED|HEAVY)((?:\s+LONGRUN)*)\]', line)
         if regime_match:
             tick["regime"] = regime_match.group(1)
             flags = regime_match.group(2).upper()
-            tick["burst_active"] = "BURST" in flags
             tick["longrun_active"] = "LONGRUN" in flags
 
             if tick["regime"] == "BPF":
@@ -1752,16 +1751,6 @@ def write_prometheus(data: dict, stamp: str) -> Path:
                     gauge("pandemonium_bench_burst_recovery_worst_us",
                           "Worst-case latency during post-burst recovery",
                           br_recovery["worst_us"], labels)
-
-                # CUSUM burst detection verification
-                if "cusum_activated" in br:
-                    gauge("pandemonium_bench_burst_cusum_activated",
-                          "Whether CUSUM burst detection fired (1=yes, 0=no)",
-                          1 if br["cusum_activated"] else 0, labels)
-                if "cusum_ticks" in br:
-                    gauge("pandemonium_bench_burst_cusum_ticks",
-                          "Number of scheduler ticks with burst_mode active",
-                          br["cusum_ticks"], labels)
 
             # Longrun detection verification
             lr_ticks = sched_data.get("longrun_ticks", 0)
@@ -2966,13 +2955,118 @@ def measure_sojourn_ceiling(binary: Path, n_cpus: int,
     }
 
 
+def measure_pcpu_starvation(binary: Path, n_cpus: int,
+                            duration_secs: float = 20.0) -> dict:
+    """Regression test for the 2026-04-09 / 2026-04-12 per-CPU DSQ
+    starvation crashes (v5.6.0 waterfall bug).
+
+    Pathology: kworker/0:2 and systemd-journal[430] were stranded on
+    a per-CPU DSQ for 35-39 seconds while the owning CPU ran a
+    long-slice CPU hog. The old 8-step waterfall short-circuited
+    before reaching the per-CPU DSQ on every dispatch; the new
+    urgency-score dispatch scores every DSQ on every pass, so a
+    stalled per-CPU DSQ cannot be skipped.
+
+    This test pins:
+      - one CPU hog on CPU 0 (tight loop, never yields)
+      - one high-wakeup emitter on CPU 0 (dd bs=1 to /dev/null,
+        syscall-per-byte wakeup storm with no voluntary yield)
+    to the same CPU via taskset, then measures the emitter's
+    wall-clock completion time vs a reference upper bound.
+
+    PASS: emitter completes, no watchdog-kill in dmesg,
+          elapsed < 2x duration_secs (generous upper bound).
+    FAIL: dmesg crash pattern, emitter timeout, non-zero exit,
+          or sched_ext disabled during the test.
+    """
+    if n_cpus < 2:
+        log_info(f"[pcpu-starve] skip: n_cpus={n_cpus} (need >= 2)")
+        return {"survived": True, "pass": True, "skip": True}
+
+    target_cpu = 0
+    # TARGET BYTES SIZED TO COMPLETE IN ~duration_secs UNDER A
+    # HEALTHY SCHEDULER (10K OPS/SEC IS CONSERVATIVE FOR dd bs=1).
+    emitter_target_bytes = int(duration_secs * 10000)
+
+    log_info(f"[pcpu-starve] pinning hog + emitter to CPU {target_cpu}, "
+             f"target {emitter_target_bytes} emitter ops, "
+             f"timeout={duration_secs * 2:.0f}s")
+
+    dmesg = DmesgMonitor()
+
+    # CPU HOG: TIGHT LOOP, NEVER YIELDS, PINNED TO target_cpu.
+    # RUNS FOR duration_secs THEN EXITS.
+    hog = subprocess.Popen(
+        ["taskset", "-c", str(target_cpu), "sh", "-c",
+         f"timeout {duration_secs} sh -c 'while :; do :; done'"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+    # EMITTER: HIGH-WAKEUP-RATE TASK PINNED TO SAME CPU.
+    # dd bs=1 PRODUCES A SYSCALL PER BYTE, SO IT CYCLES
+    # RUNNABLE -> RUNNING -> RUNNABLE THOUSANDS OF TIMES PER SECOND.
+    # THIS IS THE PATTERN kworker/systemd-journal EXHIBIT:
+    # FREQUENT SHORT WAKEUPS, PINNED TO ONE CPU.
+    emit_start = time.monotonic()
+    emitter = subprocess.Popen(
+        ["taskset", "-c", str(target_cpu), "dd",
+         "if=/dev/urandom", "of=/dev/null",
+         "bs=1", f"count={emitter_target_bytes}"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+    try:
+        emitter_rc = emitter.wait(timeout=duration_secs * 2.5)
+    except subprocess.TimeoutExpired:
+        emitter.kill()
+        emitter.wait()
+        emitter_rc = -1
+    emit_elapsed = time.monotonic() - emit_start
+
+    # CLEAN UP HOG (SHOULD HAVE EXITED ON TIMEOUT ALREADY).
+    try:
+        hog.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        hog.terminate()
+        try:
+            hog.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            hog.kill()
+            hog.wait()
+
+    dmesg.check()
+
+    # PASS CRITERIA: NO DMESG CRASH, EMITTER COMPLETED, ELAPSED < 2x BOUND.
+    passed = (not dmesg.crashed
+              and emitter_rc == 0
+              and emit_elapsed < duration_secs * 2.0)
+
+    verdict = "PASS" if passed else "FAIL"
+    log_info(f"[pcpu-starve] emitter rc={emitter_rc} "
+             f"elapsed={emit_elapsed:.1f}s bound={duration_secs * 2:.1f}s "
+             f"crash={dmesg.crashed}  {verdict}")
+
+    return {
+        "survived": not dmesg.crashed,
+        "pass": passed,
+        "emitter_elapsed_s": round(emit_elapsed, 2),
+        "emitter_rc": emitter_rc,
+        "crashed": dmesg.crashed,
+        "crash_msg": dmesg.crash_msg,
+    }
+
+
 def cmd_bench_pcpu(args) -> int:
     """Per-CPU DSQ visibility stress test.
 
-    Three tests attack the per-CPU DSQ reintroduction (v5.4.8):
+    Four tests attack per-CPU DSQ reachability:
       burst-starvation: Reproduces the CS2 starvation scenario
       work-stealing:    Tests L2 work stealing under asymmetric load
       sojourn-ceiling:  Tests per-CPU sojourn rescue under full saturation
+      pcpu-starvation:  Regression test for v5.6.0 watchdog crashes
+                        (kworker/0:2, systemd-journal[430]). Pins a
+                        never-yielding CPU hog and a high-wakeup emitter
+                        to the same CPU and asserts the emitter runs.
 
     Requires sudo. Runs at current online CPU count by default.
     """
@@ -3013,7 +3107,7 @@ def cmd_bench_pcpu(args) -> int:
                     continue
             time.sleep(2)
 
-            core_results = {"burst": [], "steal": [], "sojourn": []}
+            core_results = {"burst": [], "steal": [], "sojourn": [], "pcpu_starve": []}
 
             for iteration in range(1, args.iterations + 1):
                 log_info(f"[{nr_cpus}C] Iteration {iteration}/{args.iterations}")
@@ -3027,6 +3121,7 @@ def cmd_bench_pcpu(args) -> int:
                     core_results["burst"].append({"survived": False, "pass": False})
                     core_results["steal"].append({"survived": False, "pass": False})
                     core_results["sojourn"].append({"survived": False, "pass": False})
+                    core_results["pcpu_starve"].append({"survived": False, "pass": False})
                     overall_pass = False
                     continue
 
@@ -3071,6 +3166,21 @@ def cmd_bench_pcpu(args) -> int:
                     if not r.get("pass", False) and not r.get("skip", False):
                         overall_pass = False
 
+                    dmesg.check()
+                    if dmesg.crashed:
+                        log_error(f"[{nr_cpus}C] Crash detected after sojourn test")
+                        overall_pass = False
+                        stop_and_wait(guard)
+                        continue
+
+                    time.sleep(3)
+
+                    # TEST 4: PER-CPU DSQ STARVATION REGRESSION (v5.6.0 BUG)
+                    r = measure_pcpu_starvation(BINARY, nr_cpus)
+                    core_results["pcpu_starve"].append(r)
+                    if not r.get("pass", False) and not r.get("skip", False):
+                        overall_pass = False
+
                 finally:
                     dmesg.save()
                     stdout = stop_and_wait(guard)
@@ -3097,7 +3207,7 @@ def cmd_bench_pcpu(args) -> int:
         cr = all_results[nr_cpus]
         log_info(f"  {nr_cpus}C:")
 
-        for test_name in ["burst", "steal", "sojourn"]:
+        for test_name in ["burst", "steal", "sojourn", "pcpu_starve"]:
             results = cr[test_name]
             if not results:
                 continue
@@ -3122,6 +3232,11 @@ def cmd_bench_pcpu(args) -> int:
                 if not r.get("skip"):
                     detail = (f"max_delay={r.get('max_delay_s', '?')}s "
                               f"p99_delay={r.get('p99_delay_s', '?')}s")
+            elif test_name == "pcpu_starve" and results:
+                r = results[-1]
+                if not r.get("skip"):
+                    detail = (f"emitter_elapsed={r.get('emitter_elapsed_s', '?')}s "
+                              f"rc={r.get('emitter_rc', '?')}")
 
             log_info(f"    {test_name:20s} {label} ({passes}/{total})  {detail}")
 
@@ -3139,7 +3254,7 @@ def cmd_bench_pcpu(args) -> int:
         f.write(f'# {datetime.now().isoformat()}\n')
         for nr_cpus in sorted(all_results.keys()):
             cr = all_results[nr_cpus]
-            for test_name in ["burst", "steal", "sojourn"]:
+            for test_name in ["burst", "steal", "sojourn", "pcpu_starve"]:
                 results = cr[test_name]
                 if not results:
                     continue
@@ -3159,6 +3274,9 @@ def cmd_bench_pcpu(args) -> int:
                 elif test_name == "sojourn" and not r.get("skip"):
                     f.write(f'pandemonium_pcpu_sojourn_max_delay_s{{{label}}} '
                             f'{r.get("max_delay_s", 0)}\n')
+                elif test_name == "pcpu_starve" and not r.get("skip"):
+                    f.write(f'pandemonium_pcpu_starve_elapsed_s{{{label}}} '
+                            f'{r.get("emitter_elapsed_s", 0)}\n')
     log_info(f"Prometheus: {prom_path}")
 
     return 0 if overall_pass else 1
@@ -3465,18 +3583,6 @@ def cmd_bench_scale(args) -> int:
                 if stdout and "PANDEMONIUM" in sched_name:
                     ticks = parse_tick_lines(stdout)
                     knobs = parse_knobs_line(stdout)
-
-                    # BURST ACTIVATION VERIFICATION
-                    if "burst" in sched_result:
-                        burst_ticks = [t for t in ticks if t.get("burst_active")]
-                        if burst_ticks:
-                            log_info(f"Burst verification: CUSUM activated in "
-                                     f"{len(burst_ticks)}/{len(ticks)} ticks")
-                        else:
-                            log_warn(f"Burst verification: CUSUM NEVER ACTIVATED "
-                                     f"(burst test may be ineffective at {n} cores)")
-                        sched_result["burst"]["cusum_activated"] = len(burst_ticks) > 0
-                        sched_result["burst"]["cusum_ticks"] = len(burst_ticks)
 
                     # LONGRUN ACTIVATION VERIFICATION
                     longrun_ticks = [t for t in ticks if t.get("longrun_active")]
@@ -5634,6 +5740,110 @@ def cmd_bench_scx(args) -> int:
     return 0 if overall_pass else 1
 
 
+# LOW-CPU DEADLINE REGRESSION TEST
+#
+# REPRODUCES THE 2026-04-20 BENCH-SCALE FINDING: ADAPTIVE MODE MISSED
+# 87.1% OF DEADLINES AT 4C (318MS JITTER P99) DUE TO BURST DETECTORS
+# (BPF wake_burst, MWU fork_storm) LATCHING ON UNDER NORMAL LOAD AT LOW
+# CPU COUNTS. v5.7.0 GATED THEM BEHIND THE OSCILLATOR'S RESCUE-DELTA
+# SIGNAL. THIS TEST GUARDS AGAINST REINTRODUCTION OF THE BUG.
+
+def cmd_low_cpu_deadline(args) -> int:
+    """Low-CPU ADAPTIVE deadline regression guard (v5.7.0).
+
+    Restricts to 4 (and optionally 2) CPUs, runs ADAPTIVE mode, and
+    asserts periodic deadline miss ratio < threshold. Before the v5.7.0
+    fix: 87% misses at 4C, 39% at 2C. After: single digits expected.
+    """
+    subprocess.run(["sudo", "true"])
+    nuke_stale_build()
+    if not build():
+        return 1
+
+    max_cpus = get_possible_cpus()
+    restore_all_cpus(max_cpus)
+
+    if args.core_counts:
+        core_counts = [int(c.strip()) for c in args.core_counts.split(",")]
+        core_counts = [c for c in core_counts if 2 <= c <= max_cpus]
+        core_counts = sorted(set(core_counts))
+    else:
+        core_counts = [c for c in (2, 4) if c <= max_cpus]
+
+    if not core_counts:
+        log_error("No valid core counts (need max_cpus >= 2)")
+        return 1
+
+    threshold = args.miss_threshold
+    version = get_version()
+    log_info(f"PANDEMONIUMv{version} LOW-CPU-DEADLINE REGRESSION")
+    log_info(f"Core counts: {core_counts}, miss threshold: {threshold:.1%}")
+
+    overall_pass = True
+    results: dict = {}
+
+    with CpuGuard(max_cpus):
+        restore_all_cpus(max_cpus)
+        time.sleep(0.5)
+
+        for nr_cpus in core_counts:
+            log_info(f"[{nr_cpus}C] Starting ADAPTIVE deadline test")
+
+            if nr_cpus < max_cpus:
+                if not restrict_cpus(nr_cpus, max_cpus):
+                    log_error(f"[{nr_cpus}C] CPU hotplug failed -- skipping")
+                    restore_all_cpus(max_cpus)
+                    time.sleep(0.5)
+                    overall_pass = False
+                    continue
+            time.sleep(2)
+
+            guard = start_and_wait(
+                [str(BINARY), "--verbose"], "PANDEMONIUM (ADAPTIVE)",
+                settle_secs=3)
+            if guard is None:
+                log_error(f"[{nr_cpus}C] Scheduler failed to start")
+                overall_pass = False
+                continue
+
+            try:
+                r = measure_deadline(BINARY, nr_cpus,
+                                     target_fps=60,
+                                     duration_secs=args.duration,
+                                     threshold_us=500)
+            finally:
+                guard.stop()
+                wait_for_deactivation(5.0)
+
+            miss_ratio = r.get("miss_ratio", 1.0)
+            jitter_p99 = r.get("jitter_p99_us", 0)
+            jitter_worst = r.get("jitter_worst_us", 0)
+            passed = miss_ratio < threshold
+            verdict = "PASS" if passed else "FAIL"
+
+            log_info(f"[{nr_cpus}C] miss_ratio={miss_ratio:.1%} "
+                     f"(threshold={threshold:.1%}) "
+                     f"jitter_p99={jitter_p99}us worst={jitter_worst}us "
+                     f"{verdict}")
+
+            results[nr_cpus] = {
+                "miss_ratio": miss_ratio,
+                "jitter_p99_us": jitter_p99,
+                "jitter_worst_us": jitter_worst,
+                "pass": passed,
+            }
+            if not passed:
+                overall_pass = False
+
+    log_info("SUMMARY")
+    for nr_cpus, r in results.items():
+        status = "PASS" if r["pass"] else "FAIL"
+        log_info(f"  {nr_cpus}C: miss={r['miss_ratio']:.1%} "
+                 f"p99={r['jitter_p99_us']}us  {status}")
+
+    return 0 if overall_pass else 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="PANDEMONIUM test orchestrator",
@@ -5737,6 +5947,16 @@ def main() -> int:
                            help="Comma-separated core counts "
                                 "(default: auto 2,4,8,...,max)")
 
+    lcd = sub.add_parser("low-cpu-deadline",
+                         help="v5.7.0 regression guard: ADAPTIVE deadline "
+                              "misses at low core counts (2-4C)")
+    lcd.add_argument("--core-counts", type=str, default=None,
+                     help="Comma-separated core counts (default: 2,4)")
+    lcd.add_argument("--duration", type=int, default=15,
+                     help="Measurement duration per core count (default: 15s)")
+    lcd.add_argument("--miss-threshold", type=float, default=0.10,
+                     help="Max allowed miss ratio (default: 0.10 = 10%%)")
+
     args = parser.parse_args()
 
     if args.command is None:
@@ -5761,6 +5981,8 @@ def main() -> int:
         return cmd_bench_cs2(args)
     if args.command == "bench-scx":
         return cmd_bench_scx(args)
+    if args.command == "low-cpu-deadline":
+        return cmd_low_cpu_deadline(args)
 
     log_error(f"Unknown command: {args.command}")
     return 1
