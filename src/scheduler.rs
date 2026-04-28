@@ -9,7 +9,7 @@ use libbpf_rs::skel::{OpenSkel, SkelBuilder};
 use libbpf_rs::MapCore;
 
 use crate::bpf_skel::*;
-use crate::tuning::TuningKnobs;
+use crate::tuning::{OscillatorState, TuningKnobs};
 use pandemonium::event::EventLog;
 
 // SCX EXIT CODES (FROM KERNEL)
@@ -29,7 +29,6 @@ pub struct PandemoniumStats {
     pub nr_shared: u64,
     pub nr_preempt: u64,
     pub wake_lat_sum: u64,
-    pub wake_lat_max: u64,
     pub wake_lat_samples: u64,
     pub nr_keep_running: u64,
     pub nr_hard_kicks: u64,
@@ -40,7 +39,6 @@ pub struct PandemoniumStats {
     pub wake_lat_idle_cnt: u64,
     pub wake_lat_kick_sum: u64,
     pub wake_lat_kick_cnt: u64,
-    pub nr_procdb_hits: u64,
     pub nr_l2_hit_batch: u64,
     pub nr_l2_miss_batch: u64,
     pub nr_l2_hit_interactive: u64,
@@ -54,7 +52,7 @@ pub struct PandemoniumStats {
 }
 
 // COMPILE-TIME ABI SAFETY: MUST MATCH STRUCT LAYOUTS IN intf.h
-const _: () = assert!(std::mem::size_of::<PandemoniumStats>() == 216);
+const _: () = assert!(std::mem::size_of::<PandemoniumStats>() == 200);
 const _: () = assert!(std::mem::size_of::<TuningKnobs>() == 88);
 
 // TuningKnobs LIVES IN tuning.rs (ZERO BPF DEPENDENCIES, TESTABLE OFFLINE)
@@ -160,9 +158,6 @@ impl<'a> Scheduler<'a> {
                 total.nr_shared += stats.nr_shared;
                 total.nr_preempt += stats.nr_preempt;
                 total.wake_lat_sum += stats.wake_lat_sum;
-                if stats.wake_lat_max > total.wake_lat_max {
-                    total.wake_lat_max = stats.wake_lat_max;
-                }
                 total.wake_lat_samples += stats.wake_lat_samples;
                 total.nr_keep_running += stats.nr_keep_running;
                 total.nr_hard_kicks += stats.nr_hard_kicks;
@@ -173,7 +168,6 @@ impl<'a> Scheduler<'a> {
                 total.wake_lat_idle_cnt += stats.wake_lat_idle_cnt;
                 total.wake_lat_kick_sum += stats.wake_lat_kick_sum;
                 total.wake_lat_kick_cnt += stats.wake_lat_kick_cnt;
-                total.nr_procdb_hits += stats.nr_procdb_hits;
                 total.nr_l2_hit_batch += stats.nr_l2_hit_batch;
                 total.nr_l2_miss_batch += stats.nr_l2_miss_batch;
                 total.nr_l2_hit_interactive += stats.nr_l2_hit_interactive;
@@ -210,15 +204,35 @@ impl<'a> Scheduler<'a> {
         Ok(())
     }
 
-    // WRITE ONLY topology_tau_ns, PRESERVING OTHER KNOBS.
+    // WRITE TOPOLOGY-OWNED FIELDS (tau_ns + codel_eq_ns), PRESERVING OTHERS.
     // CALLED AT TOPOLOGY DETECT AND ON HOTPLUG. READ-MODIFY-WRITE BECAUSE THE
     // tuning_knobs_map IS A SINGLE-ENTRY STRUCT AND PARTIAL UPDATES AREN'T A
     // libbpf CONCEPT -- BUT WE NEED A NARROW SETTER SO TOPOLOGY CHANGES DON'T
     // STOMP ON WHATEVER THE ADAPTIVE LOOP'S LATEST KNOB VALUES ARE.
-    pub fn write_topology_tau_ns(&self, tau_ns: u64) -> Result<()> {
+    pub fn write_topology_fields(&self, tau_ns: u64, codel_eq_ns: u64) -> Result<()> {
         let mut knobs = self.read_tuning_knobs();
         knobs.topology_tau_ns = tau_ns;
+        knobs.codel_eq_ns = codel_eq_ns;
         self.write_tuning_knobs(&knobs)
+    }
+
+    // READ BPF OSCILLATOR STATE FROM BSS/DATA SECTIONS.
+    // MWU GATES ITS RESCUE-DRIVEN PATHWAYS ON THIS SO IT DOESN'T
+    // DOUBLE-CORRECT WHEN THE BPF DAMPED OSCILLATOR HAS ALREADY MOVED.
+    pub fn read_oscillator_state(&self) -> OscillatorState {
+        let bss = match self.skel.maps.bss_data.as_ref() {
+            Some(b) => b,
+            None => return OscillatorState::default(),
+        };
+        let data = match self.skel.maps.data_data.as_ref() {
+            Some(d) => d,
+            None => return OscillatorState::default(),
+        };
+        OscillatorState {
+            codel_target_ns: bss.codel_target_ns,
+            codel_target_floor_ns: bss.codel_target_floor_ns,
+            codel_target_max_ns: data.codel_target_max_ns,
+        }
     }
 
     // READ CURRENT TUNING KNOBS FROM BPF MAP
@@ -313,7 +327,12 @@ impl<'a> Scheduler<'a> {
     // affinity_rank[cpu * MAX_AFFINITY_CANDIDATES + slot] = target_cpu
     // SORTED BY ASCENDING R_EFF FROM LAPLACIAN PSEUDOINVERSE
     pub fn write_affinity_rank(&self, cpu: u32, slot: u32, target_cpu: u32) -> Result<()> {
-        let key = (cpu * 16 + slot).to_ne_bytes(); // MAX_AFFINITY_CANDIDATES = 16
+        // MAX_AFFINITY_CANDIDATES MIRROR. The literal 16 must match the C macro
+        // in src/bpf/intf.h. There is no compile-time tie between the two sides:
+        // bumping the macro without updating this literal (or vice versa) silently
+        // mis-sizes the map index, under-populating the BPF map with no error.
+        // Topology.rs:402 has the same literal for the same reason.
+        let key = (cpu * 16 + slot).to_ne_bytes();
         let val = target_cpu.to_ne_bytes();
         self.skel
             .maps

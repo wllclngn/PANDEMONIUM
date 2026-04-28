@@ -199,7 +199,7 @@ fn main() -> Result<()> {
 // DEFAULT COMPOSITORS: BOOSTED TO LAT_CRITICAL VIA BPF MAP LOOKUP
 const DEFAULT_COMPOSITORS: &[&str] = &[
     "kwin", "gnome-shell", "mutter", "sway", "Hyprland",
-    "picom", "weston", "labwc", "wayfire", "niri", "pandemonium",
+    "picom", "weston", "labwc", "wayfire", "niri",
 ];
 
 fn run_scheduler(
@@ -277,10 +277,14 @@ fn run_scheduler(
                 if let Err(e) = topo.populate_affinity_rank_map(&sched, &rank) {
                     log_warn!("AFFINITY RANK MAP WRITE FAILED: {}", e);
                 }
-                // WRITE tau_ns INTO tuning_knobs. BPF'S tick() ON CPU 0 PICKS
-                // IT UP AND DERIVES THE TAU-SCALED TIMING STATICS.
-                if let Err(e) = sched.write_topology_tau_ns(spectrum.tau_ns) {
-                    log_warn!("TOPOLOGY TAU KNOB WRITE FAILED: {}", e);
+                // WRITE tau_ns + codel_eq_ns INTO tuning_knobs. BPF'S tick() ON
+                // CPU 0 PICKS THESE UP AND DERIVES THE TAU-SCALED TIMING STATICS
+                // AND THE R_eff-DERIVED CODEL EQUILIBRIUM TARGET.
+                if let Err(e) = sched.write_topology_fields(
+                    spectrum.tau_ns,
+                    spectrum.codel_eq_ns,
+                ) {
+                    log_warn!("TOPOLOGY KNOB WRITE FAILED: {}", e);
                 }
             }
             Err(e) => log_warn!("CACHE TOPOLOGY DETECT FAILED: {}", e),
@@ -340,7 +344,6 @@ fn run_scheduler(
                 } else {
                     0
                 };
-                let delta_procdb = stats.nr_procdb_hits.wrapping_sub(prev.nr_procdb_hits);
                 let delta_reenq = stats.nr_reenqueue.wrapping_sub(prev.nr_reenqueue);
 
                 // L2 CACHE AFFINITY DELTAS
@@ -385,10 +388,10 @@ fn run_scheduler(
 
                 if verbose {
                     println!(
-                        "d/s: {:<8} idle: {}% shared: {:<6} preempt: {:<4} keep: {:<4} kick: H={:<4} S={:<4} enq: W={:<4} R={:<4} wake: {}us lat_idle: {}us lat_kick: {}us procdb: {} reenq: {} sjrn: {}ms l2: B={}% I={}% L={}% [BPF{}]",
+                        "d/s: {:<8} idle: {}% shared: {:<6} preempt: {:<4} keep: {:<4} kick: H={:<4} S={:<4} enq: W={:<4} R={:<4} wake: {}us lat_idle: {}us lat_kick: {}us reenq: {} sjrn: {}ms l2: B={}% I={}% L={}% [BPF{}]",
                         delta_d, idle_pct, delta_shared, delta_preempt, delta_keep,
                         delta_hard, delta_soft, delta_enq_wake, delta_enq_requeue,
-                        wake_avg_us, lat_idle_us, lat_kick_us, delta_procdb,
+                        wake_avg_us, lat_idle_us, lat_kick_us,
                         delta_reenq, sojourn_ms, l2_pct_b, l2_pct_i, l2_pct_l,
                         longrun_label,
                     );
@@ -432,9 +435,9 @@ fn run_scheduler(
                 0
             };
             println!(
-                "[KNOBS] regime=BPF slice_ns={} batch_ns={} preempt_ns={} demotion_ns={} lag={} l2_hit=B:{}%/I:{}%/L:{}%",
+                "[KNOBS] regime=BPF slice_ns={} batch_ns={} preempt_ns={} lag={} l2_hit=B:{}%/I:{}%/L:{}%",
                 knobs.slice_ns, knobs.batch_slice_ns,
-                knobs.preempt_thresh_ns, knobs.cpu_bound_thresh_ns,
+                knobs.preempt_thresh_ns,
                 knobs.lag_scale, l2_cum_b, l2_cum_i, l2_cum_l,
             );
 

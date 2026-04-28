@@ -62,8 +62,14 @@ pub fn monitor_loop(
         }
     };
 
-    // APPLY INITIAL REGIME
-    sched.write_tuning_knobs(&scaled_regime_knobs(regime, nr_cpus, tau_ns))?;
+    // APPLY INITIAL REGIME. scaled_regime_knobs RETURNS topology_tau_ns/codel_eq_ns=0;
+    // OVERLAY THE LIVE BPF VALUES SO THE FIRST WRITE DOESN'T CLOBBER WHAT
+    // write_topology_fields() PUT IN THE MAP. Mirrors the regime-change path at line 230.
+    let live = sched.read_tuning_knobs();
+    let mut rk = scaled_regime_knobs(regime, nr_cpus, tau_ns);
+    rk.topology_tau_ns = tau_ns;
+    rk.codel_eq_ns = live.codel_eq_ns;
+    sched.write_tuning_knobs(&rk)?;
 
     while !shutdown.load(Ordering::Relaxed) && !sched.exited() {
         crate::watchdog::LOOP_HEARTBEAT.fetch_add(1, Ordering::Relaxed);
@@ -224,13 +230,14 @@ pub fn monitor_loop(
             }
             if regime_hold >= 2 {
                 regime = detected;
-                // REFRESH tau IN CASE HOTPLUG/TOPOLOGY CHANGED SINCE LAST REGIME
-                // TRANSITION. scaled_regime_knobs PRODUCES A TuningKnobs WITH
-                // topology_tau_ns=0; THE write_tuning_knobs PATH PRESERVES THE
-                // LIVE BPF VALUE VIA THE MWU MONITOR OVERLAY BELOW.
-                tau_ns = sched.read_tuning_knobs().topology_tau_ns;
+                // REFRESH tau IN CASE HOTPLUG/TOPOLOGY CHANGED.
+                // scaled_regime_knobs RETURNS topology_tau_ns/codel_eq_ns=0;
+                // OVERLAY THE LIVE BPF VALUES (BOTH OWNED BY TOPOLOGY LAYER).
+                let live = sched.read_tuning_knobs();
+                tau_ns = live.topology_tau_ns;
                 let mut rk = scaled_regime_knobs(regime, nr_cpus, tau_ns);
                 rk.topology_tau_ns = tau_ns;
+                rk.codel_eq_ns = live.codel_eq_ns;
                 sched.write_tuning_knobs(&rk)?;
                 regime_changed_this_tick = true;
                 mwu.set_baseline(rk);
@@ -249,13 +256,26 @@ pub fn monitor_loop(
                 interactive_p99_ns: tp99_i_ns,
                 io_pct,
                 rescue_count: delta_rescue,
-                wakeup_rate: delta_enq_wake / nr_cpus.max(1),
+                // RAW total wakes/sec; the MWU fork-storm gate compares against
+                // a tau-derived total threshold (scale_tau_u64 * K_FORK_STORM_RATE).
+                // Per-CPU normalization here re-introduced an nr_cpus^2 effective
+                // threshold and latched on quiet 2-4C systems.
+                wakeup_rate: delta_enq_wake,
             };
-            let mut knobs = mwu.update(&signals, regime.p99_ceiling(), nr_cpus);
-            // PRESERVE topology_tau_ns (OWNED BY THE TOPOLOGY LAYER, NOT MWU).
-            // WITHOUT THIS, THE ADAPTIVE LOOP'S 1HZ WRITES WOULD CLOBBER THE
-            // tau VALUE main.rs SET AT TOPOLOGY DETECT + ANY HOTPLUG UPDATE.
-            knobs.topology_tau_ns = sched.read_tuning_knobs().topology_tau_ns;
+            // OSCILLATOR-AWARE GATING: READ THE BPF DAMPED-HARMONIC
+            // OSCILLATOR'S CURRENT STATE BEFORE MWU DECIDES. PATHWAYS
+            // 2 AND 4 (RESCUE-DRIVEN) DEFER WHEN THE OSCILLATOR HAS
+            // ALREADY MOVED. WITHOUT THIS, MWU AND THE OSCILLATOR
+            // INDEPENDENTLY ADAPT ON global_rescue_count AND THE TWO
+            // CONTROLLERS DOUBLE-CORRECT.
+            let osc_state = sched.read_oscillator_state();
+            let mut knobs = mwu.update(&signals, regime.p99_ceiling(), nr_cpus, tau_ns, &osc_state);
+            // PRESERVE TOPOLOGY-OWNED FIELDS (tau_ns, codel_eq_ns) -- MWU
+            // DOESN'T TOUCH THEM. WITHOUT THIS, THE ADAPTIVE LOOP'S 1HZ
+            // WRITES WOULD CLOBBER VALUES main.rs SET AT TOPOLOGY DETECT.
+            let live = sched.read_tuning_knobs();
+            knobs.topology_tau_ns = live.topology_tau_ns;
+            knobs.codel_eq_ns = live.codel_eq_ns;
             sched.write_tuning_knobs(&knobs)?;
         }
 
@@ -368,9 +388,9 @@ pub fn monitor_loop(
         0
     };
     println!(
-        "[KNOBS] regime={} slice_ns={} batch_ns={} preempt_ns={} demotion_ns={} lag={} mwu={:.3} ticks=L:{}/M:{}/H:{} l2_hit=B:{}%/I:{}%/L:{}%",
+        "[KNOBS] regime={} slice_ns={} batch_ns={} preempt_ns={} lag={} mwu={:.3} ticks=L:{}/M:{}/H:{} l2_hit=B:{}%/I:{}%/L:{}%",
         regime.label(), final_knobs.slice_ns, final_knobs.batch_slice_ns,
-        final_knobs.preempt_thresh_ns, final_knobs.cpu_bound_thresh_ns,
+        final_knobs.preempt_thresh_ns,
         final_knobs.lag_scale, mwu.scale(),
         light_ticks, mixed_ticks, heavy_ticks,
         l2_cum_b, l2_cum_i, l2_cum_l,

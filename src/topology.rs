@@ -13,8 +13,21 @@ use crate::scheduler::Scheduler;
 // lambda_2 IS THE SECOND-SMALLEST EIGENVALUE OF THE WEIGHTED GRAPH LAPLACIAN
 // (THE "ALGEBRAIC CONNECTIVITY" OR "SPECTRAL GAP"). 1/lambda_2 IS THE MIXING
 // TIME OF A RANDOM WALK ACROSS THE CPU GRAPH -- A CANONICAL "TIME CONSTANT"
-// FOR HOW FAST WORK PROPAGATES ACROSS THE TOPOLOGY. EVERY ad-hoc nr_cpus
-// SCALING FORMULA IN THE SCHEDULER IS A CRUDE APPROXIMATION OF THIS.
+// FOR HOW FAST WORK PROPAGATES ACROSS THE TOPOLOGY. EVERY TIMING/THRESHOLD
+// FORMULA IN THE SCHEDULER DERIVES FROM tau VIA scale_tau() (BPF) OR
+// scale_tau_u64() (RUST); ad-hoc nr_cpus FORMULAS ARE CRUDE APPROXIMATIONS
+// OF THIS AND ARE EXPLICITLY MIGRATED OUT.
+//
+// CARVE-OUT: ONLY ABSOLUTE-COUNT QUANTITIES KEEP nr_cpu_ids. GRAPH-SHAPE
+// QUANTITIES (including search budgets sized by spectral connectivity) ARE
+// EXPRESSED THROUGH tau VIA lambda_2 = TAU_SCALE_NS / tau. TWO SITES IN
+// main.bpf.c INTENTIONALLY KEEP nr_cpu_ids:
+//   - select_cpu()'s wake_wide() flips threshold (matches the kernel's
+//     wake_wide() convention; an external interface).
+//   - tick()'s rotating-scan budget switch (coverage over the active CPU
+//     range, not a graph-shape decision).
+// Everything else -- timing, oscillator dynamics, search budgets, depth
+// gates -- derives from tau in apply_tau_scaling().
 //
 // EXTRACTION IS O(n log n) ON TOP OF THE EXISTING O(n^3) Jacobi; NEGLIGIBLE.
 // REFERENCE: CHEEGER'S INEQUALITY BOUNDS lambda_2 AGAINST GRAPH BOTTLENECK.
@@ -25,10 +38,17 @@ const TAU_SCALE_NS: f64 = 1.6e8;        // 160MS -- CALIBRATED SO FLAT K_4 WITH
 const TAU_FLOOR_NS: u64 = 1_000_000;    //  1MS
 const TAU_CEIL_NS: u64 = 40_000_000;    // 40MS
 
+// CoDel TARGET EQUILIBRIUM CLAMP RANGE. THE CONTROLLER'S MEAN-REVERTING
+// TARGET IN ABSENCE OF DISTURBANCE. SAME ORDER OF MAGNITUDE AS THE
+// CoDel TARGET RANGE ITSELF (FLOOR ~200us, CEILING ~8MS).
+const C_EQ_FLOOR_NS: u64 =   200_000;    // 200us
+const C_EQ_CEIL_NS:  u64 = 8_000_000;    // 8ms
+
 #[derive(Clone, Copy, Debug)]
 pub struct TopologySpectrum {
-    pub fiedler: f64,   // lambda_2
-    pub tau_ns: u64,    // clamped TAU_SCALE_NS / lambda_2
+    pub fiedler: f64,            // lambda_2
+    pub tau_ns: u64,             // clamped TAU_SCALE_NS / lambda_2
+    pub codel_eq_ns: u64,        // <R_eff> * 2m * tau, clamped
 }
 
 fn extract_fiedler(eigenvalues: &[f64]) -> f64 {
@@ -46,6 +66,39 @@ fn extract_fiedler(eigenvalues: &[f64]) -> f64 {
 fn compute_tau_ns(fiedler: f64) -> u64 {
     let raw = TAU_SCALE_NS / fiedler.max(LAMBDA_ZERO_EPS);
     (raw as u64).clamp(TAU_FLOOR_NS, TAU_CEIL_NS)
+}
+
+// CoDel TARGET EQUILIBRIUM FROM THE LAPLACIAN SPECTRUM.
+// FORMULA:  c_eq = <R_eff> * 2m * tau
+// SPECTRAL FORM:
+//   <R_eff>  =  Tr(L+) / N  =  (1/N) * sum_{lambda > 0} 1 / lambda
+//   2m       =  Tr(L)      =  sum_{lambda} lambda
+//   tau      =  TAU_SCALE_NS / lambda_2  (already computed, in ns)
+//
+// PHYSICAL INTERPRETATION: c_eq is the natural commute-time scale of
+// the topology graph -- the average time it takes work to bounce
+// between two CPUs along the topology's slowest paths. The CoDel
+// target's mean-reverting equilibrium settles to this value in the
+// absence of disturbance, so the stall detector tightens around the
+// topology's intrinsic timescale instead of a hand-picked constant.
+//
+// CLAMPED TO [200us, 8ms] -- THE CoDel TARGET RANGE ITSELF.
+fn compute_codel_eq_ns(eigenvalues: &[f64], n: usize, tau_ns: u64) -> u64 {
+    if n == 0 {
+        return TAU_FLOOR_NS;
+    }
+    let mut sum_inv_lambda = 0.0f64;
+    let mut sum_lambda = 0.0f64;
+    for &lambda in eigenvalues {
+        sum_lambda += lambda;
+        if lambda > LAMBDA_ZERO_EPS {
+            sum_inv_lambda += 1.0 / lambda;
+        }
+    }
+    let avg_reff = sum_inv_lambda / n as f64;
+    let two_m = sum_lambda;
+    let raw_ns = avg_reff * two_m * tau_ns as f64;
+    (raw_ns as u64).clamp(C_EQ_FLOOR_NS, C_EQ_CEIL_NS)
 }
 
 #[allow(dead_code)]
@@ -335,7 +388,8 @@ impl CpuTopology {
         let l_pinv = Self::compute_pseudoinverse(&eigenvalues, &eigenvectors, n);
         let reff = Self::extract_reff(&l_pinv, n);
         let rank = Self::build_affinity_rank(&reff, n);
-        (reff, rank, TopologySpectrum { fiedler, tau_ns })
+        let codel_eq_ns = compute_codel_eq_ns(&eigenvalues, n, tau_ns);
+        (reff, rank, TopologySpectrum { fiedler, tau_ns, codel_eq_ns })
     }
 
     // WRITE AFFINITY RANK TO BPF MAP
@@ -345,7 +399,11 @@ impl CpuTopology {
         sched: &Scheduler,
         rank: &[u32],
     ) -> Result<()> {
-        let max_candidates = self.nr_cpus.min(16); // BPF MAP BOUNDED
+        // MAX_AFFINITY_CANDIDATES MIRROR. The 16 must match the C macro in
+        // src/bpf/intf.h. No compile-time tie -- if the macro and this literal
+        // drift apart, BPF reads past the populated slots into zeroes (which
+        // alias CPU 0). Scheduler.rs's write_affinity_rank() has the same hazard.
+        let max_candidates = self.nr_cpus.min(16);
         for cpu in 0..self.nr_cpus {
             for slot in 0..max_candidates {
                 let val = rank[cpu * self.nr_cpus + slot];
@@ -362,9 +420,10 @@ impl CpuTopology {
         spectrum: TopologySpectrum,
     ) {
         log_info!(
-            "TOPOLOGY SPECTRUM: lambda2={:.4} tau={}ms",
+            "TOPOLOGY SPECTRUM: lambda2={:.4} tau={}ms codel_eq={}us",
             spectrum.fiedler,
-            spectrum.tau_ns / 1_000_000
+            spectrum.tau_ns / 1_000_000,
+            spectrum.codel_eq_ns / 1_000
         );
         let n = self.nr_cpus;
         // LOG TOP 3 AFFINITIES FOR CPU 0
