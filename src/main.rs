@@ -10,6 +10,8 @@
 #[allow(dead_code)]
 mod bpf_skel;
 
+mod bpf_intf;
+
 #[macro_use]
 mod log;
 mod adaptive;
@@ -42,11 +44,12 @@ struct Cli {
     #[arg(short, long)]
     verbose: bool,
 
-    #[arg(long)]
+    /// Internal: dump in-memory ring log on shutdown
+    #[arg(long, hide = true)]
     dump_log: bool,
 
-    /// Override CPU count for scaling formulas (default: auto-detect)
-    #[arg(long)]
+    /// Internal: override CPU count for scaling formulas (test harness use)
+    #[arg(long, hide = true)]
     nr_cpus: Option<u64>,
 
     /// Run BPF scheduler only, disable Rust adaptive control loop
@@ -60,36 +63,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum SubCmd {
-    /// Check dependencies and kernel config
-    Check,
+    /// Internal: interactive wakeup probe (Python test harness use)
+    #[command(hide = true)]
+    Probe,
 
-    /// Run interactive wakeup probe (stdout: overshoot_us per line)
-    Probe(ProbeArgs),
-
-    /// Build, run with sudo, capture output + dmesg, save logs
-    Start(StartArgs),
-
-    /// Show filtered kernel dmesg for sched_ext/pandemonium
-    Dmesg,
-
-    /// A/B benchmark (EEVDF baseline vs PANDEMONIUM)
-    Bench(BenchArgs),
-
-    /// Build release then run bench (logs to /tmp/pandemonium)
-    BenchRun(BenchRunArgs),
-
-    /// Run test gate (unit + integration)
-    Test,
-
-    /// CPU-pinned stress worker for bench-scale (internal use)
+    /// Internal: CPU-pinned stress worker (Python test harness use)
+    #[command(hide = true)]
     StressWorker(StressWorkerArgs),
-}
-
-#[derive(Parser)]
-struct ProbeArgs {
-    /// Death pipe FD for orphan detection (internal use)
-    #[arg(long)]
-    death_pipe_fd: Option<i32>,
 }
 
 #[derive(Parser)]
@@ -97,63 +77,6 @@ struct StressWorkerArgs {
     /// CPU to pin the stress worker to
     #[arg(long)]
     cpu: u32,
-}
-
-#[derive(Parser)]
-struct StartArgs {
-    /// Run with --verbose --dump-log
-    #[arg(long)]
-    observe: bool,
-
-    /// Extra args forwarded to `pandemonium run`
-    #[arg(last = true)]
-    sched_args: Vec<String>,
-}
-
-#[derive(Parser)]
-struct BenchArgs {
-    /// Benchmark mode
-    #[arg(long, value_enum)]
-    mode: cli::bench::BenchMode,
-
-    /// Command to benchmark (for --mode cmd)
-    #[arg(long)]
-    cmd: Option<String>,
-
-    /// Number of iterations per phase
-    #[arg(long, default_value_t = 3)]
-    iterations: usize,
-
-    /// Clean command between iterations (for --mode cmd)
-    #[arg(long)]
-    clean_cmd: Option<String>,
-
-    /// Extra args forwarded to `pandemonium run`
-    #[arg(last = true)]
-    sched_args: Vec<String>,
-}
-
-#[derive(Parser)]
-struct BenchRunArgs {
-    /// Benchmark mode
-    #[arg(long, value_enum)]
-    mode: cli::bench::BenchMode,
-
-    /// Command to benchmark (for --mode cmd)
-    #[arg(long)]
-    cmd: Option<String>,
-
-    /// Number of iterations per phase
-    #[arg(long, default_value_t = 3)]
-    iterations: usize,
-
-    /// Clean command between iterations (for --mode cmd)
-    #[arg(long)]
-    clean_cmd: Option<String>,
-
-    /// Extra args forwarded to `pandemonium run`
-    #[arg(last = true)]
-    sched_args: Vec<String>,
 }
 
 fn main() -> Result<()> {
@@ -167,28 +90,10 @@ fn main() -> Result<()> {
 
     match cli.command {
         None => run_scheduler(verbose, dump_log, nr_cpus, no_adaptive, &extra_compositors),
-        Some(SubCmd::Check) => cli::check::run_check(),
-        Some(SubCmd::Probe(args)) => {
-            cli::probe::run_probe(args.death_pipe_fd);
+        Some(SubCmd::Probe) => {
+            cli::probe::run_probe();
             Ok(())
         }
-        Some(SubCmd::Start(args)) => cli::run::run_start(args.observe, &args.sched_args),
-        Some(SubCmd::Dmesg) => cli::run::run_dmesg(),
-        Some(SubCmd::Bench(args)) => cli::bench::run_bench(
-            args.mode,
-            args.cmd.as_deref(),
-            args.iterations,
-            args.clean_cmd.as_deref(),
-            &args.sched_args,
-        ),
-        Some(SubCmd::BenchRun(args)) => cli::bench::run_bench_run(
-            args.mode,
-            args.cmd.as_deref(),
-            args.iterations,
-            args.clean_cmd.as_deref(),
-            &args.sched_args,
-        ),
-        Some(SubCmd::Test) => cli::test_gate::run_test_gate(),
         Some(SubCmd::StressWorker(args)) => {
             cli::stress::run_stress_worker(args.cpu);
             Ok(())

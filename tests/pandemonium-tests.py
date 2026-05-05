@@ -56,6 +56,13 @@ class DmesgMonitor:
         "failed to run for",
         "runnable task stall",
     ]
+    # Disable lines that indicate a real fault. "(unregistered from user
+    # space)" is a clean userspace shutdown -- not a crash.
+    DISABLE_FAULT_MARKERS = [
+        "(runtime error)",
+        "(timeout)",
+        "errored",
+    ]
     KEYWORDS = ["sched_ext", "pandemonium", "non-existent DSQ", "zero slice",
                 "panic", "BUG:", "RIP:", "Oops", "Call Trace"]
 
@@ -64,6 +71,8 @@ class DmesgMonitor:
         self.baseline = len(r.stdout.splitlines()) if r.returncode == 0 else 0
         self.crashed = False
         self.crash_msg = ""
+        # Track every sched_ext disable line, even clean ones, for reporting.
+        self.disable_msg = ""
 
     def _new_lines(self) -> list[str]:
         r = subprocess.run(["sudo", "dmesg"], capture_output=True, text=True)
@@ -73,7 +82,9 @@ class DmesgMonitor:
         return lines[self.baseline:] if self.baseline < len(lines) else []
 
     def check(self) -> bool:
-        """Poll for crash patterns. Returns True if crash detected."""
+        """Poll for crash patterns. Returns True if a real crash is detected.
+        Records clean shutdown messages in self.disable_msg without flagging
+        as a crash."""
         for line in self._new_lines():
             if "sched_ext" in line:
                 log_info(f"  dmesg: {line.strip()}")
@@ -83,9 +94,13 @@ class DmesgMonitor:
                     self.crash_msg = line.strip()
                     return True
             if "disabled" in line and "sched_ext" in line:
-                self.crashed = True
-                self.crash_msg = line.strip()
-                return True
+                self.disable_msg = line.strip()
+                # Only flag as crash for fault-shaped disable reasons.
+                if any(m in line for m in self.DISABLE_FAULT_MARKERS):
+                    self.crashed = True
+                    self.crash_msg = line.strip()
+                    return True
+                # "unregistered from user space" / clean disable: no crash.
         return False
 
     def save(self, stamp: str | None = None) -> None:
@@ -232,9 +247,15 @@ class TraceCapture:
 BPF_SRC = SCRIPT_DIR / "src" / "bpf" / "main.bpf.c"
 
 
-def patch_bpf_trace_filter(target: str) -> str | None:
-    """Patch is_sched_task() in main.bpf.c to trace `target` instead of 'pand'.
-    Returns the original content for restoration, or None on error."""
+def patch_bpf_trace_filter(target: str | None) -> str | None:
+    """Patch is_sched_task() in main.bpf.c to trace `target` instead of 'pand',
+    AND flip `#define TRACE_SCHED 0` to `1` so the bpf_printk call sites
+    survive the preprocessor. Without the TRACE_SCHED flip, the filter
+    rewrite is meaningless: `#if TRACE_SCHED` strips every PAND emission
+    at compile time and trace_pipe captures nothing.
+    If target is None, patch to `return true;` (capture all scheduling
+    activity). Returns the original content for restoration, or None on
+    error."""
     original = BPF_SRC.read_text()
 
     # Match the exact two-line return statement in is_sched_task():
@@ -247,18 +268,30 @@ def patch_bpf_trace_filter(target: str) -> str | None:
         log_error("Could not find is_sched_task() trace filter in main.bpf.c")
         return None
 
-    checks = [f"p->comm[{i}] == '{c}'" for i, c in enumerate(target)]
-    if len(checks) <= 2:
-        new_body = "\treturn " + " && ".join(checks) + ";"
+    if "#define TRACE_SCHED 0" not in original:
+        log_error("Could not find `#define TRACE_SCHED 0` in main.bpf.c "
+                  "-- bpf_printk emissions will be stripped at compile time")
+        return None
+
+    if target is None:
+        new_body = "\treturn true;"
+        log_label = "all tasks"
     else:
-        line1 = checks[:2]
-        line2 = checks[2:]
-        new_body = ("\treturn " + " && ".join(line1) + " &&\n"
-                    "\t       " + " && ".join(line2) + ";")
+        checks = [f"p->comm[{i}] == '{c}'" for i, c in enumerate(target)]
+        if len(checks) <= 2:
+            new_body = "\treturn " + " && ".join(checks) + ";"
+        else:
+            line1 = checks[:2]
+            line2 = checks[2:]
+            new_body = ("\treturn " + " && ".join(line1) + " &&\n"
+                        "\t       " + " && ".join(line2) + ";")
+        log_label = f"'pand' -> '{target}'"
 
     patched = original.replace(old_body, new_body, 1)
+    patched = patched.replace("#define TRACE_SCHED 0",
+                              "#define TRACE_SCHED 1", 1)
     BPF_SRC.write_text(patched)
-    log_info(f"Patched trace filter: 'pand' -> '{target}'")
+    log_info(f"Patched trace filter: {log_label} (TRACE_SCHED enabled)")
     return original
 
 
@@ -3860,7 +3893,7 @@ def cmd_bench_sys(args) -> int:
 # BENCH-TRACE WORKLOAD GENERATORS
 
 class _StressWorkers:
-    """Background CPU stress saturating all cores (for bench-trace)."""
+    """Background CPU stress saturating all cores."""
 
     def __init__(self, n_cpus):
         self.procs = []
@@ -3889,7 +3922,7 @@ class _StressWorkers:
 
 
 class _LatencyProbe:
-    """Wakeup latency via sleep/wake cycles (for bench-trace)."""
+    """Wakeup latency via sleep/wake cycles."""
 
     def __init__(self, duration_secs):
         self.duration = duration_secs
@@ -3919,7 +3952,7 @@ class _LatencyProbe:
 
 
 class _LongRunners:
-    """Persistent CPU-bound processes that count work iterations (for bench-trace)."""
+    """Persistent CPU-bound processes that count work iterations."""
 
     def __init__(self, count):
         self.count = count
@@ -3975,189 +4008,9 @@ def _burst_processes(count):
     return procs
 
 
-# BENCH-TRACE PHASES
-
-def _trace_phase_latency(nr_cpus, dmesg, sched_alive_fn, duration=15):
-    log_info(f"PHASE: latency ({duration}s)")
-    probe = _LatencyProbe(duration)
-    probe.start()
-    samples = probe.collect()
-    if samples:
-        p99 = percentile(samples, 99)
-        log_info(f"  latency: {len(samples)} samples, P99={p99:.0f}us")
-    if dmesg.check():
-        return False
-    return sched_alive_fn()
 
 
-def _trace_phase_burst(nr_cpus, dmesg, sched_alive_fn):
-    burst_size = nr_cpus * 4
-    log_info(f"PHASE: burst (size={burst_size})")
-    probe_base = _LatencyProbe(5)
-    probe_base.start()
-    probe_base.collect()
-    if dmesg.check() or not sched_alive_fn():
-        return False
-    burst_procs = _burst_processes(burst_size)
-    probe_burst = _LatencyProbe(10)
-    probe_burst.start()
-    burst_samples = probe_burst.collect()
-    for p in burst_procs:
-        try:
-            p.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            p.kill()
-    if dmesg.check() or not sched_alive_fn():
-        return False
-    probe_recv = _LatencyProbe(5)
-    probe_recv.start()
-    recv_samples = probe_recv.collect()
-    bp99 = percentile(burst_samples, 99) if burst_samples else 0
-    rp99 = percentile(recv_samples, 99) if recv_samples else 0
-    log_info(f"  burst P99={bp99:.0f}us, recovery P99={rp99:.0f}us")
-    if dmesg.check():
-        return False
-    return sched_alive_fn()
-
-
-def _trace_phase_longrun(nr_cpus, dmesg, sched_alive_fn, duration=20):
-    n_runners = max(2, nr_cpus // 2)
-    log_info(f"PHASE: longrun ({n_runners} runners, {duration}s)")
-    runners = _LongRunners(n_runners)
-    runners.start(duration)
-    probe = _LatencyProbe(duration)
-    probe.start()
-    samples = probe.collect()
-    work = runners.collect(timeout=duration + 15)
-    p99 = percentile(samples, 99) if samples else 0
-    min_work = min(work) if work else 0
-    log_info(f"  longrun P99={p99:.0f}us, min_work={min_work}")
-    if dmesg.check():
-        return False
-    return sched_alive_fn()
-
-
-def _trace_phase_mixed(nr_cpus, dmesg, sched_alive_fn, duration=30):
-    n_runners = max(2, nr_cpus // 2)
-    burst_size = nr_cpus * 4
-    log_info(f"PHASE: mixed ({n_runners} runners + {burst_size} burst, {duration}s)")
-    runners = _LongRunners(n_runners)
-    runners.start(duration)
-    probe = _LatencyProbe(duration)
-    probe.start()
-    time.sleep(5)
-    if dmesg.check() or not sched_alive_fn():
-        runners.collect(timeout=5)
-        return False
-    burst_procs = _burst_processes(burst_size)
-    samples = probe.collect()
-    work = runners.collect(timeout=duration + 15)
-    for p in burst_procs:
-        try:
-            p.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            p.kill()
-    p99 = percentile(samples, 99) if samples else 0
-    min_work = min(work) if work else 0
-    log_info(f"  mixed P99={p99:.0f}us, min_work={min_work}")
-    if dmesg.check():
-        return False
-    return sched_alive_fn()
-
-
-def _trace_phase_deadline(nr_cpus, dmesg, sched_alive_fn, duration=15):
-    log_info(f"PHASE: deadline ({duration}s)")
-    script = (
-        f"import time, sys\n"
-        f"target_ns = 16_666_667\n"
-        f"misses = 0\n"
-        f"total = 0\n"
-        f"end = time.monotonic() + {duration}\n"
-        "while time.monotonic() < end:\n"
-        "    t0 = time.monotonic()\n"
-        "    time.sleep(target_ns / 1e9)\n"
-        "    actual = (time.monotonic() - t0) * 1e9\n"
-        "    jitter = actual - target_ns\n"
-        "    total += 1\n"
-        "    if jitter > 500_000:\n"
-        "        misses += 1\n"
-        "print(f'{misses}/{total}', flush=True)\n"
-    )
-    p = subprocess.Popen(
-        [sys.executable, "-c", script],
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-    )
-    try:
-        out, _ = p.communicate(timeout=duration + 10)
-        log_info(f"  deadline: {out.strip()}")
-    except subprocess.TimeoutExpired:
-        p.kill()
-    if dmesg.check():
-        return False
-    return sched_alive_fn()
-
-
-def _trace_phase_ipc(nr_cpus, dmesg, sched_alive_fn):
-    n_pairs = max(2, nr_cpus // 2)
-    rounds = 10000
-    log_info(f"PHASE: ipc ({n_pairs} pairs, {rounds} rounds)")
-    script = (
-        "import os, time, sys\n"
-        "r1, w1 = os.pipe()\n"
-        "r2, w2 = os.pipe()\n"
-        "pid = os.fork()\n"
-        "if pid == 0:\n"
-        f"    for _ in range({rounds}):\n"
-        "        os.read(r1, 1)\n"
-        "        os.write(w2, b'x')\n"
-        "    os._exit(0)\n"
-        "else:\n"
-        "    t0 = time.monotonic()\n"
-        f"    for _ in range({rounds}):\n"
-        "        os.write(w1, b'x')\n"
-        "        os.read(r2, 1)\n"
-        "    elapsed = time.monotonic() - t0\n"
-        "    os.waitpid(pid, 0)\n"
-        f"    rtt = elapsed / {rounds} * 1e6\n"
-        "    print(f'{rtt:.1f}', flush=True)\n"
-    )
-    procs = []
-    for _ in range(n_pairs):
-        p = subprocess.Popen(
-            [sys.executable, "-c", script],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-        )
-        procs.append(p)
-    rtts = []
-    for p in procs:
-        try:
-            out, _ = p.communicate(timeout=30)
-            rtts.append(float(out.strip()))
-        except (subprocess.TimeoutExpired, ValueError):
-            p.kill()
-    if rtts:
-        log_info(f"  ipc: median={sorted(rtts)[len(rtts)//2]:.1f}us")
-    if dmesg.check():
-        return False
-    return sched_alive_fn()
-
-
-def _trace_phase_launch(nr_cpus, dmesg, sched_alive_fn, count=100):
-    log_info(f"PHASE: launch ({count} launches)")
-    times = []
-    for _ in range(count):
-        t0 = time.monotonic()
-        subprocess.run(["/usr/bin/true"], capture_output=True)
-        times.append((time.monotonic() - t0) * 1e6)
-    if times:
-        p99 = percentile(times, 99)
-        log_info(f"  launch P99={p99:.0f}us")
-    if dmesg.check():
-        return False
-    return sched_alive_fn()
-
-
-# BENCH-TRACE COMMAND
+# SCHEDULER LIFECYCLE HELPERS (shared by bench-trace, bench-contention)
 
 def _trace_start_scheduler(nr_cpus=None):
     """Start PANDEMONIUM with stale detection and settle verification."""
@@ -4236,166 +4089,8 @@ def _trace_stop_scheduler(proc):
     measure_struct_ops_cleanup()
 
 
-def _trace_run_iteration(iteration, total, nr_cpus):
-    """Run one full workload iteration. Returns True if scheduler survived."""
-    dmesg = DmesgMonitor()
-
-    label = f"[{iteration}/{total}] " if total > 1 else ""
-    log_info(f"{label}Starting scheduler")
-
-    sched_proc = _trace_start_scheduler(nr_cpus=nr_cpus)
-    if sched_proc is None:
-        return False
-
-    def sched_alive():
-        return sched_proc is not None and sched_proc.poll() is None
-
-    log_info(f"{label}Starting workload sequence at {nr_cpus}C")
-    stress = _StressWorkers(nr_cpus)
-    stress.start()
-    time.sleep(2)
-
-    phases = [
-        ("latency",  lambda: _trace_phase_latency(nr_cpus, dmesg, sched_alive)),
-        ("burst",    lambda: _trace_phase_burst(nr_cpus, dmesg, sched_alive)),
-        ("longrun",  lambda: _trace_phase_longrun(nr_cpus, dmesg, sched_alive)),
-        ("mixed",    lambda: _trace_phase_mixed(nr_cpus, dmesg, sched_alive)),
-        ("deadline", lambda: _trace_phase_deadline(nr_cpus, dmesg, sched_alive)),
-        ("ipc",      lambda: _trace_phase_ipc(nr_cpus, dmesg, sched_alive)),
-        ("launch",   lambda: _trace_phase_launch(nr_cpus, dmesg, sched_alive)),
-    ]
-
-    crashed = False
-    for name, fn in phases:
-        alive = fn()
-        if not alive:
-            crashed = True
-            if dmesg.crashed:
-                log_error(f"{label}CRASH DETECTED during '{name}': {dmesg.crash_msg}")
-            else:
-                log_error(f"{label}Scheduler died during '{name}' (no dmesg crash)")
-            break
-        log_info(f"  '{name}' passed, scheduler alive")
-    else:
-        log_info(f"{label}ALL PHASES COMPLETE -- scheduler survived")
-
-    stress.stop()
-    _trace_stop_scheduler(sched_proc)
-    dmesg.save()
-
-    return not crashed
 
 
-def cmd_bench_trace(args) -> int:
-    """Crash-detection stress test with trace capture.
-
-    Iterates core counts, runs all 7 workload phases per core count,
-    live crash detection via DmesgMonitor between phases, TraceCapture
-    always active. Reports survived/crashed per core count.
-    """
-
-    subprocess.run(["sudo", "true"])
-
-    nuke_stale_build()
-
-    if not build():
-        return 1
-
-    max_cpus = get_possible_cpus()
-    restore_all_cpus(max_cpus)
-
-    if args.core_counts:
-        core_counts = [int(c.strip()) for c in args.core_counts.split(",")]
-        core_counts = [c for c in core_counts if 2 <= c <= max_cpus]
-        core_counts = sorted(set(core_counts))
-    else:
-        core_counts = compute_core_counts(max_cpus)
-
-    if not core_counts:
-        log_error(f"no valid core counts (host has {max_cpus} CPUs, minimum is 2)")
-        return 1
-
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    trace_path = LOG_DIR / f"trace-{stamp}.log"
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-
-    ver = get_version()
-    git = get_git_info()
-    dirty = " (dirty)" if git["dirty"] else ""
-    log_info(f"bench-trace v{ver} [{git['commit']}{dirty}], "
-             f"core_counts={core_counts}, iterations={args.iterations}, "
-             f"host_cpus={max_cpus}")
-
-    trace = TraceCapture(trace_path)
-    results = {}
-
-    try:
-        trace_ok = trace.start()
-        if not trace_ok:
-            log_warn("trace capture unavailable, continuing with dmesg monitoring only")
-
-        for nr_cpus in core_counts:
-            log_info(f"[{nr_cpus}C] Restricting to {nr_cpus} cores")
-            if nr_cpus < max_cpus:
-                if not restrict_cpus(nr_cpus, max_cpus):
-                    log_error(f"[{nr_cpus}C] failed to offline CPUs, skipping")
-                    results[nr_cpus] = (0, args.iterations)
-                    restore_all_cpus(max_cpus)
-                    continue
-            time.sleep(1)
-
-            survived = 0
-            crashed = 0
-
-            for i in range(1, args.iterations + 1):
-                if args.iterations > 1:
-                    log_info(f"[{nr_cpus}C] ITERATION {i}/{args.iterations}")
-                ok = _trace_run_iteration(i, args.iterations, nr_cpus)
-                if ok:
-                    survived += 1
-                else:
-                    crashed += 1
-                if i < args.iterations:
-                    log_info("Settling 3s before next iteration...")
-                    time.sleep(3)
-
-            results[nr_cpus] = (survived, crashed)
-            log_info(f"[{nr_cpus}C] RESULTS: {survived}/{args.iterations} survived")
-
-            if nr_cpus < max_cpus:
-                restore_all_cpus(max_cpus)
-                time.sleep(2)
-
-    except KeyboardInterrupt:
-        log_info("Interrupted")
-    finally:
-        restore_all_cpus(max_cpus)
-        trace.stop()
-
-        total_survived = 0
-        total_crashed = 0
-        if results:
-            log_info("SUMMARY")
-            for nr_cpus in sorted(results.keys()):
-                s, c = results[nr_cpus]
-                total_survived += s
-                total_crashed += c
-                status = "PASS" if c == 0 else "FAIL"
-                log_info(f"  {nr_cpus:>3}C: {s}/{s+c} survived  {status}")
-            log_info(f"  TOTAL: {total_survived}/{total_survived+total_crashed}")
-
-        log_info(f"Trace events: {trace.count}")
-        log_info(f"Trace log:    {trace_path}")
-
-        if trace_path.exists():
-            lines = trace_path.read_text().splitlines()
-            if lines:
-                tail = lines[-20:]
-                log_info(f"Last {len(tail)} trace events:")
-                for line in tail:
-                    log_info(f"  {line.rstrip()}")
-
-    return 0 if total_crashed == 0 else 1
 
 
 # BENCH-CONTENTION PHASES
@@ -5047,10 +4742,10 @@ def cmd_bench_contention(args) -> int:
     return 0 if total_crashed == 0 else 1
 
 
-# BENCH-CS2: AUTOMATED GAME WORKLOAD DIAGNOSIS
+# BENCH-TRACE: BPF TRACE CAPTURE FOR EXTERNAL WORKLOADS
 
-CS2_CAPTURE_S = 120     # DEFAULT CAPTURE DURATION
-CS2_LAUNCH_TIMEOUT = 120  # MAX WAIT FOR CS2 PROCESS TO APPEAR
+TRACE_CAPTURE_S = 120     # DEFAULT CAPTURE DURATION
+TRACE_LAUNCH_TIMEOUT = 120  # MAX WAIT FOR --target PROCESS TO APPEAR
 GAP_THRESH_MS = 50      # SCHEDULING GAPS ABOVE THIS ARE FLAGGED (1 FRAME @ 20FPS)
 
 
@@ -5098,7 +4793,44 @@ def _kill_process(name: str):
         pass
 
 
-def _cs2_parse_trace(trace_path: Path) -> dict:
+def _extract_panic_context(stderr_text: str, stdout_text: str) -> list[str]:
+    """Pull Rust panic / BPF exit / abort signatures out of the scheduler's
+    captured stderr+stdout. Returns the matching lines plus a few lines of
+    surrounding context. Empty list when nothing panic-shaped is found.
+
+    Patterns recognized:
+      thread '...' panicked at ...
+      note: run with `RUST_BACKTRACE=...
+      BPF exit: kind=... / BPF exit reason: ... / BPF exit msg: ...
+      assertion failed: ... / assertion `...` failed
+      fatal runtime error
+    """
+    if not stderr_text and not stdout_text:
+        return []
+    combined = (stderr_text or "") + "\n" + (stdout_text or "")
+    lines = combined.splitlines()
+    markers = (
+        "thread '", "panicked at", "RUST_BACKTRACE",
+        "BPF exit:", "BPF exit reason:", "BPF exit msg:",
+        "assertion failed", "assertion `", "fatal runtime error",
+        "stack backtrace:",
+    )
+    hits: list[int] = []
+    for i, line in enumerate(lines):
+        if any(m in line for m in markers):
+            hits.append(i)
+    if not hits:
+        return []
+    # Coalesce hits + 2 lines of surrounding context, dedupe.
+    keep: set[int] = set()
+    for h in hits:
+        for j in range(max(0, h - 1), min(len(lines), h + 3)):
+            keep.add(j)
+    out = [lines[i] for i in sorted(keep) if lines[i].strip()]
+    return out[:40]
+
+
+def _trace_parse(trace_path: Path) -> dict:
     """Parse a trace log into structured event data."""
     events = []       # (timestamp_s, event_type, raw_line)
     type_counts = {}  # event_type -> count
@@ -5127,10 +4859,10 @@ def _cs2_parse_trace(trace_path: Path) -> dict:
     return {"events": events, "type_counts": type_counts}
 
 
-def _cs2_write_prometheus(version, git, stamp, target, elapsed,
+def _trace_write_prometheus(version, git, stamp, target, elapsed,
                           trace_data, latency_samples, crashed,
                           crash_msg) -> Path:
-    """Write Prometheus .prom for bench-cs2."""
+    """Write Prometheus .prom for bench-trace."""
     lines = []
     emitted = set()
 
@@ -5145,71 +4877,55 @@ def _cs2_write_prometheus(version, git, stamp, target, elapsed,
         else:
             lines.append(f"{name} {value}")
 
-    dirty = "true" if git["dirty"] else "false"
-    gauge("pandemonium_cs2_info", "Build and run metadata", 1,
-          {"version": version, "git_commit": git["commit"],
-           "git_dirty": dirty, "target": target})
-    gauge("pandemonium_cs2_timestamp_seconds", "Test start time",
-          int(time.time()))
-    gauge("pandemonium_cs2_elapsed_seconds", "Total capture duration",
-          f"{elapsed:.1f}")
-    gauge("pandemonium_cs2_crashed", "Scheduler crashed (1=yes 0=no)",
-          1 if crashed else 0)
+    # ERRORS and WARNINGS only. Absence of error == nothing to emit.
+    # A clean run produces an empty .prom file. No metadata, no debug
+    # telemetry, no "crashed=0" sentinel.
 
-    # Trace event counts
+    # ERROR: scheduler crashed. Emit only when crashed.
+    if crashed:
+        labels = {"version": version, "git_commit": git["commit"]}
+        if crash_msg:
+            labels["reason"] = crash_msg.replace('"', "'")[:200]
+        gauge("pandemonium_trace_crashed",
+              "ERROR: scheduler crashed during bench-trace run",
+              1, labels)
+
+    # WARNING: scheduling gaps past threshold. Emit only if any fired.
     events = trace_data["events"]
-    type_counts = trace_data["type_counts"]
-    gauge("pandemonium_cs2_trace_total", "Total trace events", len(events))
-
-    for etype, count in sorted(type_counts.items()):
-        gauge("pandemonium_cs2_trace_by_type", "Trace events by type",
-              count, {"type": etype})
-
-    # Event rate
-    if len(events) >= 2:
-        t0 = events[0][0]
-        duration_s = events[-1][0] - t0
-        if duration_s > 0:
-            gauge("pandemonium_cs2_trace_rate_avg",
-                  "Average trace events per second",
-                  f"{len(events) / duration_s:.1f}")
-
-    # Gaps
     gap_thresh = GAP_THRESH_MS / 1000.0
     gaps = []
     for i in range(1, len(events)):
         dt = events[i][0] - events[i - 1][0]
         if dt > gap_thresh:
             gaps.append(dt)
-    gauge("pandemonium_cs2_gaps_total",
-          f"Scheduling gaps >{GAP_THRESH_MS}ms", len(gaps))
     if gaps:
-        gauge("pandemonium_cs2_gap_max_ms", "Largest scheduling gap (ms)",
+        gauge("pandemonium_trace_gaps_total",
+              f"WARNING: scheduling gaps >{GAP_THRESH_MS}ms detected",
+              len(gaps))
+        gauge("pandemonium_trace_gap_max_ms",
+              "WARNING: largest scheduling gap (ms)",
               f"{max(gaps) * 1000:.1f}")
-        gauge("pandemonium_cs2_gap_median_ms", "Median scheduling gap (ms)",
+        gauge("pandemonium_trace_gap_median_ms",
+              "WARNING: median scheduling gap (ms)",
               f"{percentile(gaps, 50) * 1000:.1f}")
 
-    # Latency probe
+    # WARNING: worst-case wakeup latency outlier. Only emit if it
+    # exceeds 1ms; sub-ms worst-case is normal scheduler behavior, not
+    # a warning condition.
     if latency_samples:
-        p50 = percentile(latency_samples, 50)
-        p99 = percentile(latency_samples, 99)
         worst = max(latency_samples)
-        gauge("pandemonium_cs2_latency_samples", "Wakeup latency samples",
-              len(latency_samples))
-        gauge("pandemonium_cs2_latency_p50_us", "Median wakeup latency (us)",
-              f"{p50:.0f}")
-        gauge("pandemonium_cs2_latency_p99_us", "P99 wakeup latency (us)",
-              f"{p99:.0f}")
-        gauge("pandemonium_cs2_latency_worst_us", "Worst wakeup latency (us)",
-              f"{worst:.0f}")
+        if worst > 1000:
+            gauge("pandemonium_trace_latency_worst_us",
+                  "WARNING: worst-case wakeup latency (us, >1ms outlier)",
+                  f"{worst:.0f}")
 
     ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
-    path = ARCHIVE_DIR / f"cs2-{version}-{stamp}.prom"
+    path = ARCHIVE_DIR / f"trace-{version}-{stamp}.prom"
     path.write_text("\n".join(lines) + "\n")
     return path
 
 
-def cmd_bench_cs2(args) -> int:
+def cmd_bench_trace(args) -> int:
     """Automated game workload diagnosis.
 
     Patches BPF trace filter at build time, waits for the game to launch,
@@ -5218,8 +4934,8 @@ def cmd_bench_cs2(args) -> int:
     subprocess.run(["sudo", "true"])
     nuke_stale_build()
 
-    target = args.target
-    capture_duration = args.duration or CS2_CAPTURE_S
+    target = args.target  # may be None: capture all scheduling activity
+    capture_duration = args.duration or TRACE_CAPTURE_S
 
     # ---- PHASE 1: PATCH + BUILD + RESTORE ----
 
@@ -5239,18 +4955,20 @@ def cmd_bench_cs2(args) -> int:
     ver = get_version()
     git = get_git_info()
     dirty = " (dirty)" if git["dirty"] else ""
-    log_info(f"bench-cs2 v{ver} [{git['commit']}{dirty}]  "
-             f"target='{target}'  capture={capture_duration}s")
+    target_label = target if target else "ALL TASKS"
+    log_info(f"bench-trace v{ver} [{git['commit']}{dirty}]  "
+             f"target='{target_label}'  capture={capture_duration}s")
     print()
 
     # ---- PHASE 2: START SCHEDULER + MONITORING ----
 
     dmesg = DmesgMonitor()
-    trace_path = LOG_DIR / f"cs2-trace-{stamp}.log"
+    trace_path = LOG_DIR / f"trace-{stamp}.log"
     sched_proc = None
     trace = None
     probe = None
     crashed = False
+    sched_exited_clean = False
     game_exited = False
     total_elapsed = 0
     latency_samples = []
@@ -5264,24 +4982,29 @@ def cmd_bench_cs2(args) -> int:
         if not trace.start():
             log_warn("Trace capture failed, continuing without trace data")
 
-        # ---- PHASE 3: WAIT FOR GAME ----
+        # ---- PHASE 3: WAIT FOR GAME (skipped if no target) ----
 
-        already_running = _find_process(target) is not None
-        if already_running:
-            log_info(f"'{target}' already running")
+        if target is not None:
+            already_running = _find_process(target) is not None
+            if already_running:
+                log_info(f"'{target}' already running")
+            else:
+                print()
+                log_info(f">>> Please launch '{target}' now. <<<")
+                log_info(f"Waiting for '{target}' process "
+                         f"(timeout {TRACE_LAUNCH_TIMEOUT}s)...")
+                print()
+
+            pid = _wait_for_process(target, TRACE_LAUNCH_TIMEOUT)
+            if pid is None:
+                log_error(f"'{target}' did not appear "
+                          f"within {TRACE_LAUNCH_TIMEOUT}s")
+                return 1
+            log_info(f"'{target}' detected (PID {pid})")
         else:
-            print()
-            log_info(f">>> Please launch '{target}' now. <<<")
-            log_info(f"Waiting for '{target}' process "
-                     f"(timeout {CS2_LAUNCH_TIMEOUT}s)...")
-            print()
-
-        pid = _wait_for_process(target, CS2_LAUNCH_TIMEOUT)
-        if pid is None:
-            log_error(f"'{target}' did not appear "
-                      f"within {CS2_LAUNCH_TIMEOUT}s")
-            return 1
-        log_info(f"'{target}' detected (PID {pid})")
+            log_info("No target -- capturing all activity. "
+                     "Start your workload now; Ctrl+C to stop "
+                     "(or wait for crash auto-detect).")
 
         # ---- PHASE 4: CAPTURE (STARTS IMMEDIATELY) ----
 
@@ -5301,12 +5024,21 @@ def cmd_bench_cs2(args) -> int:
                 break
 
             if sched_proc.poll() is not None:
-                log_error(f"Scheduler exited at {elapsed:.0f}s "
-                          f"(code {sched_proc.returncode})")
-                crashed = True
+                # Distinguish kernel-watchdog crash (already caught by
+                # dmesg.check above) from a clean scheduler exit. Re-poll
+                # dmesg first so the disable_msg is captured.
+                dmesg.check()
+                if dmesg.crashed:
+                    log_error(f"SCHEDULER CRASH at {elapsed:.0f}s: "
+                              f"{dmesg.crash_msg}")
+                    crashed = True
+                else:
+                    log_warn(f"Scheduler exited cleanly at {elapsed:.0f}s "
+                             f"(code {sched_proc.returncode})")
+                    sched_exited_clean = True
                 break
 
-            if _find_process(target) is None:
+            if target is not None and _find_process(target) is None:
                 log_warn(f"'{target}' exited at {elapsed:.0f}s")
                 game_exited = True
                 break
@@ -5329,31 +5061,76 @@ def cmd_bench_cs2(args) -> int:
 
         if trace:
             trace.stop()
+        # Drain scheduler stdout/stderr BEFORE stopping so panic messages
+        # written immediately before SIGABRT are captured. The pipes lose
+        # earlier data when full, but the final flush before exit lands
+        # in the buffer.
+        sched_stderr_tail = ""
+        sched_stdout_tail = ""
+        if sched_proc is not None:
+            try:
+                if sched_proc.stderr:
+                    err_text = sched_proc.stderr.read() or ""
+                    sched_stderr_tail = err_text[-4000:] if err_text else ""
+                if sched_proc.stdout:
+                    out_text = sched_proc.stdout.read() or ""
+                    sched_stdout_tail = out_text[-4000:] if out_text else ""
+            except (ValueError, OSError):
+                pass
         _trace_stop_scheduler(sched_proc)
 
-        if _find_process(target):
+        if target is not None and _find_process(target):
             log_info(f"Killing '{target}'")
             _kill_process(target)
 
         # ---- REPORT (ALWAYS RUNS) ----
 
         print()
-        trace_data = _cs2_parse_trace(trace_path)
+        trace_data = _trace_parse(trace_path)
         events = trace_data["events"]
         type_counts = trace_data["type_counts"]
 
         report_lines = []
-        report_lines.append(f"bench-cs2 v{ver} [{git['commit']}{dirty}]")
+        report_lines.append(f"bench-trace v{ver} [{git['commit']}{dirty}]")
         if crashed:
             report_lines.append(
                 f"SCHEDULER CRASHED at {total_elapsed:.1f}s")
             if dmesg.crash_msg:
                 report_lines.append(f"  dmesg: {dmesg.crash_msg}")
+        elif sched_exited_clean:
+            rc = sched_proc.returncode if sched_proc else None
+            sig_label = ""
+            if rc is not None and rc < 0:
+                # Negative returncode == killed by signal abs(rc)
+                sig_num = -rc
+                sig_name = {6: "SIGABRT", 9: "SIGKILL", 15: "SIGTERM",
+                            11: "SIGSEGV", 4: "SIGILL", 8: "SIGFPE"}.get(
+                                sig_num, f"signal {sig_num}")
+                sig_label = f" -- killed by {sig_name}"
+            report_lines.append(
+                f"SCHEDULER EXITED at {total_elapsed:.1f}s "
+                f"(rc={rc}{sig_label}, no kernel crash markers)")
+            if dmesg.disable_msg:
+                report_lines.append(f"  dmesg: {dmesg.disable_msg}")
+            # Surface panic / abort context from scheduler stderr.
+            panic_lines = _extract_panic_context(sched_stderr_tail,
+                                                 sched_stdout_tail)
+            if panic_lines:
+                report_lines.append("  scheduler stderr/stdout (panic context):")
+                for line in panic_lines:
+                    report_lines.append(f"    {line}")
+            elif sched_stderr_tail.strip() or sched_stdout_tail.strip():
+                report_lines.append("  scheduler stderr (last 20 lines):")
+                tail = (sched_stderr_tail or sched_stdout_tail).strip().splitlines()
+                for line in tail[-20:]:
+                    report_lines.append(f"    {line}")
         elif game_exited:
             report_lines.append(f"GAME EXITED at {total_elapsed:.1f}s")
         else:
             report_lines.append(
                 f"Completed: {total_elapsed:.1f}s capture")
+            if dmesg.disable_msg:
+                report_lines.append(f"  dmesg disable note: {dmesg.disable_msg}")
         report_lines.append("")
 
         report_lines.append(f"Trace events: {len(events)}")
@@ -5425,12 +5202,12 @@ def cmd_bench_cs2(args) -> int:
         for line in report_lines:
             log_info(line)
 
-        report_path = LOG_DIR / f"bench-cs2-{stamp}.log"
+        report_path = LOG_DIR / f"bench-trace-{stamp}.log"
         report_path.write_text("\n".join(report_lines) + "\n")
         log_info(f"Report: {report_path}")
         log_info(f"Raw trace: {trace_path}")
 
-        prom_path = _cs2_write_prometheus(
+        prom_path = _trace_write_prometheus(
             ver, git, stamp, target, total_elapsed,
             trace_data, latency_samples, crashed,
             dmesg.crash_msg if crashed else "")
@@ -5440,6 +5217,8 @@ def cmd_bench_cs2(args) -> int:
 
         if crashed:
             status = "CRASH"
+        elif sched_exited_clean:
+            status = "SCHEDULER EXITED CLEANLY"
         elif game_exited:
             status = "GAME EXITED"
         else:
@@ -5890,13 +5669,6 @@ def main() -> int:
                        help="Skip EEVDF and external schedulers, run only "
                             "PANDEMONIUM (BPF) and PANDEMONIUM (ADAPTIVE)")
 
-    trace_bench = sub.add_parser("bench-trace",
-                                  help="Crash-detection stress test with trace capture")
-    trace_bench.add_argument("--iterations", type=int, default=1,
-                             help="Full workload iterations per core count (default: 1)")
-    trace_bench.add_argument("--core-counts", type=str, default=None,
-                             help="Comma-separated core counts "
-                                  "(default: auto 2,4,8,...,max)")
 
     contention_bench = sub.add_parser("bench-contention",
                                       help="Contention stress test for v5.4.x adaptive features")
@@ -5930,11 +5702,13 @@ def main() -> int:
                             help="Comma-separated core counts "
                                  "(default: auto 2,4,8,...,max)")
 
-    cs2_bench = sub.add_parser("bench-cs2",
-                                help="Automated game workload diagnosis")
-    cs2_bench.add_argument("--target", type=str, default="cs2",
-                           help="Process name to trace and detect (default: cs2)")
-    cs2_bench.add_argument("--duration", type=int, default=0,
+    trace_bench = sub.add_parser("bench-trace",
+                                help="BPF trace capture for an external workload")
+    trace_bench.add_argument("--target", type=str, default=None,
+                           help="Process comm-prefix to trace; if omitted, "
+                                "capture all scheduling activity (Ctrl+C "
+                                "to stop, or wait for scheduler crash)")
+    trace_bench.add_argument("--duration", type=int, default=0,
                            help="Capture duration in seconds (default: 120)")
 
     scx_bench = sub.add_parser("bench-scx",
@@ -5969,16 +5743,14 @@ def main() -> int:
 
     if args.command == "bench-scale":
         return cmd_bench_scale(args)
-    if args.command == "bench-trace":
-        return cmd_bench_trace(args)
     if args.command == "bench-contention":
         return cmd_bench_contention(args)
     if args.command == "bench-sys":
         return cmd_bench_sys(args)
     if args.command == "bench-pcpu":
         return cmd_bench_pcpu(args)
-    if args.command == "bench-cs2":
-        return cmd_bench_cs2(args)
+    if args.command == "bench-trace":
+        return cmd_bench_trace(args)
     if args.command == "bench-scx":
         return cmd_bench_scx(args)
     if args.command == "low-cpu-deadline":

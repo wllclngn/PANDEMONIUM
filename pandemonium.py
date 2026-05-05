@@ -5,10 +5,11 @@ PANDEMONIUM build/run/install manager.
 Usage:
     ./pandemonium.py bench-scale  Unified throughput + latency benchmark
     ./pandemonium.py bench-pcpu        Per-CPU DSQ visibility stress test (v5.4.8)
-    ./pandemonium.py bench-trace       Crash-detection stress test with trace capture
     ./pandemonium.py bench-contention  Contention stress test for v5.4.x features
     ./pandemonium.py bench-scx         scx CI compatibility test
     ./pandemonium.py bench-fork-thread  Fork/thread IPC benchmark + hardware counter profiling
+    ./pandemonium.py bench-trace       BPF trace capture for external workloads (Ctrl+C to stop)
+    ./pandemonium.py bench-power       Energy-efficiency benchmark (RAPL J/op + idle floor + C-state)
     ./pandemonium.py bench-sys         Live system telemetry capture (Ctrl+C to stop)
     ./pandemonium.py install      Build + install + activate systemd service
     ./pandemonium.py clean        Wipe build artifacts
@@ -204,12 +205,6 @@ def main() -> int:
              "bench-scale"] + sys.argv[2:],
             cwd=SCRIPT_DIR,
         ).returncode
-    elif cmd == "bench-trace":
-        return subprocess.run(
-            [sys.executable, str(SCRIPT_DIR / "tests" / "pandemonium-tests.py"),
-             "bench-trace"] + sys.argv[2:],
-            cwd=SCRIPT_DIR,
-        ).returncode
     elif cmd == "bench-contention":
         return subprocess.run(
             [sys.executable, str(SCRIPT_DIR / "tests" / "pandemonium-tests.py"),
@@ -231,6 +226,18 @@ def main() -> int:
     elif cmd == "bench-fork-thread":
         return subprocess.run(
             [sys.executable, str(SCRIPT_DIR / "tests" / "bench-fork-thread.py")]
+            + sys.argv[2:],
+            cwd=SCRIPT_DIR,
+        ).returncode
+    elif cmd == "bench-trace":
+        return subprocess.run(
+            [sys.executable, str(SCRIPT_DIR / "tests" / "pandemonium-tests.py"),
+             "bench-trace"] + sys.argv[2:],
+            cwd=SCRIPT_DIR,
+        ).returncode
+    elif cmd == "bench-power":
+        return subprocess.run(
+            [sys.executable, str(SCRIPT_DIR / "tests" / "bench-power.py")]
             + sys.argv[2:],
             cwd=SCRIPT_DIR,
         ).returncode

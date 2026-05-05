@@ -394,20 +394,26 @@ impl CpuTopology {
 
     // WRITE AFFINITY RANK TO BPF MAP
     // affinity_rank[cpu * MAX_AFFINITY_CANDIDATES + slot] = target_cpu
+    //
+    // Emit the full sorted R_eff peer list per CPU, capped at the BPF
+    // table width (MAX_AFFINITY_CANDIDATES). Slots beyond the actual
+    // topology end (nr_cpus - 1) are written as explicit u32::MAX
+    // sentinels so the BPF early-exit fires correctly -- map zero-init
+    // would otherwise alias to "CPU 0" and silently mis-route.
     pub fn populate_affinity_rank_map(
         &self,
         sched: &Scheduler,
         rank: &[u32],
     ) -> Result<()> {
-        // MAX_AFFINITY_CANDIDATES MIRROR. The 16 must match the C macro in
-        // src/bpf/intf.h. No compile-time tie -- if the macro and this literal
-        // drift apart, BPF reads past the populated slots into zeroes (which
-        // alias CPU 0). Scheduler.rs's write_affinity_rank() has the same hazard.
-        let max_candidates = self.nr_cpus.min(16);
+        let stride = crate::bpf_intf::MAX_AFFINITY_CANDIDATES as usize;
+        let valid = self.nr_cpus.saturating_sub(1).min(stride);
         for cpu in 0..self.nr_cpus {
-            for slot in 0..max_candidates {
+            for slot in 0..valid {
                 let val = rank[cpu * self.nr_cpus + slot];
                 sched.write_affinity_rank(cpu as u32, slot as u32, val)?;
+            }
+            for slot in valid..stride {
+                sched.write_affinity_rank(cpu as u32, slot as u32, u32::MAX)?;
             }
         }
         Ok(())

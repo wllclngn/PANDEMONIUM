@@ -55,6 +55,14 @@ pub struct PandemoniumStats {
 const _: () = assert!(std::mem::size_of::<PandemoniumStats>() == 200);
 const _: () = assert!(std::mem::size_of::<TuningKnobs>() == 88);
 
+// MAX_AFFINITY_CANDIDATES IS DEFINED IN intf.h. THE RUST MIRROR IN
+// bpf_intf.rs MUST KEEP THE SAME VALUE; IF THE TWO SIDES DRIFT, THE
+// BPF MAP STRIDE AND THE RUST WRITER STRIDE DISAGREE AND THE TABLE
+// IS SILENTLY MIS-POPULATED.
+const _: () = assert!(
+    crate::bpf_intf::MAX_AFFINITY_CANDIDATES == crate::bpf_intf::MAX_CPUS >> 3
+);
+
 // TuningKnobs LIVES IN tuning.rs (ZERO BPF DEPENDENCIES, TESTABLE OFFLINE)
 
 const KNOBS_PIN: &str = "/sys/fs/bpf/pandemonium/tuning_knobs";
@@ -327,12 +335,11 @@ impl<'a> Scheduler<'a> {
     // affinity_rank[cpu * MAX_AFFINITY_CANDIDATES + slot] = target_cpu
     // SORTED BY ASCENDING R_EFF FROM LAPLACIAN PSEUDOINVERSE
     pub fn write_affinity_rank(&self, cpu: u32, slot: u32, target_cpu: u32) -> Result<()> {
-        // MAX_AFFINITY_CANDIDATES MIRROR. The literal 16 must match the C macro
-        // in src/bpf/intf.h. There is no compile-time tie between the two sides:
-        // bumping the macro without updating this literal (or vice versa) silently
-        // mis-sizes the map index, under-populating the BPF map with no error.
-        // Topology.rs:402 has the same literal for the same reason.
-        let key = (cpu * 16 + slot).to_ne_bytes();
+        // Stride = MAX_AFFINITY_CANDIDATES. Single source of truth is the
+        // C macro in src/bpf/intf.h, mirrored in bpf_intf.rs. The
+        // static_assert above catches drift at compile time.
+        let stride = crate::bpf_intf::MAX_AFFINITY_CANDIDATES;
+        let key = (cpu * stride + slot).to_ne_bytes();
         let val = target_cpu.to_ne_bytes();
         self.skel
             .maps

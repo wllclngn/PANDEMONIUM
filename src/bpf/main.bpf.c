@@ -395,7 +395,8 @@ static __always_inline void count_l2_affinity(struct pandemonium_stats *s,
 // BOUNDED LOOP (MAX 8 ITERATIONS), VERIFIER-SAFE.
 // RETURNS IDLE CPU IN SAME L2 GROUP, OR -1 IF NONE FOUND.
 
-static __always_inline s32 find_idle_l2_sibling(const struct task_ctx *tctx)
+static __always_inline s32 find_idle_l2_sibling(const struct task_ctx *tctx,
+					       const struct cpumask *allowed)
 {
 	if (tctx->last_cpu < 0)
 		return -1;
@@ -412,6 +413,8 @@ static __always_inline s32 find_idle_l2_sibling(const struct task_ctx *tctx)
 		if (!val || *val == (u32)-1)
 			break;
 		s32 cpu = (s32)*val;
+		if (allowed && !bpf_cpumask_test_cpu(cpu, allowed))
+			continue;
 		if (scx_bpf_test_and_clear_cpu_idle(cpu))
 			return cpu;
 	}
@@ -435,7 +438,8 @@ static __always_inline s32 find_idle_l2_sibling(const struct task_ctx *tctx)
 // ENTRIES SKIP WITHOUT CHARGING BUDGET. SET IN apply_tau_scaling().
 static u32 affinity_search_online = 3;
 
-static __always_inline s32 find_idle_by_affinity(s32 src_cpu)
+static __always_inline s32 find_idle_by_affinity(s32 src_cpu,
+						 const struct cpumask *allowed)
 {
 	if (src_cpu < 0 || (u32)src_cpu >= nr_cpu_ids)
 		return -1;
@@ -452,6 +456,8 @@ static __always_inline s32 find_idle_by_affinity(s32 src_cpu)
 		// affinity_rank IS BUILT AT INIT FROM THE FULL TOPOLOGY;
 		// HOTPLUG DOESN'T REBUILD IT.
 		if (*val >= nr_cpu_ids)
+			continue;
+		if (allowed && !bpf_cpumask_test_cpu((s32)*val, allowed))
 			continue;
 		if (scx_bpf_test_and_clear_cpu_idle((s32)*val))
 			return (s32)*val;
@@ -477,7 +483,8 @@ static __always_inline s32 find_idle_by_affinity(s32 src_cpu)
 // CLAMPED TO [6, MAX_AFFINITY_CANDIDATES]. SET IN apply_tau_scaling().
 static u32 pcpu_spill_search_budget = 6;
 
-static __always_inline s32 find_pcpu_with_room(s32 src_cpu)
+static __always_inline s32 find_pcpu_with_room(s32 src_cpu,
+					       const struct cpumask *allowed)
 {
 	if (src_cpu < 0 || (u32)src_cpu >= nr_cpu_ids)
 		return -1;
@@ -491,6 +498,8 @@ static __always_inline s32 find_pcpu_with_room(s32 src_cpu)
 			break;
 		if (*val >= nr_cpu_ids)
 			continue;
+		if (allowed && !bpf_cpumask_test_cpu((s32)*val, allowed))
+			continue;
 		if (scx_bpf_dsq_nr_queued((u64)*val) < pcpu_depth_base)
 			return (s32)*val;
 		if (++checked >= pcpu_spill_search_budget)
@@ -502,20 +511,27 @@ static __always_inline s32 find_pcpu_with_room(s32 src_cpu)
 
 // PICK A DSQ FOR WAKE-SYNC OR INITIAL ENQUEUE WITH SIBLING-SPILL FALLBACK.
 // THREE-LEVEL PRIORITY:
-//   1. src_cpu's PER-CPU DSQ IF UNDER pcpu_depth_base.
-//   2. R_EFF-RANKED SIBLING PER-CPU DSQ WITH ROOM (find_pcpu_with_room).
+//   1. src_cpu's PER-CPU DSQ IF UNDER pcpu_depth_base AND IN allowed.
+//   2. R_EFF-RANKED SIBLING PER-CPU DSQ WITH ROOM AND IN allowed.
 //      DISPATCH REACHES THESE AT STEP 0 (OWN) OR STEP 1 (L2 STEAL).
-//   3. LAST RESORT: SHARED NODE DSQ. HARD STARVATION RESCUE BOUNDS WAIT;
-//      A FORK-STORM SHOULD ALMOST NEVER REACH THIS PATH WHEN MWU PATHWAY
-//      4 IS COMPRESSING SLICES (DISPATCH FREQUENCY HIGH -> SIBLING DSQs
-//      DRAIN BEFORE DEPTH SATURATES).
+//   3. LAST RESORT: SHARED NODE DSQ. HARD STARVATION RESCUE BOUNDS WAIT.
+//      ALSO THE ESCAPE VALVE WHEN allowed EXCLUDES src_cpu AND ALL R_EFF
+//      SIBLINGS -- TASK CAN ALWAYS BE DRAINED BY ANY ALLOWED CPU ON THE
+//      NODE VIA STEP 3 OF THE DISPATCH WATERFALL. PREVENTS THE PER-CPU
+//      DSQ AFFINITY-STRANDING CLASS BEHIND scx ISSUE #728 / RUNNABLE-TASK
+//      STALLS WHEN cpus_ptr CHANGES MID-FLIGHT (LIBVIRT CGROUP CPUSETS,
+//      kthread_bind, ETC.).
 // *out_cpu RECEIVES THE CPU SCX SHOULD WAKE (THE PER-CPU DSQ OWNER WE
 // LANDED IN; src_cpu IF WE FELL BACK TO NODE DSQ).
-static __always_inline u64 pick_pcpu_dsq_with_spill(s32 src_cpu, s32 *out_cpu)
+static __always_inline u64 pick_pcpu_dsq_with_spill(s32 src_cpu,
+						    const struct cpumask *allowed,
+						    s32 *out_cpu)
 {
 	u64 now = bpf_ktime_get_ns();
+	bool src_ok = (u64)src_cpu < nr_cpu_ids &&
+		      (!allowed || bpf_cpumask_test_cpu(src_cpu, allowed));
 
-	if ((u64)src_cpu < nr_cpu_ids &&
+	if (src_ok &&
 	    scx_bpf_dsq_nr_queued((u64)src_cpu) < pcpu_depth_base) {
 		if ((u32)src_cpu < MAX_CPUS)
 			__sync_val_compare_and_swap(
@@ -525,7 +541,7 @@ static __always_inline u64 pick_pcpu_dsq_with_spill(s32 src_cpu, s32 *out_cpu)
 		return (u64)src_cpu;
 	}
 
-	s32 spill = find_pcpu_with_room(src_cpu);
+	s32 spill = find_pcpu_with_room(src_cpu, allowed);
 	if (spill >= 0) {
 		if ((u32)spill < MAX_CPUS)
 			__sync_val_compare_and_swap(
@@ -845,23 +861,30 @@ static __always_inline void apply_tau_scaling(u64 tau_ns, u64 codel_eq_ns)
 	longrun_preempt_shift = (tau_ns < 4000000ULL) ? 2 : 0;
 
 	// SPILL SEARCH BUDGET. budget = K_SPILL_BUDGET / tau = lambda_2 / 2.
-	// CLAMPED TO [6, MAX_AFFINITY_CANDIDATES]. WIDER GRAPHS (HIGH lambda_2,
-	// LOW tau) GET MORE BUDGET TO COVER MORE PEERS; THIN GRAPHS GET LESS.
+	// CLAMPED TO [6, min(nr_cpu_ids - 1, MAX_AFFINITY_CANDIDATES)]. THE
+	// nr_cpu_ids - 1 RUNTIME CEILING LETS THE BUDGET COVER THE FULL
+	// TOPOLOGY ON SYSTEMS WHERE THE TABLE WIDTH ALLOWS; ON SYSTEMS LARGER
+	// THAN MAX_AFFINITY_CANDIDATES (= 64), THE COMPILE-TIME BOUND TAKES OVER.
 	{
 		u32 b = (u32)(K_SPILL_BUDGET / tau_ns);
+		u32 ceil = (nr_cpu_ids > 1) ? (u32)(nr_cpu_ids - 1) : 1;
+		if (ceil > MAX_AFFINITY_CANDIDATES) ceil = MAX_AFFINITY_CANDIDATES;
 		if (b < 6) b = 6;
-		if (b > MAX_AFFINITY_CANDIDATES) b = MAX_AFFINITY_CANDIDATES;
+		if (b > ceil) b = ceil;
 		pcpu_spill_search_budget = b;
 	}
 
 	// AFFINITY IDLE-SEARCH BUDGET. budget = K_AFFINITY_SEARCH / tau =
 	// lambda_2 / 4. SMALLER DIVISOR THAN SPILL BUDGET BECAUSE THE PREDICATE
 	// (test_and_clear_cpu_idle) IS MORE EXPENSIVE. CLAMPED TO
-	// [3, MAX_AFFINITY_CANDIDATES].
+	// [3, min(nr_cpu_ids - 1, MAX_AFFINITY_CANDIDATES)] -- SAME TOPOLOGY-
+	// AWARE CEILING AS THE SPILL BUDGET ABOVE.
 	{
 		u32 b = (u32)(K_AFFINITY_SEARCH / tau_ns);
+		u32 ceil = (nr_cpu_ids > 1) ? (u32)(nr_cpu_ids - 1) : 1;
+		if (ceil > MAX_AFFINITY_CANDIDATES) ceil = MAX_AFFINITY_CANDIDATES;
 		if (b < 3) b = 3;
-		if (b > MAX_AFFINITY_CANDIDATES) b = MAX_AFFINITY_CANDIDATES;
+		if (b > ceil) b = ceil;
 		affinity_search_online = b;
 	}
 
@@ -1154,14 +1177,14 @@ s32 BPF_STRUCT_OPS(pandemonium_select_cpu, struct task_struct *p,
 					goto normal_path;
 
 				// R_EFF RANKED IDLE SEARCH FROM WAKER
-				s32 target = find_idle_by_affinity(waker_cpu);
+				s32 target = find_idle_by_affinity(waker_cpu, p->cpus_ptr);
 				if (target >= 0) {
 					struct task_ctx *tctx = lookup_task_ctx(p);
 					struct tuning_knobs *knobs = get_knobs();
 					u64 sl = tctx ? task_slice(tctx, knobs)
 						      : 1000000;
 					s32 dst_cpu;
-					u64 dst_dsq = pick_pcpu_dsq_with_spill(target, &dst_cpu);
+					u64 dst_dsq = pick_pcpu_dsq_with_spill(target, p->cpus_ptr, &dst_cpu);
 					u64 dl = tctx ? task_deadline(p, tctx,
 						dst_dsq, knobs) : vtime_now;
 					scx_bpf_dsq_insert_vtime(p,
@@ -1191,7 +1214,7 @@ s32 BPF_STRUCT_OPS(pandemonium_select_cpu, struct task_struct *p,
 					u64 sl = tctx ? task_slice(tctx, knobs)
 						      : 1000000;
 					s32 dst_cpu;
-					u64 dst_dsq = pick_pcpu_dsq_with_spill(waker_cpu, &dst_cpu);
+					u64 dst_dsq = pick_pcpu_dsq_with_spill(waker_cpu, p->cpus_ptr, &dst_cpu);
 					u64 dl = tctx ? task_deadline(p, tctx,
 						dst_dsq, knobs) : vtime_now;
 					scx_bpf_dsq_insert_vtime(p,
@@ -1223,7 +1246,7 @@ normal_path:;
 		// PER-CPU DSQ PLACEMENT WITH L2/R_EFF SPILL. CACHE-HOT IF cpu
 		// HAS ROOM; SIBLING PER-CPU DSQ NEXT (REACHED BY DISPATCH STEP 0
 		// ON SIBLING OR STEP 1 L2 STEAL); LAST-RESORT SHARED NODE DSQ.
-		u64 dst_dsq = pick_pcpu_dsq_with_spill(cpu, &dst_cpu);
+		u64 dst_dsq = pick_pcpu_dsq_with_spill(cpu, p->cpus_ptr, &dst_cpu);
 		u64 dl = tctx ? task_deadline(p, tctx, dst_dsq, knobs)
 			      : vtime_now;
 		scx_bpf_dsq_insert_vtime(p, dst_dsq, sl, dl, 0);
@@ -1287,8 +1310,8 @@ void BPF_STRUCT_OPS(pandemonium_enqueue, struct task_struct *p,
 	if (knobs && knobs->affinity_mode > 0 && tctx &&
 	    tctx->tier != TIER_LAT_CRITICAL &&
 	    !(p->flags & PF_KTHREAD)) {
-		// cpu = find_idle_by_affinity(tctx->last_cpu);
-		cpu = find_idle_l2_sibling(tctx);
+		// cpu = find_idle_by_affinity(tctx->last_cpu, p->cpus_ptr);
+		cpu = find_idle_l2_sibling(tctx, p->cpus_ptr);
 	}
 	if (cpu < 0)
 		cpu = __COMPAT_scx_bpf_pick_idle_cpu_node(p->cpus_ptr, node, 0);
@@ -1344,7 +1367,7 @@ void BPF_STRUCT_OPS(pandemonium_enqueue, struct task_struct *p,
 			// LOGIC AS select_cpu: cpu's PER-CPU IF ROOM, ELSE A SIBLING
 			// VIA find_pcpu_with_room, ELSE LAST-RESORT NODE DSQ.
 			s32 t2_cpu;
-			u64 tier2_dsq = pick_pcpu_dsq_with_spill(cpu, &t2_cpu);
+			u64 tier2_dsq = pick_pcpu_dsq_with_spill(cpu, p->cpus_ptr, &t2_cpu);
 
 			dl = task_deadline(p, tctx, tier2_dsq, knobs);
 			scx_bpf_dsq_insert_vtime(p, tier2_dsq, sl, dl,
@@ -1354,6 +1377,15 @@ void BPF_STRUCT_OPS(pandemonium_enqueue, struct task_struct *p,
 				 tctx->tier == TIER_LAT_CRITICAL)
 				? SCX_KICK_PREEMPT : SCX_KICK_IDLE;
 			scx_bpf_kick_cpu(t2_cpu, kick_flag);
+			// Arm tick-preempt safety net when the spill helper
+			// fell back to node_dsq. Useful in conjunction with
+			// the CPU-bound demotion in stopping(): demoted
+			// saturators are now TIER_BATCH and tick can preempt
+			// them within preempt_thresh_ns to drain the kicked
+			// CPU's queue and let the dispatch waterfall reach
+			// node_dsq for the wedged victim.
+			if (tier2_dsq >= nr_cpu_ids)
+				arm_interactive_waiting(tctx);
 			tctx->dispatch_path = 1;
 			tctx->enqueue_at = bpf_ktime_get_ns();
 
@@ -1789,15 +1821,22 @@ void BPF_STRUCT_OPS(pandemonium_stopping, struct task_struct *p,
 	// so classify_tier never reruns. The classifier-based path leaves
 	// such tasks at TIER_INTERACTIVE indefinitely, which makes them
 	// unpreemptible by tick() (only TIER_BATCH receives the tick rescue
-	// at line ~2031) and forces the longrun-interactive prober to wait
-	// out a full slice on every wakeup. Cliff scales with core count
-	// because more cores = more INTERACTIVE long-runners with no slack.
-	// Demote on avg_runtime alone; the ewma_age gate the commit message
-	// described would never fire for the exact tasks it should catch.
-	if (tctx->tier == TIER_INTERACTIVE &&
-	    tctx->avg_runtime >= 2500000ULL) {
-		tctx->tier = TIER_BATCH;
-		tctx->cached_weight = effective_weight(p, tctx);
+	// at line ~2031). Threshold scales with slice_ns: an INTERACTIVE
+	// long-runner's avg_runtime asymptotes to the slice cap, so a
+	// fixed-ns threshold above slice_ns can never fire for the exact
+	// tasks the demotion is meant to catch. 75% of slice_cap catches
+	// pure CPU-bound within ~6 stop cycles (~6ms wall). The ewma_age
+	// guard spares legit interactive tasks that use full slice but
+	// sleep frequently -- their ewma_age grows on every sleep->wake.
+	{
+		struct tuning_knobs *kk = get_knobs();
+		u64 slice_cap = kk ? kk->slice_ns : 1000000;
+		if (tctx->tier == TIER_INTERACTIVE &&
+		    tctx->avg_runtime * 4 >= slice_cap * 3 &&
+		    tctx->ewma_age <= 4) {
+			tctx->tier = TIER_BATCH;
+			tctx->cached_weight = effective_weight(p, tctx);
+		}
 	}
 
 	// PROCDB: PUBLISH TASK CLASSIFICATION FOR USERSPACE
@@ -2044,7 +2083,18 @@ void BPF_STRUCT_OPS(pandemonium_tick, struct task_struct *p)
 
 	u64 on_cpu = tctx->last_run_at > 0
 		? bpf_ktime_get_ns() - tctx->last_run_at : 0;
-	if (tctx->tier == TIER_BATCH && on_cpu >= thresh) {
+	// TIER PREEMPT POLICY:
+	//   * BATCH residents are always preemptible by tick when interactive_waiting
+	//     is set (any non-batch wakeup is pending).
+	//   * INTERACTIVE residents are preemptible only when latcrit_waiting is set
+	//     (a TIER_LAT_CRITICAL wakeup is specifically pending). LAT_CRIT outranks
+	//     INTERACTIVE; INTERACTIVE keeps protection from ordinary BATCH-waiter
+	//     contention. This closes the 10ms-cadence stall class where saturators
+	//     hadn't yet demoted to BATCH (or fork-storm children newly spawned at
+	//     INTERACTIVE) couldn't be tick-preempted for a LAT_CRIT victim wake.
+	bool preemptible = tctx->tier == TIER_BATCH ||
+			   (latcrit_waiting && tctx->tier == TIER_INTERACTIVE);
+	if (preemptible && on_cpu >= thresh) {
 		scx_bpf_kick_cpu(scx_bpf_task_cpu(p), SCX_KICK_PREEMPT);
 		interactive_waiting = false;
 		latcrit_waiting = false;

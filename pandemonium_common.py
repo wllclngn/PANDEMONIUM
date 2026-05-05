@@ -167,6 +167,21 @@ def ensure_vmlinux_h() -> bool:
     return True
 
 
+def _cargo_invocation(cargo_args: list[str]) -> list[str]:
+    """Wrap a cargo command in `sudo -u <SUDO_USER> -H env ...` when
+    running under sudo. rustup stores the default toolchain in the
+    invoking user's home; running cargo as root with no root-side
+    rustup config aborts with 'no default toolchain configured'. Drop
+    privs back to the original user so cargo finds their toolchain.
+    -H resets HOME so .cargo and .rustup are picked up; `env` forwards
+    CARGO_TARGET_DIR through sudo's default env scrub."""
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user and sudo_user != "root" and os.geteuid() == 0:
+        return ["sudo", "-u", sudo_user, "-H", "env",
+                f"CARGO_TARGET_DIR={TARGET_DIR}", "cargo"] + cargo_args
+    return ["cargo"] + cargo_args
+
+
 def build(force: bool = False) -> bool:
     """Build PANDEMONIUM release binary. Returns True on success."""
     if not check_kernel_version():
@@ -192,7 +207,7 @@ def build(force: bool = False) -> bool:
     if force:
         log_info("Forced rebuild, cleaning package + BPF artifacts...")
         subprocess.run(
-            ["cargo", "clean", "-p", "pandemonium"],
+            _cargo_invocation(["clean", "-p", "pandemonium"]),
             env={**os.environ, "CARGO_TARGET_DIR": str(TARGET_DIR)},
             cwd=str(SCRIPT_DIR),
             capture_output=True,
@@ -204,7 +219,7 @@ def build(force: bool = False) -> bool:
 
     log_info("Building (release)...")
     ret = run_cmd(
-        ["cargo", "build", "--release"],
+        _cargo_invocation(["build", "--release"]),
         env={**os.environ, "CARGO_TARGET_DIR": str(TARGET_DIR)},
         cwd=SCRIPT_DIR,
     )
@@ -219,11 +234,6 @@ def build(force: bool = False) -> bool:
     return True
 
 
-def check_root():
-    """Exit if not running as root."""
-    if os.geteuid() != 0:
-        print("ERROR: must run as root (sudo)")
-        sys.exit(1)
 
 
 def ensure_build():
