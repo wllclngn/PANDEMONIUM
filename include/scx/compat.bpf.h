@@ -263,6 +263,33 @@ static inline struct task_struct *__COMPAT_scx_bpf_cpu_curr(int cpu)
 	 scx_bpf_pick_any_cpu(cpus_allowed, flags))
 
 /*
+ * Kernel 7.1+: scx_bpf_task_set_slice() and scx_bpf_task_set_dsq_vtime()
+ * replace direct writes to p->scx.slice / p->scx.dsq_vtime. The wrappers
+ * below match the upstream scx/compat.bpf.h pattern (___new suffix on the
+ * kfunc decl + static inline wrapper that picks kfunc-or-direct-write via
+ * bpf_ksym_exists). Drop the wrappers and move the decls to common.bpf.h
+ * once the kernel-side rename stabilizes.
+ */
+bool scx_bpf_task_set_slice___new(struct task_struct *p, u64 slice) __ksym __weak;
+bool scx_bpf_task_set_dsq_vtime___new(struct task_struct *p, u64 vtime) __ksym __weak;
+
+static inline void scx_bpf_task_set_slice(struct task_struct *p, u64 slice)
+{
+	if (bpf_ksym_exists(scx_bpf_task_set_slice___new))
+		scx_bpf_task_set_slice___new(p, slice);
+	else
+		p->scx.slice = slice;
+}
+
+static inline void scx_bpf_task_set_dsq_vtime(struct task_struct *p, u64 vtime)
+{
+	if (bpf_ksym_exists(scx_bpf_task_set_dsq_vtime___new))
+		scx_bpf_task_set_dsq_vtime___new(p, vtime);
+	else
+		p->scx.dsq_vtime = vtime;
+}
+
+/*
  * Define sched_ext_ops. This may be expanded to define multiple variants for
  * backward compatibility. See compat.h::SCX_OPS_LOAD/ATTACH().
  */

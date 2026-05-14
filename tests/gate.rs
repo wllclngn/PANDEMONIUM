@@ -16,15 +16,23 @@ use std::time::{Duration, Instant};
 
 use regex::Regex;
 
-const LOG_DIR: &str = "/tmp/pandemonium";
 const ACTIVATION_TIMEOUT: Duration = Duration::from_secs(10);
 const ACTIVATION_POLL: Duration = Duration::from_millis(500);
 
 // HELPERS
 
+fn user_cache_target() -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    format!("{}/.cache/pandemonium-build", home)
+}
+
+fn log_dir() -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    format!("{}/.cache/pandemonium", home)
+}
+
 fn binary_path() -> String {
-    let target_dir =
-        std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "/tmp/pandemonium-build".to_string());
+    let target_dir = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| user_cache_target());
     format!("{}/release/pandemonium", target_dir)
 }
 
@@ -115,8 +123,9 @@ fn which(name: &str) -> bool {
 }
 
 fn save_report(stamp: &str, results: &[(String, Option<bool>, String)], verdict: &str) {
-    fs::create_dir_all(LOG_DIR).ok();
-    let path = format!("{}/test-{}.log", LOG_DIR, stamp);
+    let dir = log_dir();
+    fs::create_dir_all(&dir).ok();
+    let path = format!("{}/test-{}.log", dir, stamp);
     let mut lines = Vec::new();
     lines.push(format!("PANDEMONIUM TEST GATE -- {}", stamp));
     lines.push("=".repeat(60));
@@ -169,9 +178,10 @@ fn layer2_load_classify_unload() {
 
     // COMPILE REAL CODE -- TESTS BPF classify_weight()
     // SCALE WORKLOAD BY CORE COUNT TO ACTUALLY STRESS THE SCHEDULER
-    // WRITE TO LOG_DIR (NOT /tmp DIRECTLY) TO AVOID fs.protected_regular=2 BLOCKING
-    fs::create_dir_all(LOG_DIR).ok();
-    let test_src = format!("{}/test_workload.c", LOG_DIR);
+    // WRITE TO LOG DIR (NOT /tmp DIRECTLY) TO AVOID fs.protected_regular=2 BLOCKING
+    let dir = log_dir();
+    fs::create_dir_all(&dir).ok();
+    let test_src = format!("{}/test_workload.c", dir);
     fs::write(&test_src, "int main() { return 0; }\n").unwrap();
     let ncpu = thread::available_parallelism()
         .map(|n| n.get())

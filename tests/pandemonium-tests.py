@@ -40,7 +40,7 @@ from pandemonium_common import (
 
 # CONFIGURATION
 
-DEFAULT_EXTERNALS = ["scx_bpfland", "scx_flow", "scx_lavd", "scx_cosmos", "scx_rusty"]
+DEFAULT_EXTERNALS = ["scx_cake"]
 
 
 # DMESG MONITORING

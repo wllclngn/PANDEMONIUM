@@ -1,7 +1,8 @@
 // PANDEMONIUM BUILD SCRIPT
 // COMPILES src/bpf/main.bpf.c INTO BPF BYTECODE AND GENERATES RUST SKELETON
-// vmlinux.h: CACHED AT /tmp/pandemonium-vmlinux.h. ON CACHE MISS, GENERATED
-// FROM RUNNING KERNEL'S BTF VIA bpftool (ONLY NEEDED ONCE PER KERNEL).
+// vmlinux.h: CACHED AT $HOME/.cache/pandemonium/vmlinux.h. ON CACHE MISS,
+// GENERATED FROM THE RUNNING KERNEL'S BTF VIA bpftool (ONLY NEEDED ONCE
+// PER KERNEL).
 
 use std::env;
 use std::path::PathBuf;

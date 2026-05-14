@@ -19,9 +19,14 @@ from pathlib import Path
 # CONFIGURATION
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
-TARGET_DIR = Path("/tmp/pandemonium-build")
 _sudo_user = os.environ.get("SUDO_USER")
 _real_home = Path(f"/home/{_sudo_user}") if _sudo_user else Path.home()
+# CARGO_TARGET_DIR LIVES UNDER THE INVOKING USER'S HOME, NOT /tmp. /tmp IS
+# WORLD-WRITABLE WITH STICKY BIT, AND A SHARED BUILD TREE THERE OPENED A
+# CROSS-USER SUPPLY-CHAIN VECTOR: ANOTHER LOCAL USER COULD POISON
+# `release/pandemonium` BEFORE A VICTIM RAN `./pandemonium.py install`,
+# WHICH RUNS `sudo cp $BINARY /usr/local/bin/pandemonium`. CLOSED IN v5.9.0.
+TARGET_DIR = _real_home / ".cache" / "pandemonium-build"
 LOG_DIR = _real_home / ".cache" / "pandemonium"
 ARCHIVE_DIR = LOG_DIR
 BINARY = TARGET_DIR / "release" / "pandemonium"

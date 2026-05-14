@@ -10,6 +10,7 @@ Usage:
     ./pandemonium.py bench-fork-thread  Fork/thread IPC benchmark + hardware counter profiling
     ./pandemonium.py bench-trace       BPF trace capture for external workloads (Ctrl+C to stop)
     ./pandemonium.py bench-power       Energy-efficiency benchmark (RAPL J/op + idle floor + C-state)
+    ./pandemonium.py bench-piotr-gorski  Phoronix-style application suite (12 workloads, scheduler matrix)
     ./pandemonium.py bench-sys         Live system telemetry capture (Ctrl+C to stop)
     ./pandemonium.py install      Build + install + activate systemd service
     ./pandemonium.py clean        Wipe build artifacts
@@ -50,6 +51,8 @@ Type=simple
 ExecStart={exec_line}
 Restart=on-failure
 RestartSec=5
+StateDirectory=pandemonium
+StateDirectoryMode=0700
 
 [Install]
 WantedBy=multi-user.target
@@ -238,6 +241,12 @@ def main() -> int:
     elif cmd == "bench-power":
         return subprocess.run(
             [sys.executable, str(SCRIPT_DIR / "tests" / "bench-power.py")]
+            + sys.argv[2:],
+            cwd=SCRIPT_DIR,
+        ).returncode
+    elif cmd == "bench-piotr-gorski":
+        return subprocess.run(
+            [sys.executable, str(SCRIPT_DIR / "tests" / "bench-piotr-gorski.py")]
             + sys.argv[2:],
             cwd=SCRIPT_DIR,
         ).returncode
