@@ -241,15 +241,162 @@ def write_report(version, git, stamp, ncpus, all_results):
     return path
 
 
+# ---- montauk eBPF trace capture (--trace) ----
+# Instead of the timing comparison, record a per-thread dispatch flight-recording
+# of the storm under montauk. montauk comes up first (incl. a quiet idle baseline)
+# so the storm onset and first-bit transient are captured, not missed.
+
+MONTAUK = "/usr/local/bin/montauk"
+TRACE_PATTERN = "perf"            # perf bench tree; children/threads auto-tracked
+TRACE_LOG_INTERVAL_MS = 100       # fine cadence so the first-bit transient shows
+MONTAUK_ATTACH_TIMEOUT = 10.0
+BASELINE_SECONDS = 3.0            # quiet idle recorded before the storm, for contrast
+LOAD_SAFETY_TIMEOUT = 180.0       # hard cap so a wedged scheduler can't hang the run
+
+
+def _wait_for_montauk_log(log_dir, timeout):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if any(log_dir.glob("montauk_*.prom")):
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def _stop_montauk(mont):
+    # Stop the way Ctrl+C would (SIGINT, montauk's clean shutdown), escalating
+    # only if it ignores us. No manual interrupt required.
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGKILL):
+        if mont.poll() is not None:
+            return
+        mont.send_signal(sig)
+        try:
+            mont.wait(timeout=8)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def _run_load_traced(timeout):
+    cmd = ["perf", "bench", "-f", "simple", "sched", "messaging",
+           "-t", "-g", str(NUM_GROUPS), "-l", str(NR_LOOPS)]
+    t0 = time.time()
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None
+    try:
+        return float(r.stdout.strip())
+    except (ValueError, AttributeError):
+        return time.time() - t0
+
+
+def trace_capture(sched_name, cmd, stamp, duration):
+    safe = sched_name.replace(" ", "-").replace("(", "").replace(")", "")
+    montauk_log = LOG_DIR / f"montauk-fork-thread-{safe}-{stamp}"
+    montauk_log.mkdir(parents=True, exist_ok=True)
+    montauk_out = LOG_DIR / f"montauk-fork-thread-{safe}-{stamp}.stdout"
+
+    guard = None
+    if cmd is not None:
+        log_info(f"[{sched_name}] activating scheduler...")
+        guard = start_and_wait(cmd, sched_name)
+        if guard is None:
+            log_error(f"[{sched_name}] failed to activate, skipping")
+            return None
+
+    log_info(f"[{sched_name}] starting montauk trace -> {montauk_log}")
+    with open(montauk_out, "w") as out:
+        mont = subprocess.Popen(
+            [MONTAUK, "--trace", TRACE_PATTERN, "--log", str(montauk_log),
+             "--log-interval-ms", str(TRACE_LOG_INTERVAL_MS)],
+            stdout=out, stderr=subprocess.STDOUT)
+    try:
+        if not _wait_for_montauk_log(montauk_log, MONTAUK_ATTACH_TIMEOUT):
+            log_warn(f"[{sched_name}] montauk slow to start (see {montauk_out})")
+        log_info(f"[{sched_name}] recording idle baseline for {BASELINE_SECONDS:.0f}s...")
+        time.sleep(BASELINE_SECONDS)
+        load_timeout = duration if duration > 0 else LOAD_SAFETY_TIMEOUT
+        log_info(f"[{sched_name}] running storm (montauk recording, window {load_timeout:.0f}s)...")
+        elapsed = _run_load_traced(load_timeout)
+        if elapsed is not None:
+            log_info(f"[{sched_name}] load completed in {elapsed:.3f}s")
+        else:
+            log_info(f"[{sched_name}] capture window ({load_timeout:.0f}s) elapsed -- load cut")
+    finally:
+        _stop_montauk(mont)
+        if guard is not None:
+            stop_and_wait(guard)
+
+    log_info(f"[{sched_name}] recording: {montauk_log}")
+    return montauk_log
+
+
+def run_trace(args):
+    if os.geteuid() != 0:
+        log_error("--trace needs root (montauk eBPF + sched_ext). Re-run with sudo.")
+        return 1
+    if not Path(MONTAUK).exists():
+        log_error(f"montauk not found at {MONTAUK}")
+        return 1
+
+    ver = get_version()
+    git = get_git_info()
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_info(f"bench-fork-thread --trace v{ver} [{git['commit']}]  "
+             f"trace='{TRACE_PATTERN}'  interval={TRACE_LOG_INTERVAL_MS}ms  "
+             f"load=perf bench sched messaging -t -g {NUM_GROUPS} -l {NR_LOOPS}")
+    print()
+
+    if is_scx_active():
+        log_warn(f"sched_ext active ({scx_scheduler_name()}) -- stopping pandemonium")
+        subprocess.run(["systemctl", "stop", "pandemonium"], capture_output=True)
+        wait_for_deactivation(5.0)
+    time.sleep(1)
+
+    entries = [("PANDEMONIUM (BPF)", [str(BINARY), "--no-adaptive"])]
+    if args.compare_eevdf:
+        entries.insert(0, ("EEVDF", None))
+
+    recs = {}
+    try:
+        for name, cmd in entries:
+            recs[name] = trace_capture(name, cmd, stamp, args.duration)
+            time.sleep(2)
+            print()
+    except KeyboardInterrupt:
+        log_info("Interrupted")
+    finally:
+        if is_scx_active():
+            wait_for_deactivation(5.0)
+
+    print()
+    log_info("Recordings (inspect montauk_trace_thread_* over montauk_scrape_timestamp_ms):")
+    for n, r in recs.items():
+        log_info(f"  {n}: {r}")
+    return 0
+
+
 def main():
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--quick", action="store_true",
                     help="Quick mode: 1000 loops instead of 6000")
+    ap.add_argument("--trace", action="store_true",
+                    help="Capture a montauk eBPF trace of the storm (per-thread "
+                         "dispatch flight recording) instead of the timing run. Root.")
+    ap.add_argument("--compare-eevdf", action="store_true",
+                    help="With --trace: also record EEVDF as the clean reference")
+    ap.add_argument("--duration", type=float, default=0,
+                    help="With --trace: capture window seconds (0 = bench to "
+                         "completion, hard-capped at 180s)")
     args = ap.parse_args()
 
     global NR_LOOPS
     NR_LOOPS = NR_LOOPS_QUICK if args.quick else NR_LOOPS_FULL
+
+    if args.trace:
+        return run_trace(args)
 
     if not shutil.which("perf"):
         log_error("perf not found. Install with: sudo pacman -S perf")

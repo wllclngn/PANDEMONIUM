@@ -27,7 +27,6 @@
 struct tuning_knobs {
 	u64 slice_ns;           // BASE TIME SLICE (DEFAULT 1MS)
 	u64 preempt_thresh_ns;  // TICK PREEMPTION THRESHOLD (DEFAULT 1MS)
-	u64 lag_scale;          // DEADLINE LAG MULTIPLIER (DEFAULT 4)
 	u64 batch_slice_ns;     // BATCH TASK SLICE CEILING (DEFAULT 20MS)
 	u64 lat_cri_thresh_high; // CLASSIFIER: LAT_CRITICAL THRESHOLD (DEFAULT 32)
 	u64 lat_cri_thresh_low;  // CLASSIFIER: INTERACTIVE THRESHOLD (DEFAULT 8)

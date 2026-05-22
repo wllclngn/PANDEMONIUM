@@ -40,7 +40,7 @@ from pandemonium_common import (
 
 # CONFIGURATION
 
-DEFAULT_EXTERNALS = ["scx_cake"]
+DEFAULT_EXTERNALS = ["scx_bpfland"]
 
 
 # DMESG MONITORING
@@ -2037,6 +2037,36 @@ def prom_sys_append_probe(path: Path, lat: dict, label_str: str):
 
 # REPORT
 
+def gauge_rr(per_sched_times):
+    """Gauge R&R on throughput: can the bench resolve scheduler deltas from
+    run-to-run noise? per_sched_times maps scheduler -> per-iteration seconds.
+    Schedulers are the 'parts', iterations the repeated trials. Returns %GRR
+    (sqrt of the within-scheduler variance fraction; AIAG: <10 good, <30
+    acceptable, >=30 the gauge cannot distinguish parts), ICC, and within-CV.
+    Returns None if fewer than 2 schedulers have >=2 iterations."""
+    import statistics
+    series = [t for t in per_sched_times.values() if len(t) >= 2]
+    if len(series) < 2:
+        return None
+    var_within = sum(statistics.variance(t) for t in series) / len(series)
+    means = [statistics.mean(t) for t in series]
+    var_between = statistics.variance(means)
+    total = var_within + var_between
+    if total <= 0:
+        return None
+    grand = statistics.mean(means)
+    grr_pct = (var_within / total) ** 0.5 * 100.0
+    if grr_pct < 10.0:
+        verdict = "EXCELLENT"
+    elif grr_pct < 30.0:
+        verdict = "ACCEPTABLE"
+    else:
+        verdict = "UNTRUSTWORTHY -- noise swamps the scheduler delta"
+    return {"grr_pct": grr_pct, "icc": var_between / total,
+            "within_cv": (var_within ** 0.5 / grand * 100.0) if grand > 0 else 0.0,
+            "verdict": verdict}
+
+
 def format_report(data: dict) -> str:
     """Format benchmark results into a human-readable report."""
     lines = []
@@ -2246,6 +2276,27 @@ def format_report(data: dict) -> str:
                              f"{count:>8} {mean:>10} "
                              f"{p99:>10} {worst:>10}")
 
+        lines.append("")
+
+    # Measurement repeatability (Gauge R&R) on throughput -- gates whether the
+    # bench can resolve scheduler deltas from run-to-run noise. Needs >=2
+    # iterations; silent on single-iteration runs.
+    grr_rows = []
+    for cores_str in sorted_cores:
+        per_sched = {}
+        for sched, sd in results[cores_str].items():
+            t = sd.get("throughput", {}).get("times", [])
+            if len(t) >= 2:
+                per_sched[sched] = t
+        g = gauge_rr(per_sched)
+        if g:
+            grr_rows.append(f"{cores_str + 'C':>6} {g['grr_pct']:>7.1f} "
+                            f"{g['icc']:>6.2f} {g['within_cv']:>9.2f}  "
+                            f"{g['verdict']}")
+    if grr_rows:
+        lines.append("MEASUREMENT REPEATABILITY (GAUGE R&R, THROUGHPUT)")
+        lines.append(f"{'CORES':>6} {'%GRR':>7} {'ICC':>6} {'WITHIN_CV':>9}  VERDICT")
+        lines.extend(grr_rows)
         lines.append("")
 
     # Summary matrix: throughput delta vs EEVDF

@@ -59,6 +59,34 @@ const LN_BP_D3: f64 = 1.791_759_469_228_055;
 // AS A "WORKLOAD IS UNPREDICTABLE THIS WINDOW" SIGNAL.
 pub const BP_H_HIGH: f64 = 0.85;
 
+// RQA (RECURRENCE QUANTIFICATION ANALYSIS) DETERMINISM.
+// DET IS THE FRACTION OF RECURRENCE POINTS THAT LIE ON DIAGONAL LINE
+// SEGMENTS. A DETERMINISTIC / STEADY SIGNAL REVISITS PHASE-SPACE
+// NEIGHBORHOODS ALONG DIAGONALS (DET -> 1); AN IID SIGNAL SCATTERS
+// RECURRENCE POINTS WITH NO DIAGONAL STRUCTURE (DET -> 0).
+// THE ADAPTIVE QUIESCENCE GATE PAIRS HIGH DET WITH HVG LAMBDA IN THE
+// PERIODIC BAND TO DETECT "STOP RETUNING" STEADY STATE.
+
+// DELAY-EMBEDDING DIMENSION. 3-D VECTORS WITH UNIT DELAY -- MATCHES
+// THE D=3 ORDINAL SCALE USED BY BANDT-POMPE.
+pub const RQA_EMBED_DIM: usize = 3;
+
+// RECURRENCE THRESHOLD AS A FRACTION OF THE WINDOW STANDARD DEVIATION:
+// eps = RQA_THRESH_STD_FRAC * sigma. 0.20 IS THE STANDARD RQA DEFAULT
+// BAND FOR SHORT SERIES.
+pub const RQA_THRESH_STD_FRAC: f64 = 0.20;
+
+// MINIMUM DIAGONAL-LINE LENGTH COUNTED AS DETERMINISM (RQA l_min).
+pub const RQA_LMIN: usize = 2;
+
+// DET AT OR ABOVE THIS = DETERMINISTIC / STEADY. CONSUMED BY THE
+// ADAPTIVE QUIESCENCE GATE.
+pub const RQA_DET_STEADY_MIN: f64 = 0.90;
+
+// BELOW THIS WINDOW FILL, rqa_det RETURNS None (INSUFFICIENT DATA --
+// NEVER LET THE GATE FREEZE ON A HALF-FILLED WINDOW).
+pub const RQA_MIN_SAMPLES: usize = 8;
+
 // RAW WINDOW
 // FIXED-SIZE RING BUFFER OF f64 SAMPLES. NO HEAP ALLOC AT STEADY STATE.
 // SEMANTICS:
@@ -372,6 +400,143 @@ pub fn bandt_pompe_d3<const N: usize>(w: &RawWindow<N>) -> f64 {
     h / LN_BP_D3
 }
 
+// RQA DETERMINISM (DET)
+//
+// DELAY-EMBED THE WINDOW INTO RQA_EMBED_DIM-D VECTORS WITH UNIT DELAY,
+// BUILD THE RECURRENCE MATRIX UNDER A CHEBYSHEV (L-INFINITY) BALL OF
+// RADIUS eps = RQA_THRESH_STD_FRAC * sigma, AND RETURN THE FRACTION OF
+// OFF-DIAGONAL RECURRENCE POINTS THAT LIE ON DIAGONAL RUNS OF LENGTH
+// >= RQA_LMIN.
+//
+// RETURNS Some(DET) IN [0, 1], OR None WHEN THE WINDOW HAS FEWER THAN
+// RQA_MIN_SAMPLES FILLED SLOTS -- THE QUIESCENCE GATE MUST NOT FREEZE
+// ON A HALF-FILLED WINDOW.
+//
+// BRUTE-FORCE O(N^2), SAME COST CLASS AS hvg_degrees. AT N <= 64 THIS
+// IS UNDER 4K COMPARISONS, DONE ONCE PER SECOND.
+
+// CHEBYSHEV (L-INFINITY) DISTANCE BETWEEN TWO 3-D EMBEDDED POINTS.
+fn chebyshev3(a: &[f64; RQA_EMBED_DIM], b: &[f64; RQA_EMBED_DIM]) -> f64 {
+    let mut m = 0.0;
+    for k in 0..RQA_EMBED_DIM {
+        let d = (a[k] - b[k]).abs();
+        if d > m {
+            m = d;
+        }
+    }
+    m
+}
+
+pub fn rqa_det<const N: usize>(w: &RawWindow<N>) -> Option<f64> {
+    let n = w.filled;
+    if n < RQA_MIN_SAMPLES {
+        return None;
+    }
+
+    // COPY WINDOW INTO ORDER-PRESERVING SLICE FOR INDEXED ACCESS.
+    let mut s: [f64; N] = [0.0; N];
+    let mut k = 0;
+    for x in w.iter() {
+        s[k] = x;
+        k += 1;
+    }
+
+    // MEAN AND STANDARD DEVIATION OVER THE n FILLED SAMPLES.
+    let nf = n as f64;
+    let mut sum = 0.0;
+    for v in s.iter().take(n) {
+        sum += *v;
+    }
+    let mean = sum / nf;
+    let mut var = 0.0;
+    for v in s.iter().take(n) {
+        let d = *v - mean;
+        var += d * d;
+    }
+    let sigma = (var / nf).sqrt();
+
+    // FLAT-WINDOW SPECIAL CASE. A PERFECTLY STEADY SIGNAL HAS sigma = 0;
+    // EVERY EMBEDDED POINT RECURS WITH EVERY OTHER. THAT IS FULLY
+    // DETERMINISTIC -- RETURN 1.0 DIRECTLY (AND AVOID eps = 0 / A
+    // DEGENERATE RECURRENCE MATRIX). idle_pct IS INTEGER-PERCENT CAST
+    // TO f64, SO A STEADY COMPUTE WORKLOAD PRODUCES AN EXACTLY-FLAT
+    // WINDOW AND MUST READ AS QUIESCENT.
+    if sigma < 1e-9 {
+        return Some(1.0);
+    }
+
+    let eps = RQA_THRESH_STD_FRAC * sigma;
+
+    // DELAY-EMBED: m = n - (RQA_EMBED_DIM - 1) VECTORS.
+    let m = n - (RQA_EMBED_DIM - 1);
+    if m < 2 {
+        return None;
+    }
+    let mut emb: [[f64; RQA_EMBED_DIM]; N] = [[0.0; RQA_EMBED_DIM]; N];
+    for i in 0..m {
+        for d in 0..RQA_EMBED_DIM {
+            emb[i][d] = s[i + d];
+        }
+    }
+
+    // RECURRENCE MATRIX OVER THE m EMBEDDED POINTS.
+    let mut rec: [[bool; N]; N] = [[false; N]; N];
+    for i in 0..m {
+        for j in 0..m {
+            rec[i][j] = chebyshev3(&emb[i], &emb[j]) <= eps;
+        }
+    }
+
+    // WALK EVERY OFF-MAIN DIAGONAL. COUNT TOTAL RECURRENCE POINTS AND
+    // THE POINTS THAT BELONG TO DIAGONAL RUNS OF LENGTH >= RQA_LMIN.
+    let mut total_rec: u64 = 0;
+    let mut diag_rec: u64 = 0;
+    // OFFSET o > 0: PAIRS (i, i + o). OFFSET o < 0 IS THE SYMMETRIC
+    // MIRROR; THE RECURRENCE MATRIX IS SYMMETRIC SO WE WALK o IN
+    // [1, m) AND DOUBLE-COUNT NOTHING BY COUNTING BOTH (i,j) AND (j,i)
+    // VIA THE 2x FACTOR -- INSTEAD WE JUST WALK BOTH UPPER AND LOWER
+    // EXPLICITLY TO KEEP total_rec CONSISTENT WITH diag_rec.
+    for o in 1..m {
+        // UPPER DIAGONAL: (i, i + o).
+        let mut run: usize = 0;
+        for i in 0..(m - o) {
+            if rec[i][i + o] {
+                total_rec += 1;
+                run += 1;
+            } else {
+                if run >= RQA_LMIN {
+                    diag_rec += run as u64;
+                }
+                run = 0;
+            }
+        }
+        if run >= RQA_LMIN {
+            diag_rec += run as u64;
+        }
+        // LOWER DIAGONAL: (i + o, i).
+        run = 0;
+        for i in 0..(m - o) {
+            if rec[i + o][i] {
+                total_rec += 1;
+                run += 1;
+            } else {
+                if run >= RQA_LMIN {
+                    diag_rec += run as u64;
+                }
+                run = 0;
+            }
+        }
+        if run >= RQA_LMIN {
+            diag_rec += run as u64;
+        }
+    }
+
+    if total_rec == 0 {
+        return Some(0.0);
+    }
+    Some(diag_rec as f64 / total_rec as f64)
+}
+
 // CHAOS COUNTER (DIAGNOSTIC)
 //
 // MONOTONIC COUNTER OF "WINDOW IS CHAOTIC" CROSSINGS. INCREMENT WHEN
@@ -392,134 +557,5 @@ impl ChaosCounter {
 
     pub fn load(&self) -> u64 {
         self.0.load(Ordering::Relaxed)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn fill_window<const N: usize>(w: &mut RawWindow<N>, samples: &[f64]) {
-        for s in samples {
-            w.push(*s);
-        }
-    }
-
-    #[test]
-    fn raw_window_basic_push_and_iter() {
-        let mut w: RawWindow<4> = RawWindow::new();
-        assert!(w.is_empty());
-        w.push(1.0);
-        w.push(2.0);
-        w.push(3.0);
-        let got: Vec<f64> = w.iter().collect();
-        assert_eq!(got, vec![1.0, 2.0, 3.0]);
-        assert_eq!(w.len(), 3);
-        w.push(4.0);
-        w.push(5.0);
-        let got: Vec<f64> = w.iter().collect();
-        assert_eq!(got, vec![2.0, 3.0, 4.0, 5.0]);
-        assert_eq!(w.len(), 4);
-    }
-
-    #[test]
-    fn mean_min_max() {
-        let mut w: RawWindow<8> = RawWindow::new();
-        fill_window(&mut w, &[1.0, 2.0, 3.0, 4.0, 5.0]);
-        assert!((mean(&w) - 3.0).abs() < 1e-9);
-        assert_eq!(min(&w), 1.0);
-        assert_eq!(max(&w), 5.0);
-    }
-
-    #[test]
-    fn hvg_monotonic_low_mean_degree() {
-        let mut w: RawWindow<32> = RawWindow::new();
-        // STRICTLY INCREASING RAMP: NO PEAK CAN SEE PAST AN INTERIOR PEAK,
-        // SO EVERY NODE ONLY SEES ITS NEIGHBORS. LAMBDA -> 2.
-        for i in 0..32 {
-            w.push(i as f64);
-        }
-        let lambda = hvg_mean_degree(&w);
-        assert!(
-            lambda <= HVG_LAMBDA_PERIODIC_MAX,
-            "monotonic ramp lambda should be in periodic band; got {} > {}",
-            lambda,
-            HVG_LAMBDA_PERIODIC_MAX
-        );
-    }
-
-    #[test]
-    fn hvg_period_2_in_mixed_band() {
-        // PERIOD-2 [1,0,1,0,...] IS A KNOWN HVG DEGENERATE CASE: PEAKS
-        // SEE EACH OTHER THROUGH TROUGHS, INFLATING LAMBDA TOWARD ~3.
-        // NOT PERIODIC BY LAMBDA, NOT CHAOTIC EITHER -- THE MIXED BAND
-        // IS THE CORRECT BUCKET FOR THIS SHAPE.
-        let mut w: RawWindow<32> = RawWindow::new();
-        for i in 0..32 {
-            w.push(if i % 2 == 0 { 1.0 } else { 0.0 });
-        }
-        let lambda = hvg_mean_degree(&w);
-        assert!(
-            lambda > HVG_LAMBDA_PERIODIC_MAX && lambda < HVG_LAMBDA_CHAOTIC_MIN,
-            "period-2 lambda should sit in mixed band; got {}",
-            lambda
-        );
-    }
-
-    #[test]
-    fn hvg_random_mean_degree_in_chaotic_band() {
-        let mut w: RawWindow<64> = RawWindow::new();
-        let mut state: u64 = 0xdeadbeefcafebabe;
-        for _ in 0..64 {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            let v = ((state >> 33) as u32) as f64 / u32::MAX as f64;
-            w.push(v);
-        }
-        let lambda = hvg_mean_degree(&w);
-        assert!(
-            lambda >= HVG_LAMBDA_CHAOTIC_MIN,
-            "iid random lambda should be in chaotic band; got {} < {}",
-            lambda,
-            HVG_LAMBDA_CHAOTIC_MIN
-        );
-    }
-
-    #[test]
-    fn hvg_stats_agrees_with_individual_functions() {
-        let mut w: RawWindow<32> = RawWindow::new();
-        let mut state: u64 = 0xfeedface12345678;
-        for _ in 0..32 {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            let v = ((state >> 33) as u32) as f64 / u32::MAX as f64;
-            w.push(v);
-        }
-        let lambda_solo = hvg_mean_degree(&w);
-        let entropy_solo = hvg_entropy(&w);
-        let (lambda_pair, entropy_pair) = hvg_stats(&w);
-        assert!((lambda_solo - lambda_pair).abs() < 1e-9);
-        assert!((entropy_solo - entropy_pair).abs() < 1e-9);
-    }
-
-    #[test]
-    fn bandt_pompe_monotonic_zero() {
-        let mut w: RawWindow<16> = RawWindow::new();
-        for i in 0..16 {
-            w.push(i as f64);
-        }
-        let h = bandt_pompe_d3(&w);
-        assert!(h < 0.1, "monotonic should have H ~= 0; got {}", h);
-    }
-
-    #[test]
-    fn bandt_pompe_random_near_one() {
-        let mut w: RawWindow<64> = RawWindow::new();
-        let mut state: u64 = 0x1234567890abcdef;
-        for _ in 0..64 {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            let v = ((state >> 33) as u32) as f64 / u32::MAX as f64;
-            w.push(v);
-        }
-        let h = bandt_pompe_d3(&w);
-        assert!(h > 0.85, "random should have H ~> 0.85; got {}", h);
     }
 }

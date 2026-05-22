@@ -71,8 +71,21 @@ pub fn monitor_loop(
     let mut light_ticks: u64 = 0;
     let mut mixed_ticks: u64 = 0;
     let mut heavy_ticks: u64 = 0;
+    // STABILITY SCORE IS A WEAK PRE-CHAOS STEADY-STATE PROXY. v5.11.0
+    // KEEPS IT FOR TELEMETRY GATING ONLY -- THE REAL STEADY-STATE GATE
+    // IS `quiesce.frozen` BELOW. DO NOT WIRE stability_score INTO THE
+    // FREEZE DECISION (TWO COMPETING "AM I STEADY" SIGNALS = A BUG).
     let mut stability_score: u32 = 0;
     let mut tick_counter: u64 = 0;
+
+    // QUIESCENCE GATE + ADAPTIVE-RARITY RETUNE STATE. The gate latches
+    // a "frozen" flag from HVG-lambda + RQA-DET + MWU convergence and
+    // the loop then skips the expensive MWU retune + knob write. When
+    // not frozen, the retune interval stretches on sub-threshold deltas.
+    let mut quiesce = tuning::QuiescenceState::new();
+    let mut retune_interval: u32 = tuning::RETUNE_INTERVAL_BASE;
+    let mut ticks_since_retune: u32 = 0;
+    let mut frozen_ticks: u64 = 0;
 
     let mut procdb = match ProcessDb::new() {
         Ok(db) => Some(db),
@@ -90,6 +103,10 @@ pub fn monitor_loop(
     rk.topology_tau_ns = tau_ns;
     rk.codel_eq_ns = live.codel_eq_ns;
     sched.write_tuning_knobs(&rk)?;
+    // COMMIT-ON-CHANGE BASELINE: the last knob set actually written to
+    // the BPF map. Updated here at init, on every regime-change write,
+    // and on every conditional write. MWU-owned fields drive the diff.
+    let mut last_written_knobs = rk;
 
     while !shutdown.load(Ordering::Relaxed) && !sched.exited() {
         crate::watchdog::LOOP_HEARTBEAT.fetch_add(1, Ordering::Relaxed);
@@ -243,15 +260,23 @@ pub fn monitor_loop(
         idle_win.push(idle_pct as f64);
         wake_win.push(delta_enq_wake as f64);
 
-        // CHAOS PRIMITIVES. ONE O(N^2) HVG PASS PER WINDOW; BP IS O(N).
+        // CHAOS PRIMITIVES. ONE O(N^2) HVG PASS + ONE O(N^2) RQA PASS
+        // PER WINDOW; BP IS O(N). RQA-DET RUNS ON THE SAME idle_win AS
+        // HVG SO THE QUIESCENCE GATE SEES IDENTICAL SAMPLES. rqa IS
+        // None UNTIL THE WINDOW HAS RQA_MIN_SAMPLES FILLED.
         let (idle_lambda, _idle_hvg_s) = chaos::hvg_stats(&idle_win);
         let wake_bp_h = chaos::bandt_pompe_d3(&wake_win);
         let bp_delta = wake_bp_h - prev_bp_h;
         let mean_idle = chaos::mean(&idle_win);
+        let rqa = chaos::rqa_det(&idle_win);
 
         // CHAOS CROSSING DIAGNOSTIC: BUMP COUNTER ON EITHER GATE FIRING.
+        // chaos_crossing IS ALSO REUSED BELOW AS THE ADAPTIVE-RARITY
+        // "disturbed" SIGNAL -- CAPTURE IT BEFORE prev_lambda_above IS
+        // OVERWRITTEN.
         let lambda_above = idle_lambda >= chaos::HVG_LAMBDA_CHAOTIC_MIN;
-        if (lambda_above && !prev_lambda_above) || bp_delta > 0.10 {
+        let chaos_crossing = (lambda_above && !prev_lambda_above) || bp_delta > 0.10;
+        if chaos_crossing {
             chaos_count.bump();
         }
         prev_lambda_above = lambda_above;
@@ -278,46 +303,98 @@ pub fn monitor_loop(
                 rk.topology_tau_ns = tau_ns;
                 rk.codel_eq_ns = live.codel_eq_ns;
                 sched.write_tuning_knobs(&rk)?;
+                last_written_knobs = rk;
                 regime_changed_this_tick = true;
                 mwu.set_baseline(rk);
-                mwu.reset();
+                // RESET ONLY THE NEW REGIME'S WEIGHT VECTOR + EDGE STATE
+                // (THE OTHER REGIMES KEEP THEIR LEARNED VECTORS), AND
+                // SNAP THE ADAPTIVE-RARITY INTERVAL BACK TO BASE.
+                mwu.reset_regime(regime);
+                retune_interval = tuning::RETUNE_INTERVAL_BASE;
+                ticks_since_retune = 0;
             }
         } else {
             pending_regime = regime;
             regime_hold = 0;
         }
 
+        // QUIESCENCE GATE. HVG-lambda in the periodic band + RQA-DET
+        // steady + the active-regime MWU vector converged -> latch
+        // `frozen` and skip the expensive MWU retune + knob write. The
+        // loop still ticks at 1 Hz; the chaos sensors above are the
+        // exit condition for frozen mode. A regime change moves lambda
+        // out of the steady band, so the gate thaws on the same/next
+        // tick -- the two gates compose without conflict.
+        let mwu_converged = mwu.converged(regime);
+        let frozen = quiesce.update(idle_lambda, rqa, mwu_converged);
+        if frozen {
+            frozen_ticks += 1;
+        }
+
         // MWU ORCHESTRATOR: UNIFIED KNOB CONTROL
-        // REPLACES: TIGHTEN/RELAX, SLEEP-INFORMED BATCH, SOJOURN EWMA, LONGRUN OVERRIDE
-        if !regime_changed_this_tick {
-            let signals = MwuSignals {
-                p99_ns,
-                interactive_p99_ns: tp99_i_ns,
-                io_pct,
-                rescue_count: delta_rescue,
-                // RAW total wakes/sec; the MWU fork-storm gate compares against
-                // a tau-derived total threshold (scale_tau_u64 * K_FORK_STORM_RATE).
-                // Per-CPU normalization here re-introduced an nr_cpus^2 effective
-                // threshold and latched on quiet 2-4C systems.
-                wakeup_rate: delta_enq_wake,
-                hvg_lambda: idle_lambda,
-                bp_h_delta: bp_delta,
-            };
-            // OSCILLATOR-AWARE GATING: READ THE BPF DAMPED-HARMONIC
-            // OSCILLATOR'S CURRENT STATE BEFORE MWU DECIDES. PATHWAYS
-            // 2 AND 4 (RESCUE-DRIVEN) DEFER WHEN THE OSCILLATOR HAS
-            // ALREADY MOVED. WITHOUT THIS, MWU AND THE OSCILLATOR
-            // INDEPENDENTLY ADAPT ON global_rescue_count AND THE TWO
-            // CONTROLLERS DOUBLE-CORRECT.
-            let osc_state = sched.read_oscillator_state();
-            let mut knobs = mwu.update(&signals, regime.p99_ceiling(), nr_cpus, tau_ns, &osc_state);
-            // PRESERVE TOPOLOGY-OWNED FIELDS (tau_ns, codel_eq_ns) -- MWU
-            // DOESN'T TOUCH THEM. WITHOUT THIS, THE ADAPTIVE LOOP'S 1HZ
-            // WRITES WOULD CLOBBER VALUES main.rs SET AT TOPOLOGY DETECT.
-            let live = sched.read_tuning_knobs();
-            knobs.topology_tau_ns = live.topology_tau_ns;
-            knobs.codel_eq_ns = live.codel_eq_ns;
-            sched.write_tuning_knobs(&knobs)?;
+        // GATED BY !regime_changed_this_tick (a fresh regime already
+        // wrote its baseline) AND !frozen (steady state -- stop the
+        // machinery). When neither gate is set, the adaptive-rarity
+        // counter throttles how often the retune actually fires.
+        if !regime_changed_this_tick && !frozen {
+            ticks_since_retune += 1;
+            if ticks_since_retune >= retune_interval {
+                ticks_since_retune = 0;
+                let signals = MwuSignals {
+                    p99_ns,
+                    interactive_p99_ns: tp99_i_ns,
+                    io_pct,
+                    rescue_count: delta_rescue,
+                    // RAW total wakes/sec; the MWU fork-storm gate compares against
+                    // a tau-derived total threshold (scale_tau_u64 * K_FORK_STORM_RATE).
+                    // Per-CPU normalization here re-introduced an nr_cpus^2 effective
+                    // threshold and latched on quiet 2-4C systems.
+                    wakeup_rate: delta_enq_wake,
+                    hvg_lambda: idle_lambda,
+                    bp_h_delta: bp_delta,
+                    // Same window HVG sees -- feeds compute_damp() for
+                    // the dynamic Butterworth blend. None on under-fill
+                    // is neutral (trust = 0.5).
+                    rqa_det: rqa,
+                };
+                // OSCILLATOR-AWARE GATING: READ THE BPF DAMPED-HARMONIC
+                // OSCILLATOR'S CURRENT STATE BEFORE MWU DECIDES. PATHWAYS
+                // 2 AND 4 (RESCUE-DRIVEN) DEFER WHEN THE OSCILLATOR HAS
+                // ALREADY MOVED. WITHOUT THIS, MWU AND THE OSCILLATOR
+                // INDEPENDENTLY ADAPT ON global_rescue_count AND THE TWO
+                // CONTROLLERS DOUBLE-CORRECT.
+                let osc_state = sched.read_oscillator_state();
+                let mut knobs = mwu.update(
+                    &signals,
+                    regime.p99_ceiling(),
+                    nr_cpus,
+                    tau_ns,
+                    &osc_state,
+                    regime,
+                );
+                // PRESERVE TOPOLOGY-OWNED FIELDS (tau_ns, codel_eq_ns) -- MWU
+                // DOESN'T TOUCH THEM. WITHOUT THIS, THE ADAPTIVE LOOP'S 1HZ
+                // WRITES WOULD CLOBBER VALUES main.rs SET AT TOPOLOGY DETECT.
+                let live = sched.read_tuning_knobs();
+                knobs.topology_tau_ns = live.topology_tau_ns;
+                knobs.codel_eq_ns = live.codel_eq_ns;
+                // COMMIT-ON-CHANGE: only push to the BPF map when an
+                // MWU-owned field actually moved. The BPF side reads the
+                // map unsynchronized -- skipping redundant writes strictly
+                // reduces torn-read exposure. The same diff drives the
+                // adaptive-rarity interval (sub-threshold = no change).
+                let changed = tuning::knobs_differ(&knobs, &last_written_knobs);
+                if changed {
+                    sched.write_tuning_knobs(&knobs)?;
+                    last_written_knobs = knobs;
+                }
+                let disturbed = mwu.had_losses() || chaos_crossing;
+                retune_interval = tuning::next_retune_interval(
+                    retune_interval,
+                    !changed,
+                    disturbed,
+                );
+            }
         }
 
         // STABILITY TRACKING
@@ -351,8 +428,10 @@ pub fn monitor_loop(
         let longrun_label = if stats.longrun_mode_active > 0 { " LONGRUN" } else { "" };
 
         if verbose && tuning::should_print_telemetry(tick_counter, stability_score) {
+            let rqa_disp = rqa.unwrap_or(-1.0);
+            let frozen_disp = if frozen { 1 } else { 0 };
             println!(
-                "d/s: {:<8} idle: {}% shared: {:<6} preempt: {:<4} keep: {:<4} kick: H={:<4} S={:<4} enq: W={:<4} R={:<4} wake: {}us p99: {}us [B:{} I:{} L:{}] lat_idle: {}us lat_kick: {}us procdb: {}/{} sleep: io={}% slice: {}us batch: {}us reenq: {} sjrn: {}ms/{}ms rescue: {} l2: B={}% I={}% L={}% chaos: lam={:.2} H={:.2} x={} [{}{}]",
+                "d/s: {:<8} idle: {}% shared: {:<6} preempt: {:<4} keep: {:<4} kick: H={:<4} S={:<4} enq: W={:<4} R={:<4} wake: {}us p99: {}us [B:{} I:{} L:{}] lat_idle: {}us lat_kick: {}us procdb: {}/{} sleep: io={}% slice: {}us batch: {}us reenq: {} sjrn: {}ms/{}ms rescue: {} l2: B={}% I={}% L={}% chaos: lam={:.2} H={:.2} det={:.2} x={} frozen: {} (n={}) retune_iv: {} [{}{}]",
                 delta_d, idle_pct, delta_shared, delta_preempt, delta_keep,
                 delta_hard, delta_soft, delta_enq_wake, delta_enq_requeue,
                 wake_avg_us, p99_us, tp99_b, tp99_i, tp99_l,
@@ -362,7 +441,8 @@ pub fn monitor_loop(
                 delta_reenq, sojourn_ms, sojourn_thresh_ms,
                 delta_rescue,
                 l2_pct_b, l2_pct_i, l2_pct_l,
-                idle_lambda, wake_bp_h, chaos_count.load(),
+                idle_lambda, wake_bp_h, rqa_disp, chaos_count.load(),
+                frozen_disp, frozen_ticks, retune_interval,
                 regime.label(), longrun_label,
             );
         }
@@ -432,11 +512,11 @@ pub fn monitor_loop(
         0
     };
     println!(
-        "[KNOBS] regime={} slice_ns={} batch_ns={} preempt_ns={} lag={} mwu={:.3} ticks=L:{}/M:{}/H:{} l2_hit=B:{}%/I:{}%/L:{}%",
+        "[KNOBS] regime={} slice_ns={} batch_ns={} preempt_ns={} mwu={:.3} ticks=L:{}/M:{}/H:{} frozen={} l2_hit=B:{}%/I:{}%/L:{}%",
         regime.label(), final_knobs.slice_ns, final_knobs.batch_slice_ns,
         final_knobs.preempt_thresh_ns,
-        final_knobs.lag_scale, mwu.scale(),
-        light_ticks, mixed_ticks, heavy_ticks,
+        mwu.scale(regime),
+        light_ticks, mixed_ticks, heavy_ticks, frozen_ticks,
         l2_cum_b, l2_cum_i, l2_cum_l,
     );
 

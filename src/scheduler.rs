@@ -53,7 +53,7 @@ pub struct PandemoniumStats {
 
 // COMPILE-TIME ABI SAFETY: MUST MATCH STRUCT LAYOUTS IN intf.h
 const _: () = assert!(std::mem::size_of::<PandemoniumStats>() == 200);
-const _: () = assert!(std::mem::size_of::<TuningKnobs>() == 88);
+const _: () = assert!(std::mem::size_of::<TuningKnobs>() == 80);
 
 // MAX_AFFINITY_CANDIDATES IS DEFINED IN intf.h. THE RUST MIRROR IN
 // bpf_intf.rs MUST KEEP THE SAME VALUE; IF THE TWO SIDES DRIFT, THE
