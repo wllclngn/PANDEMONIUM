@@ -16,6 +16,7 @@ import re
 import resource
 import shutil
 import signal
+import statistics
 import subprocess
 import sys
 import time
@@ -332,10 +333,26 @@ def trace_capture(sched_name, cmd, stamp, duration):
     return montauk_log
 
 
+def _restore_ownership(paths):
+    # We self-elevated to root, so anything montauk wrote lands root-owned.
+    # Hand the recordings (the trace dir + its .stdout) back to the invoking
+    # user so they're viewable without sudo. No-op when not running under sudo.
+    user = os.environ.get("SUDO_USER")
+    if not user or os.geteuid() != 0:
+        return
+    for p in paths:
+        for target in (Path(p), Path(f"{p}.stdout")):
+            if target.exists():
+                subprocess.run(["chown", "-R", f"{user}:", str(target)],
+                               capture_output=True)
+
+
 def run_trace(args):
     if os.geteuid() != 0:
-        log_error("--trace needs root (montauk eBPF + sched_ext). Re-run with sudo.")
-        return 1
+        # SELF-ELEVATE: the trace flow needs root end-to-end (montauk eBPF attach
+        # + sched_ext load), so re-exec under sudo rather than make the user type
+        # it -- matches how every other command elevates its own privileged steps.
+        os.execvp("sudo", ["sudo", sys.executable, *sys.argv])
     if not Path(MONTAUK).exists():
         log_error(f"montauk not found at {MONTAUK}")
         return 1
@@ -369,6 +386,7 @@ def run_trace(args):
     finally:
         if is_scx_active():
             wait_for_deactivation(5.0)
+        _restore_ownership(recs.values())
 
     print()
     log_info("Recordings (inspect montauk_trace_thread_* over montauk_scrape_timestamp_ms):")
@@ -390,7 +408,25 @@ def main():
     ap.add_argument("--duration", type=float, default=0,
                     help="With --trace: capture window seconds (0 = bench to "
                          "completion, hard-capped at 180s)")
+    ap.add_argument("--iterations", type=int, default=1,
+                    help="Run each scheduler N times and report the MEDIAN "
+                         "(robust to a poisoned outlier run). Default 1.")
+    ap.add_argument("--all-scx", action="store_true",
+                    help="Also run the full installed scx scheduler field "
+                         "(scx_bpfland, scx_rusty, scx_lavd, scx_flow, "
+                         "scx_rustland, scx_p2dq, scx_tickless, scx_cosmos, "
+                         "scx_cake, scx_flash, scx_beerland, scx_layered). "
+                         "Default: EEVDF + PANDEMONIUM (BPF + ADAPTIVE) only.")
+    ap.add_argument("--phi-sweep", type=str, nargs="?", const="0", default=None,
+                    metavar="VALUES",
+                    help="Phi A/B: instead of the full scx field, run PANDEMONIUM "
+                         "(BPF mode) across phi_dist_scale_q16 values (comma list; "
+                         "0 = Phi off) plus the topology default and EEVDF. Bare "
+                         "--phi-sweep tests {0, default}. Isolates Phi's marginal "
+                         "effect on this CPU's CCX layout.")
     args = ap.parse_args()
+    if args.iterations < 1:
+        args.iterations = 1
 
     global NR_LOOPS
     NR_LOOPS = NR_LOOPS_QUICK if args.quick else NR_LOOPS_FULL
@@ -426,23 +462,44 @@ def main():
             return 1
     time.sleep(1)
 
-    entries = [
-        ("EEVDF", None),
-        ("PANDEMONIUM (BPF)", [str(BINARY), "--no-adaptive"]),
-        ("PANDEMONIUM (ADAPTIVE)", [str(BINARY)]),
-    ]
-
-    bpfland = find_scheduler("scx_bpfland")
-    if bpfland:
-        entries.append(("scx_bpfland", ["scx_bpfland"]))
+    if args.phi_sweep is not None:
+        # PHI A/B: hold everything constant, vary only phi_dist_scale_q16 via the
+        # scheduler's --phi-scale override. BPF mode (matches the established BPF
+        # anchor; no adaptive loop to perturb). EEVDF for the VS-EEVDF column, the
+        # topology default (no override), then one run per requested value (0 = off).
+        vals = [v.strip() for v in args.phi_sweep.split(",") if v.strip() != ""]
+        entries = [
+            ("EEVDF", None),
+            ("PANDEMONIUM (phi=default)", [str(BINARY), "--no-adaptive"]),
+        ]
+        for v in vals:
+            entries.append(
+                (f"PANDEMONIUM (phi={v})", [str(BINARY), "--no-adaptive", "--phi-scale", v])
+            )
+        log_info(f"PHI SWEEP: topology default + values {vals} (BPF mode)")
     else:
-        log_warn("scx_bpfland not found, skipping")
+        entries = [
+            ("EEVDF", None),
+            ("PANDEMONIUM (BPF)", [str(BINARY), "--no-adaptive"]),
+            ("PANDEMONIUM (ADAPTIVE)", [str(BINARY)]),
+        ]
 
-    flow = find_scheduler("scx_flow")
-    if flow:
-        entries.append(("scx_flow", ["scx_flow"]))
-    else:
-        log_warn("scx_flow not found, skipping")
+        # FULL FIELD: every installed production scx scheduler in the ring against
+        # EEVDF and PANDEMONIUM. Gated behind --all-scx (opt-in) to keep the default
+        # run fast -- the EEVDF + PANDEMONIUM (BPF + ADAPTIVE) trio is what we iterate
+        # on most. scx_chaos is excluded (fault-injection test scheduler, not a
+        # contender). scx_layered needs a layer spec and may self-skip without one.
+        if args.all_scx:
+            scx_field = [
+                "scx_bpfland", "scx_rusty", "scx_lavd", "scx_flow", "scx_rustland",
+                "scx_p2dq", "scx_tickless", "scx_cosmos", "scx_cake", "scx_flash",
+                "scx_beerland", "scx_layered",
+            ]
+            for s in scx_field:
+                if find_scheduler(s):
+                    entries.append((s, [s]))
+                else:
+                    log_warn(f"{s} not found, skipping")
 
     all_results = {}
 
@@ -458,19 +515,42 @@ def main():
                     all_results[sched_name] = (None, None)
                     continue
 
-            log_info(f"[{sched_name}] running perf stat + bench...")
-            elapsed, counters = run_perf_bench()
+            log_info(f"[{sched_name}] running perf stat + bench (x{args.iterations})...")
+            samples = []
+            for it in range(args.iterations):
+                el, ct = run_perf_bench()
+                if el is not None:
+                    samples.append((el, ct))
+                    msg = f"[{sched_name}] iter {it + 1}/{args.iterations}: {el:.3f}s"
+                    if ct and ct.get("cache-misses"):
+                        msg += f"  cache-misses={_fmt_count(ct['cache-misses'])}"
+                    log_info(msg)
+                else:
+                    log_error(f"[{sched_name}] iter {it + 1}/{args.iterations} perf bench failed")
 
-            if elapsed is not None:
-                log_info(f"[{sched_name}] {elapsed:.3f}s")
-                if counters:
-                    cyc = counters.get("cycles", 0)
-                    ins = counters.get("instructions", 0)
-                    cmiss = counters.get("cache-misses", 0)
-                    ipc = ins / cyc if cyc > 0 else 0
-                    log_info(f"  cycles={_fmt_count(cyc)}  IPC={ipc:.3f}  cache-misses={_fmt_count(cmiss)}")
+            if samples:
+                # MEDIAN across iterations -- robust to a single poisoned run.
+                # sched_ext state poisoning can blow one iteration up ~100x; the
+                # median ignores that outlier where a mean would be wrecked by it.
+                elapsed = statistics.median([s[0] for s in samples])
+                counters = {}
+                keys = set()
+                for _, ct in samples:
+                    if ct:
+                        keys.update(ct.keys())
+                for k in keys:
+                    vals = [ct[k] for _, ct in samples if ct and k in ct]
+                    if vals:
+                        counters[k] = statistics.median(vals)
+                cyc = counters.get("cycles", 0)
+                ins = counters.get("instructions", 0)
+                ipc = ins / cyc if cyc > 0 else 0
+                log_info(f"[{sched_name}] MEDIAN {elapsed:.3f}s  IPC={ipc:.3f}  "
+                         f"cache-misses={_fmt_count(counters.get('cache-misses', 0))}  "
+                         f"(n={len(samples)}/{args.iterations})")
             else:
-                log_error(f"[{sched_name}] perf bench failed")
+                elapsed, counters = None, None
+                log_error(f"[{sched_name}] all {args.iterations} iterations failed")
 
             all_results[sched_name] = (elapsed, counters)
 

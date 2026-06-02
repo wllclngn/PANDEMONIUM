@@ -103,6 +103,13 @@ pub fn monitor_loop(
     rk.topology_tau_ns = tau_ns;
     rk.codel_eq_ns = live.codel_eq_ns;
     sched.write_tuning_knobs(&rk)?;
+    // SEED THE MWU BASELINE WITH THE LIVE PHI EQUILIBRIUM AT TICK 0. new()
+    // BUILT mwu FROM scaled_regime_knobs (codel_eq_ns=0); set_baseline IS
+    // OTHERWISE ONLY CALLED ON A REGIME CHANGE. WITHOUT THIS SEED THE SOJOURN
+    // FLOOR (tuning.rs) FALLS BACK TO THE DEAD 4ms CONSTANT FOR ANY RUN WHOSE
+    // REGIME NEVER CHANGES (E.G. A STEADY MIXED BENCH), SO THE PHI-COHERENT
+    // FLOOR WOULD NEVER ENGAGE.
+    mwu.set_baseline(rk);
     // COMMIT-ON-CHANGE BASELINE: the last knob set actually written to
     // the BPF map. Updated here at init, on every regime-change write,
     // and on every conditional write. MWU-owned fields drive the diff.
@@ -160,6 +167,15 @@ pub fn monitor_loop(
         let delta_enq_wake = stats.nr_enq_wakeup.wrapping_sub(prev.nr_enq_wakeup);
         let delta_enq_requeue = stats.nr_enq_requeue.wrapping_sub(prev.nr_enq_requeue);
         let delta_rescue = stats.nr_overflow_rescue.wrapping_sub(prev.nr_overflow_rescue);
+        // CROSS-CCX SCATTER (PATHWAY 6 INPUT). PLACEMENT-SIDE PATHS ONLY:
+        // XCCX_SEL_* + XCCX_ENQ_T1/T2 (INDICES 0..6). THE PHI-CORRECT WORK-
+        // CONSERVATION PATHS XCCX_STEAL (6) AND XCCX_STEP5 (7) ARE EXCLUDED --
+        // PENALIZING THEM WOULD MAKE MWU FIGHT THE BPF'S DELIBERATE REBALANCING.
+        // saturating_sub ABSORBS A COUNTER RESET (BPF RELOAD) AS 0, NO GARBAGE.
+        let scatter_now: u64 = stats.nr_xccx[0..6].iter().sum();
+        let scatter_prev: u64 = prev.nr_xccx[0..6].iter().sum();
+        let delta_scatter = scatter_now.saturating_sub(scatter_prev);
+        let scatter_pct = if delta_d > 0 { delta_scatter * 100 / delta_d } else { 0 };
         let wake_avg_us = if delta_wake_samples > 0 {
             delta_wake_sum / delta_wake_samples / 1000
         } else {
@@ -350,6 +366,7 @@ pub fn monitor_loop(
                     // Per-CPU normalization here re-introduced an nr_cpus^2 effective
                     // threshold and latched on quiet 2-4C systems.
                     wakeup_rate: delta_enq_wake,
+                    scatter_pct,
                     hvg_lambda: idle_lambda,
                     bp_h_delta: bp_delta,
                     // Same window HVG sees -- feeds compute_damp() for
@@ -511,13 +528,24 @@ pub fn monitor_loop(
     } else {
         0
     };
+    // CROSS-CCX SCATTER ATTRIBUTION (PER XCCX_* PATH). scatter_pct IS THE
+    // PLACEMENT-SIDE FRACTION (idx 0..6) PATHWAY 6 ACTS ON; THE PER-PATH COUNTS
+    // ARE THE PERMANENT ATTRIBUTION SURFACED TO THE BENCH SUITE EVERY RUN.
+    let x = &final_stats.nr_xccx;
+    let x_scatter: u64 = x[0..6].iter().sum();
+    let x_scatter_pct = if final_stats.nr_dispatches > 0 {
+        x_scatter * 100 / final_stats.nr_dispatches
+    } else {
+        0
+    };
     println!(
-        "[KNOBS] regime={} slice_ns={} batch_ns={} preempt_ns={} mwu={:.3} ticks=L:{}/M:{}/H:{} frozen={} l2_hit=B:{}%/I:{}%/L:{}%",
+        "[KNOBS] regime={} slice_ns={} batch_ns={} preempt_ns={} mwu={:.3} ticks=L:{}/M:{}/H:{} frozen={} l2_hit=B:{}%/I:{}%/L:{}% xccx_scatter_pct={} xccx_sel_tight={} xccx_sel_sync={} xccx_sel_normal={} xccx_sel_dfl={} xccx_enq_t1={} xccx_enq_t2={} xccx_steal={} xccx_step5={}",
         regime.label(), final_knobs.slice_ns, final_knobs.batch_slice_ns,
         final_knobs.preempt_thresh_ns,
         mwu.scale(regime),
         light_ticks, mixed_ticks, heavy_ticks, frozen_ticks,
         l2_cum_b, l2_cum_i, l2_cum_l,
+        x_scatter_pct, x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7],
     );
 
     // READ UEI EXIT REASON

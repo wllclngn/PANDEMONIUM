@@ -49,6 +49,10 @@ pub struct TopologySpectrum {
     pub fiedler: f64,            // lambda_2
     pub tau_ns: u64,             // clamped TAU_SCALE_NS / lambda_2
     pub codel_eq_ns: u64,        // <R_eff> * 2m * tau, clamped
+    // Phi migration-potential distance->wait scale (Q16). The extra head-wait a
+    // steal must clear before crossing to a peer = (reff * this) >> 16 ns. 0 on a
+    // monolithic / single-CCX part (Phi off -> flat codel_target, exact no-op).
+    pub phi_dist_scale_q16: u64,
 }
 
 fn extract_fiedler(eigenvalues: &[f64]) -> f64 {
@@ -116,6 +120,8 @@ pub struct CpuTopology {
     pub l2_domain: Vec<u32>,      // l2_domain[cpu] = group_id
     pub l2_groups: Vec<Vec<u32>>, // l2_groups[group_id] = [cpu, ...]
     pub socket_domain: Vec<u32>,  // socket_domain[cpu] = socket_id
+    pub llc_domain: Vec<u32>,     // llc_domain[cpu] = L3/CCX GROUP (== socket WHEN MONOLITHIC)
+    pub ccx_active: bool,         // TRUE WHEN A SOCKET HOLDS >1 L3/CCX (AMD CHIPLET): ENABLES SAME-CCX RUNG
     pub nr_sockets: u32,
 }
 
@@ -175,20 +181,68 @@ impl CpuTopology {
 
         let nr_sockets = seen_sockets.len() as u32;
 
+        // DETECT L3 / CCX / CCD DOMAIN (index3). ON AMD CHIPLET PARTS index3
+        // SUBDIVIDES THE SOCKET INTO CCX/CCD GROUPS; ON MONOLITHIC-L3 PARTS IT
+        // SPANS THE WHOLE SOCKET. USE THE TIER ONLY WHEN IT GENUINELY
+        // SUBDIVIDES A SOCKET (MORE L3 GROUPS THAN SOCKETS) AND index3 WAS
+        // PRESENT FOR EVERY CPU; OTHERWISE llc_domain == socket_domain SO THE
+        // CROSS-CCX RUNG IN build_laplacian NEVER FIRES (EXACT NO-OP).
+        let mut llc_domain = vec![0u32; nr_cpus];
+        let mut seen_llc: Vec<Vec<u32>> = Vec::new();
+        let mut llc_ok = true;
+        for cpu in 0..nr_cpus {
+            let path = format!(
+                "/sys/devices/system/cpu/cpu{}/cache/index3/shared_cpu_list",
+                cpu
+            );
+            let content = match std::fs::read_to_string(&path) {
+                Ok(s) => s,
+                Err(_) => {
+                    llc_ok = false;
+                    break;
+                }
+            };
+            let members = parse_cpu_list(content.trim());
+            let group_id = match seen_llc.iter().position(|g| *g == members) {
+                Some(id) => id as u32,
+                None => {
+                    let id = seen_llc.len() as u32;
+                    seen_llc.push(members);
+                    id
+                }
+            };
+            llc_domain[cpu] = group_id;
+        }
+        let llc_subdivides = llc_ok && seen_llc.len() > nr_sockets as usize;
+        if !llc_subdivides {
+            llc_domain = socket_domain.clone();
+        }
+
         Ok(Self {
             nr_cpus,
             l2_domain,
             l2_groups: seen_groups,
             socket_domain,
+            llc_domain,
+            ccx_active: llc_subdivides,
             nr_sockets,
         })
     }
 
     // WRITE L2 DOMAIN MAP TO BPF ARRAY VIA SCHEDULER
-    pub fn populate_bpf_map(&self, sched: &Scheduler) -> Result<()> {
+    pub fn populate_bpf_map(&self, sched: &mut Scheduler) -> Result<()> {
         for cpu in 0..self.nr_cpus {
             sched.write_cache_domain(cpu as u32, self.l2_domain[cpu])?;
+            sched.write_llc_domain(cpu as u32, self.llc_domain[cpu])?;
         }
+        // nr_ccx = number of distinct llc_domain values
+        let mut seen: Vec<u32> = Vec::new();
+        for &g in &self.llc_domain {
+            if !seen.contains(&g) {
+                seen.push(g);
+            }
+        }
+        sched.write_nr_ccx(seen.len() as u32);
         Ok(())
     }
 
@@ -215,9 +269,14 @@ impl CpuTopology {
     //   R_eff(i,j) = L+[i,i] + L+[j,j] - 2*L+[i,j]
     //
     // EDGE CONDUCTANCES (INVERSE RESISTANCE):
-    //   L2 SIBLINGS:     10.0  (SHARED CACHE, NEAR-ZERO MIGRATION COST)
-    //   SAME SOCKET:      1.0  (SHARED LLC, MODERATE COST)
-    //   CROSS-SOCKET:     0.3  (NUMA HOP, HIGH COST)
+    //   L2 SIBLINGS:      10.0  (SHARED L2, NEAR-ZERO MIGRATION COST)
+    //   SAME L3 / CCX:     3.0  (SHARED LLC; ONLY WHEN A SOCKET HOLDS >1 CCX)
+    //   CROSS-CCX SOCKET:  1.0  (INFINITY-FABRIC HOP, ~8x CORE-TO-CORE LATENCY)
+    //   CROSS-SOCKET:      0.3  (NUMA HOP, HIGH COST)
+    // RAISING THE SAME-CCX RUNG (NOT LOWERING THE CROSS-CCX CUT) RANKS
+    // SAME-CCX PEERS AHEAD OF CROSS-CCX ONES WITHOUT MOVING lambda_2: THE
+    // CROSS-CCX CUT STAYS 1.0, SO tau AND codel_eq ARE UNCHANGED. THE RUNG
+    // IS GATED ON ccx_active SO MONOLITHIC-L3 PARTS ARE AN EXACT NO-OP.
     //
     // THE LAPLACIAN L = D - W WHERE D IS DEGREE MATRIX, W IS WEIGHTED ADJACENCY.
     // L+ (MOORE-PENROSE PSEUDOINVERSE) COMPUTED VIA EIGENDECOMPOSITION:
@@ -228,9 +287,16 @@ impl CpuTopology {
     // REFERENCE: Christiano-Kelner-Madry-Spielman-Teng (STOC 2011),
     //            Chen-Kyng-Liu-Peng-Gutenberg-Sachdeva (FOCS 2022)
 
-    const CONDUCTANCE_L2: f64 = 10.0;
-    const CONDUCTANCE_SOCKET: f64 = 1.0;
-    const CONDUCTANCE_CROSS: f64 = 0.3;
+    // Phi FIX A: SMT siblings SHARE L2, so a move between them costs ~0 cache.
+    // Make the edge very stiff -> R_eff(SMT-sib) ~ 0, which lands the Phi migration
+    // barrier exactly at the physical-core / L2 boundary (a real cold-L2 refill)
+    // instead of penalizing free intra-core moves. lambda_2 is the cross-CCX Fiedler
+    // cut (independent of L2 stiffness) so tau is unchanged, and codel_eq is already
+    // clamped at its ceiling, so the oscillator timescales are invariant.
+    const CONDUCTANCE_L2: f64 = 1000.0;   // L2 / SMT SIBLINGS
+    const CONDUCTANCE_LLC: f64 = 3.0;     // SAME L3 / CCX (ABOVE SOCKET; ONLY WHEN ccx_active)
+    const CONDUCTANCE_SOCKET: f64 = 1.0;  // SAME SOCKET, CROSS-CCX (IF HOP) -- OR MONOLITHIC SAME-SOCKET
+    const CONDUCTANCE_CROSS: f64 = 0.3;   // CROSS-SOCKET NUMA HOP
 
     // BUILD WEIGHTED GRAPH LAPLACIAN FROM CPU TOPOLOGY
     fn build_laplacian(&self) -> Vec<f64> {
@@ -240,6 +306,8 @@ impl CpuTopology {
             for j in (i + 1)..n {
                 let w = if self.l2_domain[i] == self.l2_domain[j] {
                     Self::CONDUCTANCE_L2
+                } else if self.ccx_active && self.llc_domain[i] == self.llc_domain[j] {
+                    Self::CONDUCTANCE_LLC
                 } else if self.socket_domain[i] == self.socket_domain[j] {
                     Self::CONDUCTANCE_SOCKET
                 } else {
@@ -398,7 +466,18 @@ impl CpuTopology {
         let reff = Self::extract_reff(&l_pinv, n);
         let rank = Self::build_affinity_rank(&reff, n);
         let codel_eq_ns = compute_codel_eq_ns(&eigenvalues, n, tau_ns);
-        (reff, rank, TopologySpectrum { fiedler, tau_ns, codel_eq_ns })
+        // Phi FIX B: distance scale calibrated so the most distant pair (max R_eff)
+        // maps to ~tau of required steal-wait, an SMT sibling (R_eff ~ 0) to ~0. Only
+        // sustained backlog (~tau) justifies a cross-CCX move; a single queued slice
+        // does not. reff_norm uses the same 1e6 scale the BPF reff_value map stores.
+        let max_reff = reff.iter().cloned().fold(0.0f64, f64::max);
+        let reff_norm = ((max_reff * 1_000_000.0).round() as u64).max(1);
+        let phi_dist_scale_q16 = if self.ccx_active {
+            tau_ns.saturating_mul(65536) / reff_norm
+        } else {
+            0
+        };
+        (reff, rank, TopologySpectrum { fiedler, tau_ns, codel_eq_ns, phi_dist_scale_q16 })
     }
 
     // WRITE AFFINITY RANK TO BPF MAP
@@ -412,7 +491,9 @@ impl CpuTopology {
     pub fn populate_affinity_rank_map(
         &self,
         sched: &Scheduler,
+        reff: &[f64],
         rank: &[u32],
+        phi_dist_scale_q16: u64,
     ) -> Result<()> {
         let stride = crate::bpf_intf::MAX_AFFINITY_CANDIDATES as usize;
         let valid = self.nr_cpus.saturating_sub(1).min(stride);
@@ -420,9 +501,22 @@ impl CpuTopology {
             for slot in 0..valid {
                 let val = rank[cpu * self.nr_cpus + slot];
                 sched.write_affinity_rank(cpu as u32, slot as u32, val)?;
+                // FOLD THE PHI DISTANCE PENALTY AT INIT: reff_value stores the
+                // final steal extra-wait in ns, (R_eff * phi_dist_scale_q16) >> 16,
+                // so the BPF steal does one indexed read and no multiply. The 1e6
+                // scale matches build_affinity_rank's sort key. phi_dist_scale_q16
+                // is 0 on monolithic / --phi-scale 0 -> every penalty 0 -> flat
+                // codel_target (exact prior behavior).
+                let r_scaled = (reff[cpu * self.nr_cpus + val as usize] * 1_000_000.0)
+                    .round()
+                    .clamp(0.0, u32::MAX as f64) as u64;
+                let dist_extra = (r_scaled.saturating_mul(phi_dist_scale_q16) >> 16)
+                    .min(u32::MAX as u64) as u32;
+                sched.write_reff_value(cpu as u32, slot as u32, dist_extra)?;
             }
             for slot in valid..stride {
                 sched.write_affinity_rank(cpu as u32, slot as u32, u32::MAX)?;
+                sched.write_reff_value(cpu as u32, slot as u32, u32::MAX)?;
             }
         }
         Ok(())
@@ -474,6 +568,14 @@ impl CpuTopology {
             self.l2_groups.len(),
             self.nr_cpus,
             self.nr_sockets
+        );
+        let mut llc = self.llc_domain.clone();
+        llc.sort_unstable();
+        llc.dedup();
+        log_info!(
+            "LLC DOMAINS: {} (SAME-CCX RUNG {})",
+            llc.len(),
+            if self.ccx_active { "ACTIVE" } else { "INACTIVE -- MONOLITHIC L3" }
         );
     }
 }

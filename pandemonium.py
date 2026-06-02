@@ -7,10 +7,10 @@ Usage:
     ./pandemonium.py bench-pcpu        Per-CPU DSQ visibility stress test (v5.4.8)
     ./pandemonium.py bench-contention  Contention stress test for v5.4.x features
     ./pandemonium.py bench-scx         scx CI compatibility test
-    ./pandemonium.py bench-fork-thread  Fork/thread IPC benchmark + hardware counter profiling
+    ./pandemonium.py bench-fork-thread  Fork/thread IPC benchmark + hw counters + non-compensatory regression gate
     ./pandemonium.py bench-trace       BPF trace capture for external workloads (Ctrl+C to stop)
     ./pandemonium.py bench-power       Energy-efficiency benchmark (RAPL J/op + idle floor + C-state)
-    ./pandemonium.py bench-piotr-gorski  Phoronix-style application suite (12 workloads, scheduler matrix)
+    ./pandemonium.py bench-cachyos     CachyOS Mini-Benchmarker suite (12 workloads, scheduler matrix)
     ./pandemonium.py bench-sys         Live system telemetry capture (Ctrl+C to stop)
     ./pandemonium.py install      Build + install + activate systemd service
     ./pandemonium.py clean        Wipe build artifacts
@@ -244,9 +244,9 @@ def main() -> int:
             + sys.argv[2:],
             cwd=SCRIPT_DIR,
         ).returncode
-    elif cmd == "bench-piotr-gorski":
+    elif cmd == "bench-cachyos":
         return subprocess.run(
-            [sys.executable, str(SCRIPT_DIR / "tests" / "bench-piotr-gorski.py")]
+            [sys.executable, str(SCRIPT_DIR / "tests" / "bench-cachyos.py")]
             + sys.argv[2:],
             cwd=SCRIPT_DIR,
         ).returncode

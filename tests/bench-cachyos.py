@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-PANDEMONIUM bench-piotr: Piotr Gorski-style application benchmark suite.
+PANDEMONIUM bench-cachyos: CachyOS Mini-Benchmarker-style application suite.
 
-Models the Mini-Benchmarker workload set used by Piotr Gorski / CachyOS
-for cross-kernel scheduler comparisons. Each workload runs N iterations
-under each scheduler, captures wall-clock time, and reports mean +
-stddev alongside per-row winners.
+Models the Mini-Benchmarker workload set the CachyOS project uses for
+cross-kernel scheduler comparisons. Each workload runs N iterations under
+each scheduler, captures wall-clock time, and reports mean + stddev
+alongside per-row winners.
 
 Workloads (12 total, 8 runnable from standard packages, 4 require manual
 asset setup):
@@ -23,11 +23,12 @@ asset setup):
     kernel-defconfig          requires kernel source clone (skip)
 
 Usage:
-    ./tests/bench-piotr-gorski.py
-    ./tests/bench-piotr-gorski.py --runs 5
-    ./tests/bench-piotr-gorski.py --workloads xz-compression,primes
-    ./tests/bench-piotr-gorski.py --schedulers scx_cake
-    ./tests/bench-piotr-gorski.py --pandemonium-only
+    ./tests/bench-cachyos.py
+    ./tests/bench-cachyos.py --runs 5
+    ./tests/bench-cachyos.py --workloads xz-compression,primes
+    ./tests/bench-cachyos.py --schedulers scx_cake
+    ./tests/bench-cachyos.py --all-scx
+    ./tests/bench-cachyos.py --pandemonium-only
 
 Prompts for sudo on entry; credentials are cached for the run and
 refreshed between schedulers.
@@ -76,7 +77,7 @@ def _refresh_sudo() -> None:
 
 # ASSET DIRECTORY. PERSISTENT TEST CORPUS, GENERATED FFMPEG CLONE,
 # AND GENERATED XZ INPUT FILE LIVE HERE BETWEEN INVOCATIONS.
-ASSET_DIR = LOG_DIR / "bench-piotr-assets"
+ASSET_DIR = LOG_DIR / "bench-cachyos-assets"
 XZ_CORPUS = ASSET_DIR / "xz-corpus.bin"
 FFMPEG_SRC = ASSET_DIR / "ffmpeg-src"
 X265_OUTPUT = ASSET_DIR / "x265-output.hevc"
@@ -413,7 +414,7 @@ def write_report(ver: str, git: dict, stamp: str, ncpus: int,
                  results: dict, runs: int, wl_order: list[str]) -> Path:
     """Aligned-column text report. No box-drawing, no separators."""
     lines = [
-        "PANDEMONIUM BENCH-PIOTR",
+        "PANDEMONIUM BENCH-CACHYOS",
         f"VERSION:     {ver}",
         f"COMMIT:      {git['commit']}{' (dirty)' if git['dirty'] else ''}",
         f"TIMESTAMP:   {stamp}",
@@ -477,7 +478,7 @@ def write_report(ver: str, git: dict, stamp: str, ncpus: int,
         lines.append("* MARKS WINNER (LOWEST MEAN) PER ROW")
     text = "\n".join(lines) + "\n"
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    path = LOG_DIR / f"bench-piotr-{stamp}.log"
+    path = LOG_DIR / f"bench-cachyos-{stamp}.log"
     path.write_text(text)
     return path
 
@@ -486,10 +487,10 @@ def write_prometheus(ver: str, git: dict, stamp: str, ncpus: int,
                      results: dict, wl_order: list[str]) -> Path:
     """Prometheus textfile-collector style emission."""
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    path = LOG_DIR / f"bench-piotr-{stamp}.prom"
+    path = LOG_DIR / f"bench-cachyos-{stamp}.prom"
     lines = [
-        "# HELP pandemonium_bench_piotr_seconds Wall-clock seconds per Piotr-suite workload",
-        "# TYPE pandemonium_bench_piotr_seconds gauge",
+        "# HELP pandemonium_bench_cachyos_seconds Wall-clock seconds per CachyOS-suite workload",
+        "# TYPE pandemonium_bench_cachyos_seconds gauge",
     ]
     for sched, by_wl in results.items():
         for wl_name in wl_order:
@@ -499,15 +500,15 @@ def write_prometheus(ver: str, git: dict, stamp: str, ncpus: int,
             mean, sd = v
             labels = (f'scheduler="{sched}",workload="{wl_name}",'
                       f'version="{ver}",commit="{git["commit"]}"')
-            lines.append(f"pandemonium_bench_piotr_seconds{{{labels},stat=\"mean\"}} {mean:.6f}")
-            lines.append(f"pandemonium_bench_piotr_seconds{{{labels},stat=\"stdev\"}} {sd:.6f}")
+            lines.append(f"pandemonium_bench_cachyos_seconds{{{labels},stat=\"mean\"}} {mean:.6f}")
+            lines.append(f"pandemonium_bench_cachyos_seconds{{{labels},stat=\"stdev\"}} {sd:.6f}")
     path.write_text("\n".join(lines) + "\n")
     return path
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="PANDEMONIUM bench-piotr: phoronix-style application suite",
+        description="PANDEMONIUM bench-cachyos: CachyOS Mini-Benchmarker-style suite",
     )
     ap.add_argument("--runs", type=int, default=DEFAULT_RUNS,
                     help=f"Iterations per workload (default: {DEFAULT_RUNS})")
@@ -515,6 +516,13 @@ def main() -> int:
                     help="Comma-separated workload names (default: all available)")
     ap.add_argument("--schedulers", type=str, default="scx_cake",
                     help="External schedulers (default: scx_cake)")
+    ap.add_argument("--all-scx", action="store_true",
+                    help="Run the full installed scx scheduler field "
+                         "(scx_bpfland, scx_rusty, scx_lavd, scx_flow, "
+                         "scx_rustland, scx_p2dq, scx_tickless, scx_cosmos, "
+                         "scx_cake, scx_flash, scx_beerland, scx_layered) "
+                         "instead of --schedulers. Each is skipped if not "
+                         "installed. Overrides --schedulers.")
     ap.add_argument("--pandemonium-only", action="store_true",
                     help="Skip EEVDF and external schedulers")
     ap.add_argument("--no-eevdf", action="store_true",
@@ -529,7 +537,7 @@ def main() -> int:
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     dirty = " (dirty)" if git["dirty"] else ""
 
-    log_info(f"bench-piotr v{ver} [{git['commit']}{dirty}]")
+    log_info(f"bench-cachyos v{ver} [{git['commit']}{dirty}]")
     log_info(f"CPUs: {ncpus}  Iterations: {args.runs}")
 
     # WORKLOAD SELECTION + AVAILABILITY PROBE.
@@ -555,7 +563,19 @@ def main() -> int:
     entries.append(("PANDEMONIUM (BPF)", [str(BINARY), "--no-adaptive"]))
     entries.append(("PANDEMONIUM (ADAPTIVE)", [str(BINARY)]))
     if not args.pandemonium_only:
-        for ext in (s.strip() for s in args.schedulers.split(",")):
+        # --all-scx runs the full installed production scx field (same set as
+        # bench-fork-thread). scx_chaos is excluded (fault-injection test
+        # scheduler, not a contender); scx_layered needs a layer spec and may
+        # self-skip without one. Otherwise honor --schedulers.
+        if args.all_scx:
+            ext_list = [
+                "scx_bpfland", "scx_rusty", "scx_lavd", "scx_flow", "scx_rustland",
+                "scx_p2dq", "scx_tickless", "scx_cosmos", "scx_cake", "scx_flash",
+                "scx_beerland", "scx_layered",
+            ]
+        else:
+            ext_list = [s.strip() for s in args.schedulers.split(",")]
+        for ext in ext_list:
             if not ext:
                 continue
             p = find_scheduler(ext)

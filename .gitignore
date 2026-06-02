@@ -12,9 +12,6 @@ __pycache__/
 *.pyc
 *.pyo
 
-# Build artifacts
-*.png
-
 # Repo artifacts
 COMMIT_MESSAGE.txt
 

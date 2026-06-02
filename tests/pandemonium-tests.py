@@ -11,6 +11,7 @@ Usage:
 """
 
 import argparse
+import bisect
 import os
 import threading
 import traceback
@@ -40,7 +41,7 @@ from pandemonium_common import (
 
 # CONFIGURATION
 
-DEFAULT_EXTERNALS = ["scx_bpfland"]
+DEFAULT_EXTERNALS = ["scx_bpfland", "scx_cake"]
 
 
 # DMESG MONITORING
@@ -504,6 +505,37 @@ def stop_and_wait(guard: SchedulerProcess | None) -> str:
 
 # MEASUREMENT
 
+# PROMETHEUS HISTOGRAM BUCKETS (us). 1-2-5 ladder per decade, 1us..1s,
+# shared across every us-domain latency distribution so bench-analyze can
+# reconstruct per-cell CDFs from the .prom alone.
+HIST_BUCKETS_US = [
+    1, 2, 5, 10, 20, 50, 100, 200, 500,
+    1_000, 2_000, 5_000, 10_000, 20_000, 50_000,
+    100_000, 200_000, 500_000, 1_000_000,
+]
+
+
+def histogram(values: list[float]) -> dict:
+    """Bucket raw us samples into a cumulative Prometheus histogram.
+
+    Returns {"buckets": [(le, cum_count), ...] ascending incl. "+Inf",
+    "sum": int, "count": int}. Empty input returns {}.
+    """
+    if not values:
+        return {}
+    counts = [0] * (len(HIST_BUCKETS_US) + 1)
+    for v in values:
+        counts[bisect.bisect_left(HIST_BUCKETS_US, v)] += 1
+    cumulative = 0
+    buckets = []
+    for i, le in enumerate(HIST_BUCKETS_US):
+        cumulative += counts[i]
+        buckets.append((le, cumulative))
+    cumulative += counts[-1]
+    buckets.append(("+Inf", cumulative))
+    return {"buckets": buckets, "sum": int(sum(values)), "count": len(values)}
+
+
 def timed_run(cmd: str, clean_cmd: str | None = None) -> float | None:
     """Run a shell command, return wall-clock seconds or None on failure."""
     if clean_cmd:
@@ -536,6 +568,7 @@ def parse_probe_output(stdout_text: str) -> dict:
         "median_us": int(percentile(values, 50)),
         "p99_us": int(percentile(values, 99)),
         "worst_us": int(max(values)),
+        "hist": histogram(values),
     }
 
 
@@ -619,6 +652,7 @@ def measure_latency(binary: Path, n_cpus: int, iterations: int = 1,
             "median_us": int(percentile(all_values, 50)),
             "p99_us": int(percentile(all_values, 99)),
             "worst_us": int(max(all_values)),
+            "hist": histogram(all_values),
         }
 
     log_info(f"Latency: {result['samples']} samples, "
@@ -1193,6 +1227,7 @@ def measure_deadline(binary: Path, n_cpus: int,
         "jitter_median_us": int(percentile(all_jitter, 50)) if all_jitter else 0,
         "jitter_p99_us": int(percentile(all_jitter, 99)) if all_jitter else 0,
         "jitter_worst_us": int(max(all_jitter)) if all_jitter else 0,
+        "jitter_hist": histogram([float(j) for j in all_jitter]),
     }
 
     log_info(f"Deadline: {total} frames, {missed} missed "
@@ -1312,6 +1347,7 @@ def measure_ipc(binary: Path, n_cpus: int,
         "rtt_median_us": int(percentile(all_rtt, 50)) if all_rtt else 0,
         "rtt_p99_us": int(percentile(all_rtt, 99)) if all_rtt else 0,
         "rtt_worst_us": int(max(all_rtt)) if all_rtt else 0,
+        "rtt_hist": histogram([float(r) for r in all_rtt]),
     }
 
     log_info(f"IPC: {len(all_rtt)} round-trips, "
@@ -1385,6 +1421,7 @@ def measure_launch(binary: Path, n_cpus: int,
         "launch_median_us": int(percentile(latencies_us, 50)) if latencies_us else 0,
         "launch_p99_us": int(percentile(latencies_us, 99)) if latencies_us else 0,
         "launch_worst_us": int(max(latencies_us)) if latencies_us else 0,
+        "hist": histogram([float(x) for x in latencies_us]),
     }
 
     log_info(f"Launch: {launch_count} runs, "
@@ -1591,6 +1628,19 @@ def write_prometheus(data: dict, stamp: str) -> Path:
         else:
             lines.append(f"{name} {value}")
 
+    def hist(name: str, help_text: str, h: dict | None, labels: dict):
+        if not h or not h.get("buckets"):
+            return
+        if name not in emitted_types:
+            lines.append(f"# HELP {name} {help_text}")
+            lines.append(f"# TYPE {name} histogram")
+            emitted_types.add(name)
+        base = ",".join(f'{k}="{v}"' for k, v in labels.items())
+        for le, cumulative in h["buckets"]:
+            lines.append(f'{name}_bucket{{{base},le="{le}"}} {cumulative}')
+        lines.append(f"{name}_sum{{{base}}} {h['sum']}")
+        lines.append(f"{name}_count{{{base}}} {h['count']}")
+
     # Metadata
     version = data.get("version", "unknown")
     git_commit = data.get("git_commit", "unknown")
@@ -1626,6 +1676,9 @@ def write_prometheus(data: dict, stamp: str) -> Path:
                 gauge("pandemonium_bench_latency_worst_us",
                       "Worst-case wakeup latency",
                       lat["worst_us"], labels)
+                hist("pandemonium_bench_latency",
+                     "Wakeup latency distribution (us)",
+                     lat.get("hist"), labels)
 
             # Throughput metrics
             tp = sched_data.get("throughput", {})
@@ -1654,6 +1707,9 @@ def write_prometheus(data: dict, stamp: str) -> Path:
                     gauge("pandemonium_bench_burst_baseline_p99_us",
                           "Baseline P99 before burst",
                           baseline["p99_us"], labels)
+                    hist("pandemonium_bench_burst_baseline",
+                         "Baseline latency distribution before burst (us)",
+                         baseline.get("hist"), labels)
                 burst = br.get("burst", {})
                 if burst.get("samples", 0) > 0:
                     gauge("pandemonium_bench_burst_p99_us",
@@ -1665,6 +1721,9 @@ def write_prometheus(data: dict, stamp: str) -> Path:
                     gauge("pandemonium_bench_burst_samples",
                           "Latency samples collected during burst",
                           burst["samples"], labels)
+                    hist("pandemonium_bench_burst",
+                         "Latency distribution during burst (us)",
+                         burst.get("hist"), labels)
 
             # Long-running metrics
             lr = sched_data.get("longrun", {})
@@ -1681,6 +1740,9 @@ def write_prometheus(data: dict, stamp: str) -> Path:
                     gauge("pandemonium_bench_longrun_latency_worst_us",
                           "Worst-case latency during long-running process test",
                           lr_lat["worst_us"], labels)
+                    hist("pandemonium_bench_longrun_latency",
+                         "Latency distribution during long-run test (us)",
+                         lr_lat.get("hist"), labels)
                 if lr.get("work_total", 0) > 0:
                     gauge("pandemonium_bench_longrun_work_total",
                           "Total SHA256 iterations across all long-runners",
@@ -1704,6 +1766,9 @@ def write_prometheus(data: dict, stamp: str) -> Path:
                     gauge("pandemonium_bench_mixed_latency_worst_us",
                           "Worst-case latency during mixed workload test",
                           mx_lat["worst_us"], labels)
+                    hist("pandemonium_bench_mixed_latency",
+                         "Latency distribution during mixed test (us)",
+                         mx_lat.get("hist"), labels)
                 if mx.get("work_total", 0) > 0:
                     gauge("pandemonium_bench_mixed_work_total",
                           "Total SHA256 iterations in mixed test",
@@ -1738,6 +1803,9 @@ def write_prometheus(data: dict, stamp: str) -> Path:
                 gauge("pandemonium_bench_deadline_jitter_worst_us",
                       "Worst-case frame scheduling jitter",
                       dl["jitter_worst_us"], labels)
+                hist("pandemonium_bench_deadline_jitter",
+                     "Frame scheduling jitter distribution (us)",
+                     dl.get("jitter_hist"), labels)
 
             # IPC metrics
             ipc = sched_data.get("ipc", {})
@@ -1755,6 +1823,9 @@ def write_prometheus(data: dict, stamp: str) -> Path:
                 gauge("pandemonium_bench_ipc_rtt_worst_us",
                       "Worst-case pipe round-trip latency",
                       ipc["rtt_worst_us"], labels)
+                hist("pandemonium_bench_ipc_rtt",
+                     "Pipe round-trip latency distribution (us)",
+                     ipc.get("rtt_hist"), labels)
 
             # Launch metrics
             lnch = sched_data.get("launch", {})
@@ -1772,6 +1843,9 @@ def write_prometheus(data: dict, stamp: str) -> Path:
                 gauge("pandemonium_bench_launch_worst_us",
                       "Worst-case fork+exec latency under load",
                       lnch["launch_worst_us"], labels)
+                hist("pandemonium_bench_launch",
+                     "Fork+exec latency distribution under load (us)",
+                     lnch.get("hist"), labels)
 
             # Post-burst recovery metrics
             br = sched_data.get("burst", {})
@@ -1784,6 +1858,9 @@ def write_prometheus(data: dict, stamp: str) -> Path:
                     gauge("pandemonium_bench_burst_recovery_worst_us",
                           "Worst-case latency during post-burst recovery",
                           br_recovery["worst_us"], labels)
+                    hist("pandemonium_bench_burst_recovery",
+                         "Latency distribution during post-burst recovery (us)",
+                         br_recovery.get("hist"), labels)
 
             # Longrun detection verification
             lr_ticks = sched_data.get("longrun_ticks", 0)
@@ -1850,6 +1927,23 @@ def write_prometheus(data: dict, stamp: str) -> Path:
                               "L2 cache hit rate by tier",
                               knobs[l2_key],
                               {**telem_labels, "tier": tier})
+
+                # CROSS-CCX SCATTER: placement-side fraction (MWU PATHWAY 6
+                # input) + per-path attribution, per mode/cores. Lets the
+                # scaling report compare scatter between BPF and ADAPTIVE and
+                # confirm which placement path dominates the storm.
+                if "xccx_scatter_pct" in knobs:
+                    gauge("pandemonium_bench_xccx_scatter_pct",
+                          "Placement-side cross-CCX scatter percent",
+                          knobs["xccx_scatter_pct"], telem_labels)
+                for xk in ["sel_tight", "sel_sync", "sel_normal", "sel_dfl",
+                           "enq_t1", "enq_t2", "steal", "step5"]:
+                    key = f"xccx_{xk}"
+                    if key in knobs:
+                        gauge("pandemonium_bench_xccx_path",
+                              "Cross-CCX landings per placement path",
+                              knobs[key],
+                              {**telem_labels, "path": xk})
 
             if tick_agg:
                 for field in ["idle_pct", "preempt",
@@ -1941,6 +2035,8 @@ def prom_sys_create(path: Path, version: str, git: dict, max_cpus: int):
         ("pandemonium_bench_reflex_events", "Reflex tighten events"),
         ("pandemonium_bench_tightened", "Graduated relax tighten active"),
         ("pandemonium_bench_regime_ticks", "Ticks spent in each regime"),
+        ("pandemonium_bench_xccx_scatter_pct", "Placement-side cross-CCX scatter percent"),
+        ("pandemonium_bench_xccx_path", "Cross-CCX landings per placement path"),
         ("pandemonium_bench_latency_samples", "Latency probe samples"),
         ("pandemonium_bench_latency_median_us", "Median probe latency us"),
         ("pandemonium_bench_latency_p99_us", "P99 probe latency us"),
@@ -2017,6 +2113,18 @@ def prom_sys_append_knobs(path: Path, knobs: dict, label_str: str):
                 tier = lk.replace("l2_hit_", "")
                 f.write(f'pandemonium_bench_l2_hit_pct{{{label_str},'
                         f'tier="{tier}"}} {knobs[lk]}\n')
+        # CROSS-CCX SCATTER: placement-side fraction (MWU PATHWAY 6 input) plus
+        # the per-path attribution. Surfaced for both BPF and ADAPTIVE so the
+        # scatter difference between modes is directly comparable per run.
+        if "xccx_scatter_pct" in knobs:
+            f.write(f"pandemonium_bench_xccx_scatter_pct{{{label_str}}} "
+                    f"{knobs['xccx_scatter_pct']}\n")
+        for xk in ["sel_tight", "sel_sync", "sel_normal", "sel_dfl",
+                   "enq_t1", "enq_t2", "steal", "step5"]:
+            key = f"xccx_{xk}"
+            if key in knobs:
+                f.write(f'pandemonium_bench_xccx_path{{{label_str},'
+                        f'path="{xk}"}} {knobs[key]}\n')
 
 
 def prom_sys_append_probe(path: Path, lat: dict, label_str: str):
