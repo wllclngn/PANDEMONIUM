@@ -8,7 +8,8 @@ Usage:
     ./pandemonium.py bench-contention  Contention stress test for v5.4.x features
     ./pandemonium.py bench-scx         scx CI compatibility test
     ./pandemonium.py bench-fork-thread  Fork/thread IPC benchmark + hw counters + non-compensatory regression gate
-    ./pandemonium.py bench-trace       BPF trace capture for external workloads (Ctrl+C to stop)
+    ./pandemonium.py bench-ipc         IPC round-trip latency (front-end over bench-scale --ipc; same lifecycle + logging)
+    ./pandemonium.py bench-trace       montauk trace capture for external workloads (Ctrl+C to stop)
     ./pandemonium.py bench-power       Energy-efficiency benchmark (RAPL J/op + idle floor + C-state)
     ./pandemonium.py bench-cachyos     CachyOS Mini-Benchmarker suite (12 workloads, scheduler matrix)
     ./pandemonium.py bench-sys         Live system telemetry capture (Ctrl+C to stop)
@@ -229,6 +230,12 @@ def main() -> int:
     elif cmd == "bench-fork-thread":
         return subprocess.run(
             [sys.executable, str(SCRIPT_DIR / "tests" / "bench-fork-thread.py")]
+            + sys.argv[2:],
+            cwd=SCRIPT_DIR,
+        ).returncode
+    elif cmd == "bench-ipc":
+        return subprocess.run(
+            [sys.executable, str(SCRIPT_DIR / "tests" / "bench-ipc.py")]
             + sys.argv[2:],
             cwd=SCRIPT_DIR,
         ).returncode

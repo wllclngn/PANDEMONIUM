@@ -16,6 +16,7 @@ Two styles:
 import argparse
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -92,10 +93,30 @@ def is_pande(s):
 
 def short_name(s):
     if is_pande(s) and "ADAPTIVE" in s:
-        return "PANDEMONIUM (adaptive)"
+        return "scx_pandemonium (adaptive)"
     if is_pande(s) and "BPF" in s:
-        return "PANDEMONIUM (bpf)"
+        return "scx_pandemonium (bpf)"
     return s
+
+
+def sched_version(s, meta):
+    """Version string for a scheduler label, so the chart is self-documenting.
+    EEVDF -> kernel release; scx_pandemonium -> the run's version from the .prom;
+    scx_* -> the installed binary's --version."""
+    if "EEVDF" in s:
+        try:
+            return os.uname().release
+        except Exception:
+            return ""
+    if is_pande(s):
+        return f"v{meta.get('version', '')}"
+    try:
+        out = subprocess.run([s, "--version"], capture_output=True,
+                             text=True, timeout=3).stdout
+        m = re.search(r"\b(\d+\.\d+\.\d+)\b", out)
+        return m.group(1) if m else ""
+    except Exception:
+        return ""
 
 
 def sched_order(s):
@@ -309,7 +330,11 @@ def render_cachyos_suite(path, args):
         ax.text(totals[s], y[i], f" {totals[s]:.1f}s{mult}",
                 va="center", ha="left", fontsize=8)
     ax.set_yticks(y)
-    ax.set_yticklabels([short_name(s) for s in scheds])
+    labels = []
+    for s in scheds:
+        v = sched_version(s, meta)
+        labels.append(f"{short_name(s)}  {v}" if v else short_name(s))
+    ax.set_yticklabels(labels)
     ax.set_xlabel(f"Total wall-time across {nwl} workloads (s).  Lower is better")
     if args.log:
         ax.set_xscale("log")
@@ -317,8 +342,9 @@ def render_cachyos_suite(path, args):
     ax.set_axisbelow(True)
     ax.margins(x=0.14)
     cpu = cpu_model()
-    ax.set_title(f"PANDEMONIUM v{meta['version']} — CachyOS Suite Total Wall-Time\n"
-                 f"{cpu}  ·  {nwl} workloads  ·  {path.name}", fontsize=12)
+    ax.set_title(f"scx_pandemonium v{meta['version']} — CachyOS Suite Total Wall-Time\n"
+                 f"{cpu}  ·  {nwl} workloads  ·  {os.uname().release}  ·  {path.name}",
+                 fontsize=12)
     fig.tight_layout()
     out = args.out or f"bench-cachyos-suite-{meta['version']}.png"
     return fig, out, f"{n} schedulers, {nwl} workloads"

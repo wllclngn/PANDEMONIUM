@@ -97,7 +97,7 @@ SCHBENCH_RUNTIME_SECS = 10
 SCHBENCH_THREADS_PER_MSG = 4
 
 WORKLOADS = ("idle-floor", "messaging", "schbench")
-DEFAULT_EXTERNALS = ["scx_bpfland", "scx_flow", "scx_lavd"]
+DEFAULT_EXTERNALS = []
 
 # RAPL events to probe in priority order. The first that works defines
 # the primary energy reading; cores/ram are best-effort and not all
@@ -806,7 +806,7 @@ def build_entries(args, has_schbench: bool) -> list[tuple[str, list[str] | None]
     """Returns ordered list of (display_name, cmd_or_None) entries.
     None command means EEVDF (default kernel scheduler)."""
     entries: list[tuple[str, list[str] | None]] = []
-    if not args.no_eevdf:
+    if not args.no_eevdf and not args.pandemonium_only:
         entries.append(("EEVDF", None))
     if not args.no_pandemonium:
         # Production-realistic activation: no --verbose, the periodic

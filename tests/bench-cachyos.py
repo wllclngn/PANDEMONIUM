@@ -40,6 +40,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -484,14 +485,24 @@ def write_report(ver: str, git: dict, stamp: str, ncpus: int,
 
 
 def write_prometheus(ver: str, git: dict, stamp: str, ncpus: int,
-                     results: dict, wl_order: list[str]) -> Path:
+                     results: dict, wl_order: list[str],
+                     skipped: Optional[dict] = None) -> Path:
     """Prometheus textfile-collector style emission."""
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     path = LOG_DIR / f"bench-cachyos-{stamp}.prom"
     lines = [
         "# HELP pandemonium_bench_cachyos_seconds Wall-clock seconds per CachyOS-suite workload",
         "# TYPE pandemonium_bench_cachyos_seconds gauge",
+        "# HELP pandemonium_bench_cachyos_scheduler_skipped Scheduler crashed/ejected/fell through to EEVDF (not measured)",
+        "# TYPE pandemonium_bench_cachyos_scheduler_skipped gauge",
     ]
+    # SKIPPED schedulers: crashed / ejected / fell through to EEVDF. Emitted so
+    # a missing scheduler is explicit, never mistaken for an EEVDF re-measure.
+    for sched, reason in (skipped or {}).items():
+        rl = reason.replace('"', "'")
+        lines.append(f'pandemonium_bench_cachyos_scheduler_skipped'
+                     f'{{scheduler="{sched}",reason="{rl}",'
+                     f'version="{ver}",commit="{git["commit"]}"}} 1')
     for sched, by_wl in results.items():
         for wl_name in wl_order:
             v = by_wl.get(wl_name)
@@ -504,6 +515,36 @@ def write_prometheus(ver: str, git: dict, stamp: str, ncpus: int,
             lines.append(f"pandemonium_bench_cachyos_seconds{{{labels},stat=\"stdev\"}} {sd:.6f}")
     path.write_text("\n".join(lines) + "\n")
     return path
+
+
+def _watch_sched(guard, expected_ops, sched_name, stop_evt, out):
+    """Background poll (1s): log the instant the scheduler ejects, so a crash
+    that HANGS a workload -- or a Ctrl+C on that hang -- surfaces immediately
+    instead of waiting for a workload that never returns. Records once."""
+    while not stop_evt.wait(1.0):
+        r = _sched_crashed(guard, expected_ops)
+        if r:
+            out["reason"] = r
+            log_error(f"[{sched_name}] CRASHED mid-run -- {r}")
+            return
+
+
+def _sched_crashed(guard, expected_ops=""):
+    """Crash / EEVDF fall-through detector for the scheduler-matrix loop.
+    Returns a reason string if the scheduler died, ejected, or silently fell
+    back to EEVDF (measuring it further would just re-measure EEVDF), else None.
+    EEVDF runs with guard=None (kernel default) and never falls through.
+    expected_ops = sched_ext ops name captured right after activation."""
+    if guard is None:
+        return None
+    if guard.proc.poll() is not None:
+        return f"process exited (rc={guard.proc.returncode})"
+    name = scx_scheduler_name()
+    if not name:
+        return "fell through to EEVDF (sched_ext slot empty -- ejected?)"
+    if expected_ops and name != expected_ops:
+        return f"fell through to '{name}' (expected '{expected_ops}')"
+    return None
 
 
 def main() -> int:
@@ -599,21 +640,44 @@ def main() -> int:
 
     # MAIN MATRIX LOOP.
     results: dict[str, dict[str, tuple[Optional[float], float]]] = {}
+    skipped: dict[str, str] = {}
     try:
         for sched_name, cmd in entries:
             log_info(f"[{sched_name}] starting...")
             guard = None
+            expected_ops = ""
             if cmd is not None:
                 guard = start_and_wait(cmd, sched_name)
                 if guard is None:
-                    log_error(f"[{sched_name}] failed to activate, skipping")
-                    results[sched_name] = {w.name: (None, 0.0) for w in active}
+                    log_error(f"[{sched_name}] FAILED to activate -- SKIPPED "
+                              f"(no point re-measuring EEVDF)")
+                    skipped[sched_name] = "failed to activate"
+                    continue
+                expected_ops = scx_scheduler_name()
+                if not expected_ops:
+                    log_error(f"[{sched_name}] not attached after activate -- "
+                              f"SKIPPED (fell through to EEVDF)")
+                    skipped[sched_name] = "fell through to EEVDF at activation"
+                    stop_and_wait(guard)
                     continue
             results[sched_name] = {}
+            stop_evt = threading.Event()
+            watch = {}
+            if guard is not None:
+                threading.Thread(target=_watch_sched, daemon=True,
+                                 args=(guard, expected_ops, sched_name,
+                                       stop_evt, watch)).start()
             for wl in active:
                 _refresh_sudo()
                 log_info(f"  [{sched_name}] {wl.label}")
                 samples = run_workload_n_times(wl, args.runs, ncpus)
+                reason = watch.get("reason") or _sched_crashed(guard, expected_ops)
+                if reason:
+                    log_error(f"[{sched_name}] CRASHED during {wl.label} -- {reason}")
+                    log_warn(f"[{sched_name}] SKIPPING remaining workloads -- "
+                             f"would just re-measure EEVDF")
+                    skipped[sched_name] = f"{reason} (during {wl.name})"
+                    break   # discard the EEVDF-tainted samples, stop this sched
                 if samples:
                     mean, sd = mean_stdev(samples)
                     log_info(f"    mean={mean:.3f}s ±{sd:.3f}")
@@ -621,6 +685,9 @@ def main() -> int:
                 else:
                     results[sched_name][wl.name] = (None, 0.0)
                 time.sleep(1)
+            stop_evt.set()
+            if watch.get("reason") and sched_name not in skipped:
+                skipped[sched_name] = watch["reason"]
             if guard is not None:
                 stop_and_wait(guard)
             time.sleep(2)
@@ -631,10 +698,18 @@ def main() -> int:
         if is_scx_active():
             wait_for_deactivation(5.0)
 
+    if skipped:
+        log_error(f"{len(skipped)} scheduler(s) CRASHED / fell through to EEVDF "
+                  f"-- SKIPPED (not measured as EEVDF):")
+        for s, r in skipped.items():
+            log_error(f"  {s} -- {r}")
+    else:
+        log_info("no scheduler crashes -- all schedulers ran as themselves")
+
     if results:
         wl_order = [w.name for w in active]
         report_path = write_report(ver, git, stamp, ncpus, results, args.runs, wl_order)
-        prom_path = write_prometheus(ver, git, stamp, ncpus, results, wl_order)
+        prom_path = write_prometheus(ver, git, stamp, ncpus, results, wl_order, skipped)
         print()
         print(report_path.read_text())
         log_info(f"Report: {report_path}")

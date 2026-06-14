@@ -679,6 +679,205 @@ def analyze_trace(recs):
     return 0
 
 
+# FRACTALITY (MONTAUK RECORDING) -- HURST/DFA ON THE DISPATCH + MIGRATION RATE
+#
+# A montauk recording is 341-ish stacked per-scrape expositions (100ms cadence,
+# no per-line timestamps). Reconstruct per-interval series by scrape order: the
+# k-th `# HELP montauk_sched_op_total` opens scrape k, carrying that scrape's
+# wakeup counter (the only live sched-op tracepoint for the BPF sched) and the
+# per-thread migration block that follows. Difference the cumulative counters to
+# get rate series, then estimate the Hurst exponent two ways (DFA primary, R/S
+# cross-check). H~0.5 = uncorrelated; H>0.5 = persistent long-range dependence
+# (self-similar, fractal dimension D=2-H); H<0.5 = anti-persistent.
+#
+# HARD CEILING: ~340 points over ~34s in the 100ms band spans barely one decade
+# of scale, so H carries wide bars and is INDICATIVE, not a rigorous fractal
+# claim -- microsecond dispatch structure is invisible at this sampling. A real
+# claim needs a raw-event capture (montauk dispatch-event stream, longer run).
+
+_WAKE_RE = re.compile(r'^montauk_sched_op_total\{op="wakeup"\}\s+([-+0-9.eE]+)')
+_MIGL_RE = re.compile(r'^montauk_trace_thread_migrations\{[^}]*\}\s+([-+0-9.eE]+)')
+
+
+def load_fractal_series(d):
+    """Montauk recording dir -> aligned per-scrape (wakeup, migration-sum)
+    cumulative series, differenced to non-negative rate series."""
+    files = sorted(Path(d).glob("montauk_*.prom"))
+    if not files:
+        return None
+    wake, mig = [], []
+    cur_mig, in_scrape = 0.0, False
+    for f in files:
+        for ln in f.read_text(errors="replace").splitlines():
+            if ln.startswith("# HELP montauk_sched_op_total"):
+                if in_scrape:
+                    mig.append(cur_mig)
+                cur_mig, in_scrape = 0.0, True
+                continue
+            mw = _WAKE_RE.match(ln)
+            if mw:
+                wake.append(float(mw.group(1)))
+                continue
+            mm = _MIGL_RE.match(ln)
+            if mm:
+                cur_mig += float(mm.group(1))
+    if in_scrape:
+        mig.append(cur_mig)
+    n = min(len(wake), len(mig))
+    if n < 32:
+        return {"dir": Path(d).name, "n": n, "short": True}
+    wake = np.asarray(wake[:n], float)
+    mig = np.asarray(mig[:n], float)
+    # CUMULATIVE COUNTERS -> RATE. WAKEUP IS MONOTONIC; MIGRATION-SUM CAN DROP
+    # WHEN HIGH-MIGRATION THREADS EXIT (CHURN), SO CLAMP NEGATIVE DELTAS TO 0.
+    wrate = np.clip(np.diff(wake), 0, None)
+    mrate = np.clip(np.diff(mig), 0, None)
+    return {"dir": Path(d).name, "n": n, "short": False,
+            "wake_rate": wrate, "mig_rate": mrate}
+
+
+def dfa_hurst(x):
+    """Detrended fluctuation analysis -> (H, se, scales, decades). Order-1
+    detrend per window; log-log slope of fluctuation vs scale is H."""
+    x = np.asarray(x, float)
+    x = x - x.mean()
+    y = np.cumsum(x)
+    n = len(y)
+    smax = max(8, n // 4)
+    scales = np.unique(np.floor(
+        np.logspace(math.log10(4), math.log10(smax), 14)).astype(int))
+    scales = scales[scales >= 4]
+    F, used = [], []
+    for s in scales:
+        nseg = n // s
+        if nseg < 1:
+            continue
+        rms = []
+        tt = np.arange(s)
+        for v in range(nseg):
+            seg = y[v * s:(v + 1) * s]
+            fit = np.polyval(np.polyfit(tt, seg, 1), tt)
+            rms.append(np.mean((seg - fit) ** 2))
+        F.append(math.sqrt(np.mean(rms)))
+        used.append(s)
+    used, F = np.asarray(used, float), np.asarray(F, float)
+    mask = F > 0
+    if mask.sum() < 3:
+        return float("nan"), float("nan"), used, 0.0
+    coef, cov = np.polyfit(np.log(used[mask]), np.log(F[mask]), 1, cov=True)
+    decades = math.log10(used[mask].max() / used[mask].min())
+    return float(coef[0]), float(math.sqrt(cov[0, 0])), used, decades
+
+
+def rs_hurst(x):
+    """Rescaled-range (R/S) Hurst, dyadic windows. Cross-check for DFA."""
+    x = np.asarray(x, float)
+    n = len(x)
+    pts = []
+    s = 8
+    while s <= n // 2:
+        nseg = n // s
+        vals = []
+        for v in range(nseg):
+            seg = x[v * s:(v + 1) * s]
+            z = np.cumsum(seg - seg.mean())
+            sd = seg.std()
+            if sd > 0:
+                vals.append((z.max() - z.min()) / sd)
+        if vals:
+            pts.append((s, np.mean(vals)))
+        s *= 2
+    if len(pts) < 3:
+        return float("nan")
+    ss, rs = np.asarray([p[0] for p in pts], float), np.asarray([p[1] for p in pts], float)
+    return float(np.polyfit(np.log(ss), np.log(rs), 1)[0])
+
+
+def avalanche_tail(mrate):
+    """Migration avalanches = maximal runs above the active-interval median;
+    size = migrations summed over the run. Returns (count, log-log tail slope).
+    Underpowered at ~340 bins -- reported as a hint, not a power-law fit."""
+    active = mrate[mrate > 0]
+    if active.size < 8:
+        return 0, float("nan")
+    thr = np.median(active)
+    sizes, run = [], 0.0
+    for v in mrate:
+        if v > thr:
+            run += v
+        elif run > 0:
+            sizes.append(run)
+            run = 0.0
+    if run > 0:
+        sizes.append(run)
+    sizes = np.sort(np.asarray(sizes, float))[::-1]
+    if sizes.size < 5:
+        return int(sizes.size), float("nan")
+    # CCDF LOG-LOG SLOPE (rank/n vs size). NEGATIVE, STEEPER = LIGHTER TAIL.
+    ccdf = np.arange(1, sizes.size + 1) / sizes.size
+    m = sizes > 0
+    slope = float(np.polyfit(np.log(sizes[m]), np.log(ccdf[m]), 1)[0])
+    return int(sizes.size), slope
+
+
+def analyze_fractal(rec):
+    """Print the fractality report for one recording; return (report, prom)."""
+    prom = []
+    if rec is None:
+        log("ERROR", "no montauk_*.prom in the recording dir")
+        return 1
+    log("INFO", f"recording: {rec['dir']}")
+    if rec.get("short"):
+        log("ERROR", f"only {rec['n']} scrapes -- need >=32 for a Hurst estimate")
+        return 1
+    n = rec["n"]
+    secs = n * 0.1
+    log("WARN", f"INDICATIVE ONLY: {n - 1} pts, ~{secs:.0f}s @ 100ms band; "
+                "microsecond dispatch structure invisible -- rigorous fractality "
+                "needs a raw-event capture")
+    print()
+    print(f"{'SERIES':<16}{'H (DFA)':>14}{'H (R/S)':>12}{'D=2-H':>10}{'decades':>10}  VERDICT")
+    for name, key in (("wakeup-rate", "wake_rate"), ("migration-rate", "mig_rate")):
+        x = rec[key]
+        if x.size < 16 or x.std() == 0:
+            print(f"{name:<16}{'flat/short -- skip':>46}")
+            continue
+        h, se, _, dec = dfa_hurst(x)
+        hrs = rs_hurst(x)
+        d = 2 - h
+        # VERDICT vs H=0.5 AT ~2 SIGMA OF THE DFA SLOPE SE.
+        if math.isnan(h):
+            verdict = "undetermined"
+        elif h - 2 * se > 0.5:
+            verdict = "persistent (long-range / self-similar)"
+        elif h + 2 * se < 0.5:
+            verdict = "anti-persistent (mean-reverting)"
+        else:
+            verdict = "indistinguishable from uncorrelated"
+        print(f"{name:<16}{h:>9.3f}±{se:.3f}{hrs:>12.3f}{d:>10.3f}{dec:>10.2f}  {verdict}")
+        labels = {"recording": rec["dir"], "series": name}
+        prom.append(("pandemonium_fractal_hurst_dfa", labels, round(h, 4)))
+        prom.append(("pandemonium_fractal_hurst_dfa_se", labels, round(se, 4)))
+        prom.append(("pandemonium_fractal_hurst_rs", labels, round(hrs, 4)))
+        prom.append(("pandemonium_fractal_dimension", labels, round(d, 4)))
+        prom.append(("pandemonium_fractal_decades", labels, round(dec, 3)))
+    nav, slope = avalanche_tail(rec["mig_rate"])
+    print()
+    if nav >= 5:
+        log("INFO", f"migration avalanches: {nav} above active-median; "
+                    f"CCDF log-log slope {slope:+.2f} (hint only -- <decade of range)")
+        prom.append(("pandemonium_fractal_avalanches",
+                     {"recording": rec["dir"]}, nav))
+        prom.append(("pandemonium_fractal_avalanche_slope",
+                     {"recording": rec["dir"]}, round(slope, 3)))
+    else:
+        log("WARN", f"only {nav} migration avalanches -- too few for any tail read")
+    print()
+    log("INFO", "fractal read: H>0.5 (>2sigma) => self-similar in this band; "
+                "near 0.5 => not fractal at 100ms (recursion != fractal)")
+    return prom
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Statistical analysis of bench-scale .prom logs.")
@@ -699,9 +898,35 @@ def main():
     ap.add_argument("--trace-dir", nargs="+",
                     help="explicit montauk recording dir(s) for --trace "
                          "(default: freshest EEVDF + PANDEMONIUM in the cache dir)")
+    ap.add_argument("--fractal", action="store_true",
+                    help="Hurst/DFA on the dispatch + migration rate series of a "
+                         "montauk recording (is the timeline self-similar?)")
+    ap.add_argument("--fractal-dir",
+                    help="explicit montauk recording dir for --fractal "
+                         "(default: freshest PANDEMONIUM-BPF in the cache dir)")
     args = ap.parse_args()
 
     log_dir = Path(args.log_dir)
+
+    if args.fractal or args.fractal_dir:
+        d = args.fractal_dir
+        if not d:
+            _, p = find_trace_dirs(log_dir)
+            d = str(p) if p else None
+            if d:
+                log("INFO", "fractal mode: freshest PANDEMONIUM-BPF recording")
+        if not d:
+            log("ERROR", "no montauk recording dir "
+                         "(need montauk-fork-thread-PANDEMONIUM-BPF-*)")
+            return 1
+        prom = analyze_fractal(load_fractal_series(d))
+        if isinstance(prom, int):
+            return prom
+        if not args.no_emit and prom:
+            path = write_analysis_prom(
+                prom, datetime.now().strftime("%Y%m%d-%H%M%S"), log_dir)
+            log("INFO", f"fractal metrics -> {path}")
+        return 0
 
     if args.trace or args.trace_dir:
         if args.trace_dir:

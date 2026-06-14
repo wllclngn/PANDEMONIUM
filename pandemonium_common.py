@@ -9,6 +9,7 @@ import math
 import os
 import platform
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -399,15 +400,271 @@ def wait_for_no_scheduler(timeout: float = 10.0) -> bool:
     return False
 
 
-# TRACEFS
+# MONTAUK TRACE CAPTURE
+#
+# THE SINGLE PLACE MONTAUK IS DRIVEN FROM. EVERY bench-* --trace PATH GOES
+# THROUGH MontaukTrace INSTEAD OF REIMPLEMENTING THE LAUNCH/ATTACH/STOP/CHOWN.
+# MONTAUK IS THE ONLY TRACER -- NO ftrace/trace_pipe ANYWHERE IN THE SUITE.
 
-def find_trace_pipe() -> Path:
-    """Find trace_pipe in tracefs (location varies by kernel)."""
-    candidates = [
-        Path("/sys/kernel/tracing/trace_pipe"),
-        Path("/sys/kernel/debug/tracing/trace_pipe"),
-    ]
-    for p in candidates:
-        if p.exists():
-            return p
-    return candidates[0]
+MONTAUK = "/usr/local/bin/montauk"
+MONTAUK_ATTACH_TIMEOUT = 10.0
+MONTAUK_LOG_INTERVAL_MS = 100
+
+
+def montauk_available() -> bool:
+    return Path(MONTAUK).exists()
+
+
+def _chown_to_invoking_user(*paths) -> None:
+    """Hand root-owned montauk recordings back to the sudo invoker so they are
+    viewable without sudo. No-op when not running under sudo."""
+    user = os.environ.get("SUDO_USER")
+    if not user or os.geteuid() != 0:
+        return
+    for path in paths:
+        if Path(path).exists():
+            subprocess.run(["chown", "-R", f"{user}:", str(path)],
+                           capture_output=True)
+
+
+class MontaukTrace:
+    """Context manager driving a montauk eBPF recording around a workload.
+
+    __enter__ launches `montauk --trace PATTERN --log DIR`, waits for attach
+    (first montauk_*.prom), then records an optional quiet baseline. __exit__
+    stops montauk the way Ctrl+C would (SIGINT, escalating to TERM/KILL) and
+    chowns the recording back to the sudo invoker. `.dir` is the recording
+    directory, ready for `bench-analyze.py --trace` / `--fractal-dir`.
+
+    The caller owns the scheduler and the workload; this owns only montauk.
+    """
+
+    def __init__(self, pattern, label, stamp, log_dir=LOG_DIR,
+                 interval_ms=MONTAUK_LOG_INTERVAL_MS, baseline_s=0.0,
+                 attach_timeout=MONTAUK_ATTACH_TIMEOUT, events=False,
+                 pin_cpu=None):
+        # pin_cpu: taskset montauk to a dedicated CPU so it always drains its
+        # ring buffer -- under a saturated workload an unpinned montauk gets
+        # starved and DROPS events (400ms+ capture holes), making a per-event
+        # trace useless. The drain core must be OUTSIDE the saturated set.
+        self.pin_cpu = pin_cpu
+        self.pattern = pattern
+        self.dir = Path(log_dir) / f"montauk-{label}-{stamp}"
+        self.stdout_path = Path(log_dir) / f"montauk-{label}-{stamp}.stdout"
+        # RAW PER-EVENT LOG (montauk --trace-out): finer than the 100ms .log
+        # snapshots -- needed to SEE a single multi-ms scheduling stall.
+        # Decode with montauk/build/montauk_trace_decode.
+        self.events_path = (Path(log_dir) / f"montauk-{label}-{stamp}.events"
+                            if events else None)
+        self.interval_ms = interval_ms
+        self.baseline_s = baseline_s
+        self.attach_timeout = attach_timeout
+        self.proc = None
+        self._out = None
+
+    def __enter__(self):
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self._out = open(self.stdout_path, "w")
+        cmd = [MONTAUK, "--trace", self.pattern, "--log", str(self.dir),
+               "--log-interval-ms", str(self.interval_ms)]
+        if self.events_path is not None:
+            cmd += ["--trace-out", str(self.events_path)]
+        if self.pin_cpu is not None:
+            cmd = ["taskset", "-c", str(self.pin_cpu)] + cmd
+        self.proc = subprocess.Popen(cmd, stdout=self._out,
+                                     stderr=subprocess.STDOUT)
+        if not self._wait_for_attach():
+            log_warn(f"montauk slow to attach (see {self.stdout_path})")
+        if self.baseline_s > 0:
+            log_info(f"recording idle baseline for {self.baseline_s:.0f}s...")
+            time.sleep(self.baseline_s)
+        return self
+
+    def _wait_for_attach(self) -> bool:
+        deadline = time.time() + self.attach_timeout
+        while time.time() < deadline:
+            if any(self.dir.glob("montauk_*.prom")):
+                return True
+            if self.proc.poll() is not None:
+                return False
+            time.sleep(0.2)
+        return False
+
+    def stop(self) -> None:
+        if self.proc is not None:
+            for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGKILL):
+                if self.proc.poll() is not None:
+                    break
+                self.proc.send_signal(sig)
+                try:
+                    self.proc.wait(timeout=8)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+            self.proc = None
+        if self._out is not None:
+            self._out.close()
+            self._out = None
+        _chown_to_invoking_user(*[p for p in (self.dir, self.stdout_path,
+                                              self.events_path) if p is not None])
+
+    def __exit__(self, exc_type, exc, tb):
+        self.stop()
+        return False
+
+
+def montauk_trace(pattern, label, stamp, log_dir=LOG_DIR, **kw) -> "MontaukTrace":
+    """Factory for MontaukTrace -- use as `with montauk_trace(...) as rec:`."""
+    return MontaukTrace(pattern, label, stamp, log_dir, **kw)
+
+
+
+
+# IPC LATENCY ENGINE (shared source of truth)
+# The shared IPC engine, consumed by bench-scale's measure_ipc.
+# The methodology that makes it trustworthy: ONE clean handoff pair per
+# primitive looping a FIXED round count -- not many pairs contending and
+# aggregated (the old bench-scale measure_ipc, whose cross-pair contention
+# inflated p99/worst into noise). gc is disabled in the workload so the
+# harness's own GC pauses don't pollute the latency tail; the processes rename
+# themselves to IPC_COMM so `montauk --trace pand-ipc` can target them.
+
+IPC_COMM = "pand-ipc"
+IPC_RTT_PRIMS = ["pipe", "socket", "eventfd", "sem"]
+IPC_DEFAULT_ROUNDS = 20000
+IPC_WARMUP_SECS = 2.0
+
+_IPC_HEAD = (
+    "import os,time,ctypes,ctypes.util,gc\n"
+    "gc.disable()\n"
+    "libc=ctypes.CDLL(ctypes.util.find_library('c'))\n"
+    f"libc.prctl(15,b'{IPC_COMM}',0,0,0)\n"
+)
+
+
+def ipc_rtt_script(prim, rounds):
+    """One handoff pair, `rounds` round-trips over `prim`; prints per-round us."""
+    if prim == "pipe":
+        setup = "r1,w1=os.pipe();r2,w2=os.pipe()\n"
+        cwait, cwake = "os.read(r1,1)", "os.write(w2,b'x')"
+        pwake, pwait = "os.write(w1,b'x')", "os.read(r2,1)"
+    elif prim == "socket":
+        setup = "import socket\nA,B=socket.socketpair()\n"
+        cwait, cwake = "B.recv(1)", "B.send(b'x')"
+        pwake, pwait = "A.send(b'x')", "A.recv(1)"
+    elif prim == "eventfd":
+        setup = "e1=os.eventfd(0);e2=os.eventfd(0)\n"
+        cwait, cwake = "os.eventfd_read(e1)", "os.eventfd_write(e2,1)"
+        pwake, pwait = "os.eventfd_write(e1,1)", "os.eventfd_read(e2)"
+    elif prim == "sem":
+        setup = "from multiprocessing import Semaphore\ns1=Semaphore(0);s2=Semaphore(0)\n"
+        cwait, cwake = "s1.acquire()", "s2.release()"
+        pwake, pwait = "s1.release()", "s2.acquire()"
+    else:
+        raise ValueError(prim)
+    return (_IPC_HEAD + f"N={rounds}\n" + setup +
+            "pid=os.fork()\n"
+            "if pid==0:\n"
+            " for _ in range(N):\n"
+            f"  {cwait};{cwake}\n"
+            " os._exit(0)\n"
+            "lat=[]\n"
+            "for _ in range(N):\n"
+            f" t=time.monotonic();{pwake};{pwait}\n"
+            " lat.append(time.monotonic()-t)\n"
+            "os.waitpid(pid,0)\n"
+            "import sys\n"
+            "sys.stdout.write('\\n'.join(str(int(l*1e6)) for l in lat))\n")
+
+
+def ipc_fanout_script(rounds, k):
+    """1 parent -> K children; each round wakes all K and waits for all K
+    (the 1:N server burst). Latency = burst-completion time."""
+    return (_IPC_HEAD + f"R={rounds};K={k}\n"
+            "P=[(os.pipe(),os.pipe()) for _ in range(K)]\n"
+            "kids=[]\n"
+            "for i in range(K):\n"
+            " pid=os.fork()\n"
+            " if pid==0:\n"
+            "  (r1,w1),(r2,w2)=P[i]\n"
+            "  for _ in range(R): os.read(r1,1);os.write(w2,b'x')\n"
+            "  os._exit(0)\n"
+            " kids.append(pid)\n"
+            "lat=[]\n"
+            "for _ in range(R):\n"
+            " t=time.monotonic()\n"
+            " for i in range(K): os.write(P[i][0][1],b'x')\n"
+            " for i in range(K): os.read(P[i][1][0],1)\n"
+            " lat.append(time.monotonic()-t)\n"
+            "for p in kids: os.waitpid(p,0)\n"
+            "import sys\n"
+            "sys.stdout.write('\\n'.join(str(int(l*1e6)) for l in lat))\n")
+
+
+def ipc_start_stress(cores, reserve=()):
+    """Pin one non-yielding stress worker to each online CPU < cores, skipping
+    any CPU in `reserve` (bench-ipc reserves cpu0 as montauk's drain core so it
+    never drops events)."""
+    workers = []
+    for cpu in range(cores):
+        if cpu in reserve:
+            continue
+        workers.append(subprocess.Popen(
+            [str(BINARY), "stress-worker", "--cpu", str(cpu)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+    return workers
+
+
+def ipc_stop_stress(workers):
+    for w in workers:
+        w.send_signal(signal.SIGINT)
+    for w in workers:
+        try:
+            w.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            w.kill()
+            w.wait()
+
+
+def ipc_run_script(script, cpu_set=None):
+    cmd = [sys.executable, "-c", script]
+    if cpu_set is not None:
+        cmd = ["taskset", "-c", cpu_set] + cmd
+    try:
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True)
+        out, _ = p.communicate(timeout=180)
+        return out
+    except subprocess.TimeoutExpired:
+        p.kill()
+        return ""
+
+
+def ipc_lat_dist(out):
+    v = [int(x) for x in out.split() if x.strip().lstrip("-").isdigit()]
+    if not v:
+        return None
+    return {"n": len(v), "p50": int(percentile(v, 50)),
+            "p99": int(percentile(v, 99)),
+            "p999": int(percentile(v, 99.9)), "worst": max(v)}
+
+
+def measure_ipc_cell(cores, rounds=IPC_DEFAULT_ROUNDS, prims=None,
+                     fanout=True):
+    """Clean per-primitive IPC RTT under stress at `cores`. One pair per
+    primitive (not contending pairs), `rounds` each. Returns
+    {rtt_<prim>: dist, 'fanout': dist}; dist = {n,p50,p99,p999,worst} or None."""
+    if prims is None:
+        prims = IPC_RTT_PRIMS
+    cell = {}
+    workers = ipc_start_stress(cores)
+    time.sleep(IPC_WARMUP_SECS)
+    try:
+        for prim in prims:
+            cell[f"rtt_{prim}"] = ipc_lat_dist(
+                ipc_run_script(ipc_rtt_script(prim, rounds)))
+        if fanout:
+            cell["fanout"] = ipc_lat_dist(
+                ipc_run_script(ipc_fanout_script(max(1, rounds // 4), cores)))
+    finally:
+        ipc_stop_stress(workers)
+    return cell

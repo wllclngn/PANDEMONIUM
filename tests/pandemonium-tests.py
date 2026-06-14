@@ -35,13 +35,14 @@ from pandemonium_common import (
     set_cpu_online, restrict_cpus, restore_all_cpus, CpuGuard,
     get_possible_cpus, get_online_cpus, compute_core_counts,
     mean_stdev, percentile,
-    find_trace_pipe,
+    montauk_trace, montauk_available,
+    measure_ipc_cell, IPC_DEFAULT_ROUNDS, IPC_RTT_PRIMS,
 )
 
 
 # CONFIGURATION
 
-DEFAULT_EXTERNALS = ["scx_bpfland", "scx_cake"]
+DEFAULT_EXTERNALS = []
 
 
 # DMESG MONITORING
@@ -143,164 +144,7 @@ class DmesgMonitor:
         log_info(f"dmesg: {len(new_lines)} messages saved to {dmesg_path}")
 
 
-# TRACE CAPTURE
-
-class TraceCapture:
-    """Background thread reading trace_pipe, filtering for PAND: lines."""
-
-    def __init__(self, path: Path):
-        self.path = path
-        self.proc = None
-        self.outfile = None
-        self.count = 0
-        self.error = None
-
-    def start(self) -> bool:
-        pipe = find_trace_pipe()
-        if not pipe.exists():
-            log_info("tracefs not found, attempting mounts...")
-            subprocess.run(
-                ["mount", "-t", "tracefs", "none", "/sys/kernel/tracing"],
-                capture_output=True, text=True,
-            )
-            subprocess.run(
-                ["mount", "-t", "debugfs", "none", "/sys/kernel/debug"],
-                capture_output=True, text=True,
-            )
-            pipe = find_trace_pipe()
-            if not pipe.exists():
-                self.error = "trace_pipe not found at any known path"
-                log_error(self.error)
-                return False
-            log_info(f"Found trace_pipe at {pipe}")
-
-        try:
-            fd = os.open(str(pipe), os.O_RDONLY | os.O_NONBLOCK)
-            os.close(fd)
-        except OSError as e:
-            self.error = f"trace_pipe not readable: {e}"
-            log_error(self.error)
-            return False
-
-        tracedir = pipe.parent
-
-        tracing_on = tracedir / "tracing_on"
-        try:
-            val = tracing_on.read_text().strip()
-            if val != "1":
-                tracing_on.write_text("1")
-                log_info("tracing_on set to 1")
-        except (PermissionError, OSError) as e:
-            log_warn(f"could not enable tracing_on: {e}")
-
-        buf_size = tracedir / "buffer_size_kb"
-        try:
-            buf_size.write_text("16384")
-        except (PermissionError, OSError) as e:
-            log_warn(f"could not set buffer_size_kb: {e}")
-
-        trace_file = tracedir / "trace"
-        try:
-            trace_file.write_text("")
-        except (PermissionError, OSError):
-            pass
-
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.outfile = open(self.path, "w")
-        self.proc = subprocess.Popen(
-            ["cat", str(pipe)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        self._thread = threading.Thread(target=self._reader, daemon=True)
-        self._thread.start()
-        time.sleep(0.3)
-        if self.proc.poll() is not None:
-            err = self.proc.stderr.read()
-            self.error = f"trace_pipe reader exited immediately: {err.strip()}"
-            log_error(self.error)
-            return False
-        log_info(f"Trace capture started -> {self.path}")
-        return True
-
-    def _reader(self):
-        try:
-            for line in self.proc.stdout:
-                if "PAND:" in line:
-                    self.outfile.write(line)
-                    self.outfile.flush()
-                    self.count += 1
-        except (ValueError, OSError):
-            pass
-
-    def stop(self):
-        if self.proc:
-            self.proc.kill()
-            self.proc.wait()
-        if self.outfile:
-            self.outfile.close()
-        log_info(f"Trace capture stopped: {self.count} PAND events")
-
-
 # BUILD HELPERS
-
-BPF_SRC = SCRIPT_DIR / "src" / "bpf" / "main.bpf.c"
-
-
-def patch_bpf_trace_filter(target: str | None) -> str | None:
-    """Patch is_sched_task() in main.bpf.c to trace `target` instead of 'pand',
-    AND flip `#define TRACE_SCHED 0` to `1` so the bpf_printk call sites
-    survive the preprocessor. Without the TRACE_SCHED flip, the filter
-    rewrite is meaningless: `#if TRACE_SCHED` strips every PAND emission
-    at compile time and trace_pipe captures nothing.
-    If target is None, patch to `return true;` (capture all scheduling
-    activity). Returns the original content for restoration, or None on
-    error."""
-    original = BPF_SRC.read_text()
-
-    # Match the exact two-line return statement in is_sched_task():
-    #   \treturn p->comm[0] == 'p' && p->comm[1] == 'a' &&
-    #   \t       p->comm[2] == 'n' && p->comm[3] == 'd';
-    old_body = ("\treturn p->comm[0] == 'p' && p->comm[1] == 'a' &&\n"
-                "\t       p->comm[2] == 'n' && p->comm[3] == 'd';")
-
-    if old_body not in original:
-        log_error("Could not find is_sched_task() trace filter in main.bpf.c")
-        return None
-
-    if "#define TRACE_SCHED 0" not in original:
-        log_error("Could not find `#define TRACE_SCHED 0` in main.bpf.c "
-                  "-- bpf_printk emissions will be stripped at compile time")
-        return None
-
-    if target is None:
-        new_body = "\treturn true;"
-        log_label = "all tasks"
-    else:
-        checks = [f"p->comm[{i}] == '{c}'" for i, c in enumerate(target)]
-        if len(checks) <= 2:
-            new_body = "\treturn " + " && ".join(checks) + ";"
-        else:
-            line1 = checks[:2]
-            line2 = checks[2:]
-            new_body = ("\treturn " + " && ".join(line1) + " &&\n"
-                        "\t       " + " && ".join(line2) + ";")
-        log_label = f"'pand' -> '{target}'"
-
-    patched = original.replace(old_body, new_body, 1)
-    patched = patched.replace("#define TRACE_SCHED 0",
-                              "#define TRACE_SCHED 1", 1)
-    BPF_SRC.write_text(patched)
-    log_info(f"Patched trace filter: {log_label} (TRACE_SCHED enabled)")
-    return original
-
-
-def restore_bpf_source(original: str):
-    """Restore main.bpf.c to its original content."""
-    BPF_SRC.write_text(original)
-    log_info("Restored main.bpf.c")
-
 
 def fix_ownership():
     uid = os.environ.get("SUDO_UID", str(os.getuid()))
@@ -1240,120 +1084,42 @@ def measure_deadline(binary: Path, n_cpus: int,
 # IPC ROUND-TRIP MEASUREMENT
 
 def measure_ipc(binary: Path, n_cpus: int,
-                pair_count: int = 0,
-                rounds: int = 10000,
-                warmup_secs: int = 3) -> dict:
-    """Measure IPC round-trip latency via pipe ping-pong under CPU load.
+                rounds: int = IPC_DEFAULT_ROUNDS) -> dict:
+    """Measure IPC round-trip latency with the shared IPC engine.
 
-    Each pair: parent writes 1 byte to pipe, child reads and writes back,
-    parent reads. Measures the scheduling round-trip (two wakeups per round).
+    One CLEAN handoff pair per primitive (pipe/socket/eventfd/sem) looping a
+    fixed round count under CPU saturation. Returns per-primitive
+    {p50,p99,p999,worst,n} in 'cell', with the pipe primitive promoted to the
+    legacy headline keys. Stress uses the shared BINARY in pandemonium_common.
     """
     if n_cpus < 1:
         return {"survived": True, "pairs": 0}
 
-    if pair_count < 1:
-        pair_count = max(2, n_cpus // 2)
+    log_info(f"IPC test: clean per-primitive RTT ({', '.join(IPC_RTT_PRIMS)}), "
+             f"{rounds} rounds each, {n_cpus} stress workers")
 
-    log_info(f"IPC test: {pair_count} pipe pairs, {rounds} rounds each, "
-             f"{n_cpus} stress workers")
+    cell = measure_ipc_cell(n_cpus, rounds)
+    pipe = cell.get("rtt_pipe") or {}
 
-    # Start stress workers on all CPUs
-    workers = []
-    for cpu in range(n_cpus):
-        p = subprocess.Popen(
-            [str(binary), "stress-worker", "--cpu", str(cpu)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        workers.append(p)
-
-    # IPC pair script: forks internally, does pipe ping-pong, prints avg_us
-    pair_script = (
-        "import os,time,sys\n"
-        f"rounds={rounds}\n"
-        "r1,w1=os.pipe()\n"
-        "r2,w2=os.pipe()\n"
-        "pid=os.fork()\n"
-        "if pid==0:\n"
-        " os.close(w1)\n"
-        " os.close(r2)\n"
-        " for _ in range(rounds):\n"
-        "  os.read(r1,1)\n"
-        "  os.write(w2,b'x')\n"
-        " os._exit(0)\n"
-        "os.close(r1)\n"
-        "os.close(w2)\n"
-        "latencies=[]\n"
-        "for _ in range(rounds):\n"
-        " t=time.monotonic()\n"
-        " os.write(w1,b'x')\n"
-        " os.read(r2,1)\n"
-        " latencies.append(time.monotonic()-t)\n"
-        "os.waitpid(pid,0)\n"
-        "for l in latencies:\n"
-        " print(int(l*1e6),flush=True)\n"
-    )
-
-    # Warmup (one pair, discard)
-    log_info(f"Warmup: {warmup_secs}s (1 pair)")
-    warmup_script = pair_script.replace(f"rounds={rounds}",
-                                         f"rounds={min(1000, rounds)}")
-    warmup = subprocess.Popen(
-        [sys.executable, "-c", warmup_script],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    try:
-        warmup.wait(timeout=warmup_secs + 10)
-    except subprocess.TimeoutExpired:
-        warmup.kill()
-        warmup.wait()
-
-    # Measurement: launch all pairs simultaneously
-    log_info(f"Measuring: {pair_count} pairs x {rounds} rounds")
-    pairs = []
-    for _ in range(pair_count):
-        p = subprocess.Popen(
-            [sys.executable, "-c", pair_script],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        )
-        pairs.append(p)
-
-    all_rtt: list[int] = []
-    for p in pairs:
-        try:
-            stdout, _ = p.communicate(timeout=120)
-            for line in stdout.decode(errors="replace").splitlines():
-                line = line.strip()
-                if line and line.isdigit():
-                    all_rtt.append(int(line))
-        except subprocess.TimeoutExpired:
-            p.kill()
-            p.wait()
-
-    # Stop stress workers
-    for w in workers:
-        w.send_signal(signal.SIGINT)
-    for w in workers:
-        try:
-            w.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            w.kill()
-            w.wait()
+    for prim in IPC_RTT_PRIMS:
+        d = cell.get(f"rtt_{prim}")
+        if d:
+            log_info(f"  {prim:<8} p50={d['p50']}us p99={d['p99']}us "
+                     f"p99.9={d['p999']}us worst={d['worst']}us (n={d['n']})")
 
     result = {
         "survived": True,
-        "pairs": pair_count,
+        "pairs": 1,
         "rounds_per_pair": rounds,
-        "total_ops": len(all_rtt),
-        "rtt_median_us": int(percentile(all_rtt, 50)) if all_rtt else 0,
-        "rtt_p99_us": int(percentile(all_rtt, 99)) if all_rtt else 0,
-        "rtt_worst_us": int(max(all_rtt)) if all_rtt else 0,
-        "rtt_hist": histogram([float(r) for r in all_rtt]),
+        # Pipe headline (legacy keys for the report table + summary matrix).
+        "total_ops": pipe.get("n", 0),
+        "rtt_median_us": pipe.get("p50", 0),
+        "rtt_p99_us": pipe.get("p99", 0),
+        "rtt_p999_us": pipe.get("p999", 0),
+        "rtt_worst_us": pipe.get("worst", 0),
+        # Full per-primitive distributions (pipe/socket/eventfd/sem + fanout).
+        "cell": cell,
     }
-
-    log_info(f"IPC: {len(all_rtt)} round-trips, "
-             f"median={result['rtt_median_us']}us, "
-             f"p99={result['rtt_p99_us']}us, "
-             f"worst={result['rtt_worst_us']}us")
     return result
 
 
@@ -1807,25 +1573,28 @@ def write_prometheus(data: dict, stamp: str) -> Path:
                      "Frame scheduling jitter distribution (us)",
                      dl.get("jitter_hist"), labels)
 
-            # IPC metrics
+            # IPC metrics: per-primitive clean RTT (shared IPC engine)
             ipc = sched_data.get("ipc", {})
             if ipc and ipc.get("total_ops", 0) > 0:
                 survived = 1 if ipc.get("survived", True) else 0
                 gauge("pandemonium_bench_ipc_survived",
                       "Whether scheduler survived IPC test (1=OK, 0=CRASHED)",
                       survived, labels)
-                gauge("pandemonium_bench_ipc_rtt_median_us",
-                      "Median pipe round-trip latency",
-                      ipc["rtt_median_us"], labels)
-                gauge("pandemonium_bench_ipc_rtt_p99_us",
-                      "P99 pipe round-trip latency",
-                      ipc["rtt_p99_us"], labels)
-                gauge("pandemonium_bench_ipc_rtt_worst_us",
-                      "Worst-case pipe round-trip latency",
-                      ipc["rtt_worst_us"], labels)
-                hist("pandemonium_bench_ipc_rtt",
-                     "Pipe round-trip latency distribution (us)",
-                     ipc.get("rtt_hist"), labels)
+                for key, d in (ipc.get("cell") or {}).items():
+                    if not d:
+                        continue
+                    prim = key[4:] if key.startswith("rtt_") else key
+                    pl = dict(labels, primitive=prim)
+                    gauge("pandemonium_bench_ipc_rtt_p50_us",
+                          "Median IPC round-trip latency (us)", d["p50"], pl)
+                    gauge("pandemonium_bench_ipc_rtt_p99_us",
+                          "P99 IPC round-trip latency (us)", d["p99"], pl)
+                    gauge("pandemonium_bench_ipc_rtt_p999_us",
+                          "P99.9 IPC round-trip latency (us)", d["p999"], pl)
+                    gauge("pandemonium_bench_ipc_rtt_worst_us",
+                          "Worst IPC round-trip latency (us)", d["worst"], pl)
+                    gauge("pandemonium_bench_ipc_rtt_samples",
+                          "IPC round-trip samples", d["n"], pl)
 
             # Launch metrics
             lnch = sched_data.get("launch", {})
@@ -2346,21 +2115,26 @@ def format_report(data: dict) -> str:
             for s in schedulers.values())
         if has_ipc:
             lines.append("")
-            lines.append(f"{'SCHEDULER':<28} {'STATUS':>8} "
-                        f"{'PAIRS':>8} {'MEDIAN':>10} "
-                        f"{'P99':>10} {'WORST':>10}")
+            lines.append(f"{'SCHEDULER':<28} {'STATUS':>8} {'PRIM':>8} "
+                        f"{'P50':>9} {'P99':>9} {'P99.9':>9} {'WORST':>9}")
             for sched_name, sched_data in schedulers.items():
                 ipc = sched_data.get("ipc", {})
                 if not ipc or ipc.get("total_ops", 0) == 0:
                     continue
                 status = "OK" if ipc.get("survived", True) else "CRASHED"
-                pairs = str(ipc.get("pairs", 0))
-                median = f"{ipc['rtt_median_us']}us"
-                p99 = f"{ipc['rtt_p99_us']}us"
-                worst = f"{ipc['rtt_worst_us']}us"
-                lines.append(f"{sched_name:<28} {status:>8} "
-                             f"{pairs:>8} {median:>10} "
-                             f"{p99:>10} {worst:>10}")
+                cell = ipc.get("cell", {})
+                first = True
+                for prim in ("pipe", "socket", "eventfd", "sem", "fanout"):
+                    key = prim if prim == "fanout" else f"rtt_{prim}"
+                    d = cell.get(key)
+                    if not d:
+                        continue
+                    nm = sched_name if first else ""
+                    st = status if first else ""
+                    first = False
+                    lines.append(f"{nm:<28} {st:>8} {prim:>8} "
+                                 f"{str(d['p50'])+'us':>9} {str(d['p99'])+'us':>9} "
+                                 f"{str(d['p999'])+'us':>9} {str(d['worst'])+'us':>9}")
 
         # Launch table
         has_launch = any(
@@ -2667,7 +2441,7 @@ def format_report(data: dict) -> str:
             .get("total_ops", 0) > 0
             for c in sorted_cores for s in all_schedulers)
         if has_any_ipc:
-            lines.append("IPC ROUND-TRIP P99 (us)")
+            lines.append("IPC PIPE RTT P99 (us)")
             header = f"{'SCHEDULER':<28}"
             for c in sorted_cores:
                 header += f" {c + 'C':>8}"
@@ -3504,16 +3278,6 @@ def cmd_bench_scale(args) -> int:
 
     dmesg = DmesgMonitor()
 
-    # Trace capture (optional)
-    trace = None
-    trace_path = None
-    if getattr(args, "trace", False):
-        stamp_early = datetime.now().strftime("%Y%m%d-%H%M%S")
-        trace_path = LOG_DIR / f"trace-{stamp_early}.log"
-        trace = TraceCapture(trace_path)
-        if not trace.start():
-            log_warn("trace capture unavailable, continuing without")
-            trace = None
 
     nuke_stale_build()
 
@@ -3814,18 +3578,6 @@ def cmd_bench_scale(args) -> int:
 
     # Dmesg
     dmesg.save(stamp)
-
-    # Trace teardown
-    if trace is not None:
-        trace.stop()
-        log_info(f"Trace log: {trace_path}")
-        if trace_path and trace_path.exists():
-            lines = trace_path.read_text().splitlines()
-            if lines:
-                tail = lines[-20:]
-                log_info(f"Last {len(tail)} trace events:")
-                for line in tail:
-                    log_info(f"  {line.rstrip()}")
 
     # Restart PANDEMONIUM service if it was running
     ret = subprocess.run(["systemctl", "is-enabled", "pandemonium"],
@@ -4989,414 +4741,90 @@ def _extract_panic_context(stderr_text: str, stdout_text: str) -> list[str]:
     return out[:40]
 
 
-def _trace_parse(trace_path: Path) -> dict:
-    """Parse a trace log into structured event data."""
-    events = []       # (timestamp_s, event_type, raw_line)
-    type_counts = {}  # event_type -> count
-
-    if not trace_path.exists():
-        return {"events": events, "type_counts": type_counts}
-
-    # trace_pipe: "<task>-<pid> [<cpu>] <flags> <timestamp>: ... PAND: <type> <rest>"
-    ts_pattern = re.compile(r"\s+([\d.]+):\s+.*PAND:\s+(.+)")
-
-    for line in trace_path.read_text().splitlines():
-        m = ts_pattern.search(line)
-        if m:
-            ts = float(m.group(1))
-            msg = m.group(2).strip()
-            # Full event type: "enq tier1 cpu=3" -> "enq tier1"
-            parts = msg.split()
-            if len(parts) >= 2 and parts[0] == "enq":
-                etype = f"{parts[0]} {parts[1]}"
-            else:
-                etype = parts[0] if parts else msg
-            events.append((ts, etype, msg))
-            type_counts[etype] = type_counts.get(etype, 0) + 1
-
-    events.sort(key=lambda e: e[0])
-    return {"events": events, "type_counts": type_counts}
-
-
-def _trace_write_prometheus(version, git, stamp, target, elapsed,
-                          trace_data, latency_samples, crashed,
-                          crash_msg) -> Path:
-    """Write Prometheus .prom for bench-trace."""
-    lines = []
-    emitted = set()
-
-    def gauge(name, help_text, value, labels=None):
-        if name not in emitted:
-            lines.append(f"# HELP {name} {help_text}")
-            lines.append(f"# TYPE {name} gauge")
-            emitted.add(name)
-        if labels:
-            label_str = ",".join(f'{k}="{v}"' for k, v in labels.items())
-            lines.append(f"{name}{{{label_str}}} {value}")
-        else:
-            lines.append(f"{name} {value}")
-
-    # ERRORS and WARNINGS only. Absence of error == nothing to emit.
-    # A clean run produces an empty .prom file. No metadata, no debug
-    # telemetry, no "crashed=0" sentinel.
-
-    # ERROR: scheduler crashed. Emit only when crashed.
-    if crashed:
-        labels = {"version": version, "git_commit": git["commit"]}
-        if crash_msg:
-            labels["reason"] = crash_msg.replace('"', "'")[:200]
-        gauge("pandemonium_trace_crashed",
-              "ERROR: scheduler crashed during bench-trace run",
-              1, labels)
-
-    # WARNING: scheduling gaps past threshold. Emit only if any fired.
-    events = trace_data["events"]
-    gap_thresh = GAP_THRESH_MS / 1000.0
-    gaps = []
-    for i in range(1, len(events)):
-        dt = events[i][0] - events[i - 1][0]
-        if dt > gap_thresh:
-            gaps.append(dt)
-    if gaps:
-        gauge("pandemonium_trace_gaps_total",
-              f"WARNING: scheduling gaps >{GAP_THRESH_MS}ms detected",
-              len(gaps))
-        gauge("pandemonium_trace_gap_max_ms",
-              "WARNING: largest scheduling gap (ms)",
-              f"{max(gaps) * 1000:.1f}")
-        gauge("pandemonium_trace_gap_median_ms",
-              "WARNING: median scheduling gap (ms)",
-              f"{percentile(gaps, 50) * 1000:.1f}")
-
-    # WARNING: worst-case wakeup latency outlier. Only emit if it
-    # exceeds 1ms; sub-ms worst-case is normal scheduler behavior, not
-    # a warning condition.
-    if latency_samples:
-        worst = max(latency_samples)
-        if worst > 1000:
-            gauge("pandemonium_trace_latency_worst_us",
-                  "WARNING: worst-case wakeup latency (us, >1ms outlier)",
-                  f"{worst:.0f}")
-
-    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
-    path = ARCHIVE_DIR / f"trace-{version}-{stamp}.prom"
-    path.write_text("\n".join(lines) + "\n")
-    return path
-
-
 def cmd_bench_trace(args) -> int:
-    """Automated game workload diagnosis.
+    """Montauk scheduling flight-recorder for a target workload.
 
-    Patches BPF trace filter at build time, waits for the game to launch,
-    captures trace + latency data, produces Prometheus + human-readable output.
+    Activates the scheduler, records a montauk eBPF trace over the capture
+    window while the target workload runs, watching dmesg for a scheduler
+    crash. The recording is analyzable with `bench-analyze.py --trace`
+    (intra/cross-CCX migration + cache split) or `--fractal-dir` (timeline).
     """
     subprocess.run(["sudo", "true"])
-    nuke_stale_build()
+    if not montauk_available():
+        log_error("montauk not found")
+        return 1
 
-    target = args.target  # may be None: capture all scheduling activity
+    target = args.target  # may be None
+    pattern = target if target else "pandemonium"
     capture_duration = args.duration or TRACE_CAPTURE_S
-
-    # ---- PHASE 1: PATCH + BUILD + RESTORE ----
-
-    original = patch_bpf_trace_filter(target)
-    if original is None:
-        return 1
-    try:
-        ok = build(force=True)
-    finally:
-        restore_bpf_source(original)
-    if not ok:
-        return 1
 
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-
     ver = get_version()
     git = get_git_info()
     dirty = " (dirty)" if git["dirty"] else ""
-    target_label = target if target else "ALL TASKS"
     log_info(f"bench-trace v{ver} [{git['commit']}{dirty}]  "
-             f"target='{target_label}'  capture={capture_duration}s")
+             f"pattern='{pattern}'  capture={capture_duration}s  (montauk)")
     print()
 
-    # ---- PHASE 2: START SCHEDULER + MONITORING ----
-
     dmesg = DmesgMonitor()
-    trace_path = LOG_DIR / f"trace-{stamp}.log"
     sched_proc = None
-    trace = None
-    probe = None
     crashed = False
-    sched_exited_clean = False
-    game_exited = False
-    total_elapsed = 0
-    latency_samples = []
+    rec_dir = None
 
     try:
         sched_proc = _trace_start_scheduler()
         if sched_proc is None:
             return 1
 
-        trace = TraceCapture(trace_path)
-        if not trace.start():
-            log_warn("Trace capture failed, continuing without trace data")
-
-        # ---- PHASE 3: WAIT FOR GAME (skipped if no target) ----
-
-        if target is not None:
-            already_running = _find_process(target) is not None
-            if already_running:
-                log_info(f"'{target}' already running")
-            else:
-                print()
-                log_info(f">>> Please launch '{target}' now. <<<")
-                log_info(f"Waiting for '{target}' process "
-                         f"(timeout {TRACE_LAUNCH_TIMEOUT}s)...")
-                print()
-
-            pid = _wait_for_process(target, TRACE_LAUNCH_TIMEOUT)
-            if pid is None:
-                log_error(f"'{target}' did not appear "
-                          f"within {TRACE_LAUNCH_TIMEOUT}s")
+        if target is not None and _find_process(target) is None:
+            print()
+            log_info(f">>> Please launch '{target}' now. <<<")
+            log_info(f"Waiting for '{target}' (timeout {TRACE_LAUNCH_TIMEOUT}s)...")
+            if _wait_for_process(target, TRACE_LAUNCH_TIMEOUT) is None:
+                log_error(f"'{target}' did not appear within {TRACE_LAUNCH_TIMEOUT}s")
                 return 1
-            log_info(f"'{target}' detected (PID {pid})")
-        else:
-            log_info("No target -- capturing all activity. "
-                     "Start your workload now; Ctrl+C to stop "
-                     "(or wait for crash auto-detect).")
+            log_info(f"'{target}' detected")
 
-        # ---- PHASE 4: CAPTURE (STARTS IMMEDIATELY) ----
-
-        log_info(f"CAPTURING: {capture_duration}s with latency probe")
-        probe = _LatencyProbe(capture_duration)
-        probe.start()
-
-        t0 = time.monotonic()
-        while time.monotonic() - t0 < capture_duration:
-            time.sleep(2)
-            elapsed = time.monotonic() - t0
-
-            if dmesg.check():
-                log_error(f"SCHEDULER CRASH at {elapsed:.0f}s: "
-                          f"{dmesg.crash_msg}")
-                crashed = True
-                break
-
-            if sched_proc.poll() is not None:
-                # Distinguish kernel-watchdog crash (already caught by
-                # dmesg.check above) from a clean scheduler exit. Re-poll
-                # dmesg first so the disable_msg is captured.
-                dmesg.check()
-                if dmesg.crashed:
-                    log_error(f"SCHEDULER CRASH at {elapsed:.0f}s: "
-                              f"{dmesg.crash_msg}")
+        with montauk_trace(pattern, f"trace-{pattern}", stamp) as rec:
+            rec_dir = rec.dir
+            log_info(f"CAPTURING: {capture_duration}s -> {rec.dir} "
+                     "(run your workload now; Ctrl+C to stop early)")
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < capture_duration:
+                time.sleep(2)
+                elapsed = time.monotonic() - t0
+                if dmesg.check():
+                    log_error(f"SCHEDULER CRASH at {elapsed:.0f}s: {dmesg.crash_msg}")
                     crashed = True
-                else:
-                    log_warn(f"Scheduler exited cleanly at {elapsed:.0f}s "
+                    break
+                if sched_proc.poll() is not None:
+                    log_warn(f"Scheduler exited at {elapsed:.0f}s "
                              f"(code {sched_proc.returncode})")
-                    sched_exited_clean = True
-                break
-
-            if target is not None and _find_process(target) is None:
-                log_warn(f"'{target}' exited at {elapsed:.0f}s")
-                game_exited = True
-                break
-
-            log_info(f"  [{elapsed:.0f}s] events={trace.count}")
-
-        total_elapsed = time.monotonic() - t0
-
+                    break
+                if target is not None and _find_process(target) is None:
+                    log_warn(f"'{target}' exited at {elapsed:.0f}s")
+                    break
+                log_info(f"  [{elapsed:.0f}s] recording...")
     except KeyboardInterrupt:
         log_info("Interrupted by user")
     finally:
-        # ---- CLEANUP (ALWAYS RUNS) ----
-
         log_info("Stopping...")
-
-        if probe and probe.proc and probe.proc.poll() is None:
-            probe.proc.kill()
-        if probe:
-            latency_samples = probe.collect()
-
-        if trace:
-            trace.stop()
-        # Drain scheduler stdout/stderr BEFORE stopping so panic messages
-        # written immediately before SIGABRT are captured. The pipes lose
-        # earlier data when full, but the final flush before exit lands
-        # in the buffer.
-        sched_stderr_tail = ""
-        sched_stdout_tail = ""
-        if sched_proc is not None:
-            try:
-                if sched_proc.stderr:
-                    err_text = sched_proc.stderr.read() or ""
-                    sched_stderr_tail = err_text[-4000:] if err_text else ""
-                if sched_proc.stdout:
-                    out_text = sched_proc.stdout.read() or ""
-                    sched_stdout_tail = out_text[-4000:] if out_text else ""
-            except (ValueError, OSError):
-                pass
         _trace_stop_scheduler(sched_proc)
-
         if target is not None and _find_process(target):
             log_info(f"Killing '{target}'")
             _kill_process(target)
-
-        # ---- REPORT (ALWAYS RUNS) ----
-
-        print()
-        trace_data = _trace_parse(trace_path)
-        events = trace_data["events"]
-        type_counts = trace_data["type_counts"]
-
-        report_lines = []
-        report_lines.append(f"bench-trace v{ver} [{git['commit']}{dirty}]")
-        if crashed:
-            report_lines.append(
-                f"SCHEDULER CRASHED at {total_elapsed:.1f}s")
-            if dmesg.crash_msg:
-                report_lines.append(f"  dmesg: {dmesg.crash_msg}")
-        elif sched_exited_clean:
-            rc = sched_proc.returncode if sched_proc else None
-            sig_label = ""
-            if rc is not None and rc < 0:
-                # Negative returncode == killed by signal abs(rc)
-                sig_num = -rc
-                sig_name = {6: "SIGABRT", 9: "SIGKILL", 15: "SIGTERM",
-                            11: "SIGSEGV", 4: "SIGILL", 8: "SIGFPE"}.get(
-                                sig_num, f"signal {sig_num}")
-                sig_label = f" -- killed by {sig_name}"
-            report_lines.append(
-                f"SCHEDULER EXITED at {total_elapsed:.1f}s "
-                f"(rc={rc}{sig_label}, no kernel crash markers)")
-            if dmesg.disable_msg:
-                report_lines.append(f"  dmesg: {dmesg.disable_msg}")
-            # Surface panic / abort context from scheduler stderr.
-            panic_lines = _extract_panic_context(sched_stderr_tail,
-                                                 sched_stdout_tail)
-            if panic_lines:
-                report_lines.append("  scheduler stderr/stdout (panic context):")
-                for line in panic_lines:
-                    report_lines.append(f"    {line}")
-            elif sched_stderr_tail.strip() or sched_stdout_tail.strip():
-                report_lines.append("  scheduler stderr (last 20 lines):")
-                tail = (sched_stderr_tail or sched_stdout_tail).strip().splitlines()
-                for line in tail[-20:]:
-                    report_lines.append(f"    {line}")
-        elif game_exited:
-            report_lines.append(f"GAME EXITED at {total_elapsed:.1f}s")
-        else:
-            report_lines.append(
-                f"Completed: {total_elapsed:.1f}s capture")
-            if dmesg.disable_msg:
-                report_lines.append(f"  dmesg disable note: {dmesg.disable_msg}")
-        report_lines.append("")
-
-        report_lines.append(f"Trace events: {len(events)}")
-        for etype in sorted(type_counts, key=type_counts.get,
-                            reverse=True):
-            report_lines.append(
-                f"  {etype:30s} {type_counts[etype]:>8d}")
-        report_lines.append("")
-
-        if len(events) >= 2:
-            t_start = events[0][0]
-            t_end = events[-1][0]
-            duration_s = t_end - t_start
-            if duration_s > 0:
-                buckets = {}
-                for ts, _, _ in events:
-                    sec = int(ts - t_start)
-                    buckets[sec] = buckets.get(sec, 0) + 1
-                rates = list(buckets.values())
-                report_lines.append(
-                    f"Event rate: avg={len(events)/duration_s:.1f}/s  "
-                    f"min={min(rates)}/s  max={max(rates)}/s  "
-                    f"over {duration_s:.1f}s")
-                total_secs = int(duration_s) + 1
-                dead = total_secs - len(buckets)
-                if dead > 0:
-                    report_lines.append(
-                        f"Dead seconds (0 events): {dead}/{total_secs}")
-                report_lines.append("")
-
-        gap_thresh = GAP_THRESH_MS / 1000.0
-        gaps = []
-        if len(events) >= 2:
-            t_start = events[0][0]
-            for i in range(1, len(events)):
-                dt = events[i][0] - events[i - 1][0]
-                if dt > gap_thresh:
-                    gaps.append((events[i - 1][0] - t_start,
-                                 events[i][0] - t_start, dt))
-
-        if gaps:
-            report_lines.append(
-                f"GAPS (>{GAP_THRESH_MS}ms): {len(gaps)} detected")
-            for start, end, dt in gaps[:30]:
-                report_lines.append(
-                    f"  {start:8.3f}s .. {end:8.3f}s  "
-                    f"gap={dt*1000:.0f}ms")
-            if len(gaps) > 30:
-                report_lines.append(
-                    f"  ... and {len(gaps) - 30} more")
-        else:
-            report_lines.append(
-                f"No gaps >{GAP_THRESH_MS}ms detected.")
-        report_lines.append("")
-
-        if latency_samples:
-            p50 = percentile(latency_samples, 50)
-            p99 = percentile(latency_samples, 99)
-            worst = max(latency_samples)
-            report_lines.append(
-                f"Wakeup latency: n={len(latency_samples)}  "
-                f"med={p50:.0f}us  P99={p99:.0f}us  "
-                f"worst={worst:.0f}us")
-        else:
-            report_lines.append(
-                "Wakeup latency: no samples collected")
-        report_lines.append("")
-
-        for line in report_lines:
-            log_info(line)
-
-        report_path = LOG_DIR / f"bench-trace-{stamp}.log"
-        report_path.write_text("\n".join(report_lines) + "\n")
-        log_info(f"Report: {report_path}")
-        log_info(f"Raw trace: {trace_path}")
-
-        prom_path = _trace_write_prometheus(
-            ver, git, stamp, target, total_elapsed,
-            trace_data, latency_samples, crashed,
-            dmesg.crash_msg if crashed else "")
-        log_info(f"Prometheus: {prom_path}")
-
         dmesg.save(stamp)
 
-        if crashed:
-            status = "CRASH"
-        elif sched_exited_clean:
-            status = "SCHEDULER EXITED CLEANLY"
-        elif game_exited:
-            status = "GAME EXITED"
-        else:
-            status = "PASS"
-        print()
-        log_info(f"RESULT: {status}")
+    print()
+    if crashed:
+        log_error(f"scheduler crashed -- partial recording: {rec_dir}")
+        return 1
+    log_info(f"montauk recording: {rec_dir}")
+    log_info(f"  migration/cache split: bench-analyze.py --trace --trace-dir '{rec_dir}'")
+    log_info(f"  timeline (Hurst/fractal): bench-analyze.py --fractal-dir '{rec_dir}'")
+    return 0
 
-        fix_ownership()
-
-    return 1 if crashed else 0
-
-
-# MAIN
-
-# SCX CI COMPATIBILITY TEST
-
-# FAILURE PATTERNS FROM scx .github/include/scripts/test_sched
-# Scheduler output is scanned for these (case-insensitive).
-# Known false positives (Spectre, RETBleed) are excluded.
 SCX_CI_FAIL_PATTERNS = ["BUG:", "WARNING:"]
 SCX_CI_FAIL_ICASE = ["error", "stall", "timeout"]
 SCX_CI_FALSE_POSITIVES = [
@@ -5406,7 +4834,6 @@ SCX_CI_FALSE_POSITIVES = [
     "retbleed",
     "mitigation",
 ]
-
 
 def _scx_ci_check_output(text: str) -> list[str]:
     """Scan scheduler output for scx CI failure patterns.
@@ -5822,8 +5249,6 @@ def main() -> int:
     bench.add_argument("--launch", action="store_true",
                        help="Launch-only mode: run only fork+exec latency "
                             "test under load")
-    bench.add_argument("--trace", action="store_true",
-                       help="Enable bpf_printk trace capture during benchmark")
     bench.add_argument("--pandemonium-only", action="store_true",
                        help="Skip EEVDF and external schedulers, run only "
                             "PANDEMONIUM (BPF) and PANDEMONIUM (ADAPTIVE)")
@@ -5862,7 +5287,7 @@ def main() -> int:
                                  "(default: auto 2,4,8,...,max)")
 
     trace_bench = sub.add_parser("bench-trace",
-                                help="BPF trace capture for an external workload")
+                                help="montauk trace capture for an external workload")
     trace_bench.add_argument("--target", type=str, default=None,
                            help="Process comm-prefix to trace; if omitted, "
                                 "capture all scheduling activity (Ctrl+C "

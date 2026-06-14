@@ -30,6 +30,7 @@ from pandemonium_common import (
     log_info, log_warn, log_error,
     is_scx_active, scx_scheduler_name,
     wait_for_deactivation,
+    montauk_trace, montauk_available, MONTAUK_LOG_INTERVAL_MS,
 )
 
 sys.path.insert(0, str(Path(__file__).parent.resolve()))
@@ -243,39 +244,13 @@ def write_report(version, git, stamp, ncpus, all_results):
 
 
 # ---- montauk eBPF trace capture (--trace) ----
-# Instead of the timing comparison, record a per-thread dispatch flight-recording
-# of the storm under montauk. montauk comes up first (incl. a quiet idle baseline)
-# so the storm onset and first-bit transient are captured, not missed.
+# Record a per-thread dispatch flight-recording of the storm under montauk (the
+# shared MontaukTrace in pandemonium_common). montauk comes up first (incl. a
+# quiet idle baseline) so the storm onset is captured, not missed.
 
-MONTAUK = "/usr/local/bin/montauk"
 TRACE_PATTERN = "perf"            # perf bench tree; children/threads auto-tracked
-TRACE_LOG_INTERVAL_MS = 100       # fine cadence so the first-bit transient shows
-MONTAUK_ATTACH_TIMEOUT = 10.0
 BASELINE_SECONDS = 3.0            # quiet idle recorded before the storm, for contrast
 LOAD_SAFETY_TIMEOUT = 180.0       # hard cap so a wedged scheduler can't hang the run
-
-
-def _wait_for_montauk_log(log_dir, timeout):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if any(log_dir.glob("montauk_*.prom")):
-            return True
-        time.sleep(0.2)
-    return False
-
-
-def _stop_montauk(mont):
-    # Stop the way Ctrl+C would (SIGINT, montauk's clean shutdown), escalating
-    # only if it ignores us. No manual interrupt required.
-    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGKILL):
-        if mont.poll() is not None:
-            return
-        mont.send_signal(sig)
-        try:
-            mont.wait(timeout=8)
-            return
-        except subprocess.TimeoutExpired:
-            continue
 
 
 def _run_load_traced(timeout):
@@ -294,10 +269,6 @@ def _run_load_traced(timeout):
 
 def trace_capture(sched_name, cmd, stamp, duration):
     safe = sched_name.replace(" ", "-").replace("(", "").replace(")", "")
-    montauk_log = LOG_DIR / f"montauk-fork-thread-{safe}-{stamp}"
-    montauk_log.mkdir(parents=True, exist_ok=True)
-    montauk_out = LOG_DIR / f"montauk-fork-thread-{safe}-{stamp}.stdout"
-
     guard = None
     if cmd is not None:
         log_info(f"[{sched_name}] activating scheduler...")
@@ -306,45 +277,27 @@ def trace_capture(sched_name, cmd, stamp, duration):
             log_error(f"[{sched_name}] failed to activate, skipping")
             return None
 
-    log_info(f"[{sched_name}] starting montauk trace -> {montauk_log}")
-    with open(montauk_out, "w") as out:
-        mont = subprocess.Popen(
-            [MONTAUK, "--trace", TRACE_PATTERN, "--log", str(montauk_log),
-             "--log-interval-ms", str(TRACE_LOG_INTERVAL_MS)],
-            stdout=out, stderr=subprocess.STDOUT)
+    rec_dir = None
     try:
-        if not _wait_for_montauk_log(montauk_log, MONTAUK_ATTACH_TIMEOUT):
-            log_warn(f"[{sched_name}] montauk slow to start (see {montauk_out})")
-        log_info(f"[{sched_name}] recording idle baseline for {BASELINE_SECONDS:.0f}s...")
-        time.sleep(BASELINE_SECONDS)
-        load_timeout = duration if duration > 0 else LOAD_SAFETY_TIMEOUT
-        log_info(f"[{sched_name}] running storm (montauk recording, window {load_timeout:.0f}s)...")
-        elapsed = _run_load_traced(load_timeout)
-        if elapsed is not None:
-            log_info(f"[{sched_name}] load completed in {elapsed:.3f}s")
-        else:
-            log_info(f"[{sched_name}] capture window ({load_timeout:.0f}s) elapsed -- load cut")
+        log_info(f"[{sched_name}] starting montauk trace...")
+        with montauk_trace(TRACE_PATTERN, f"fork-thread-{safe}", stamp,
+                           baseline_s=BASELINE_SECONDS) as rec:
+            rec_dir = rec.dir
+            load_timeout = duration if duration > 0 else LOAD_SAFETY_TIMEOUT
+            log_info(f"[{sched_name}] running storm "
+                     f"(montauk recording, window {load_timeout:.0f}s)...")
+            elapsed = _run_load_traced(load_timeout)
+            if elapsed is not None:
+                log_info(f"[{sched_name}] load completed in {elapsed:.3f}s")
+            else:
+                log_info(f"[{sched_name}] capture window "
+                         f"({load_timeout:.0f}s) elapsed -- load cut")
     finally:
-        _stop_montauk(mont)
         if guard is not None:
             stop_and_wait(guard)
 
-    log_info(f"[{sched_name}] recording: {montauk_log}")
-    return montauk_log
-
-
-def _restore_ownership(paths):
-    # We self-elevated to root, so anything montauk wrote lands root-owned.
-    # Hand the recordings (the trace dir + its .stdout) back to the invoking
-    # user so they're viewable without sudo. No-op when not running under sudo.
-    user = os.environ.get("SUDO_USER")
-    if not user or os.geteuid() != 0:
-        return
-    for p in paths:
-        for target in (Path(p), Path(f"{p}.stdout")):
-            if target.exists():
-                subprocess.run(["chown", "-R", f"{user}:", str(target)],
-                               capture_output=True)
+    log_info(f"[{sched_name}] recording: {rec_dir}")
+    return rec_dir
 
 
 def run_trace(args):
@@ -353,7 +306,7 @@ def run_trace(args):
         # + sched_ext load), so re-exec under sudo rather than make the user type
         # it -- matches how every other command elevates its own privileged steps.
         os.execvp("sudo", ["sudo", sys.executable, *sys.argv])
-    if not Path(MONTAUK).exists():
+    if not montauk_available():
         log_error(f"montauk not found at {MONTAUK}")
         return 1
 
@@ -361,7 +314,7 @@ def run_trace(args):
     git = get_git_info()
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     log_info(f"bench-fork-thread --trace v{ver} [{git['commit']}]  "
-             f"trace='{TRACE_PATTERN}'  interval={TRACE_LOG_INTERVAL_MS}ms  "
+             f"trace='{TRACE_PATTERN}'  interval={MONTAUK_LOG_INTERVAL_MS}ms  "
              f"load=perf bench sched messaging -t -g {NUM_GROUPS} -l {NR_LOOPS}")
     print()
 
@@ -386,7 +339,6 @@ def run_trace(args):
     finally:
         if is_scx_active():
             wait_for_deactivation(5.0)
-        _restore_ownership(recs.values())
 
     print()
     log_info("Recordings (inspect montauk_trace_thread_* over montauk_scrape_timestamp_ms):")
