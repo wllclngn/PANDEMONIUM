@@ -27,8 +27,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.resolve()))
 from pandemonium_common import (
     SCRIPT_DIR, TARGET_DIR, LOG_DIR, ARCHIVE_DIR, BINARY, SOURCE_PATTERNS,
-    get_version, get_git_info,
-    log_info, log_warn, log_error, run_cmd,
+    get_version, get_git_info, DmesgMonitor,
+    log, log_info, log_warn, log_error, run_cmd,
     has_root_owned_files, clean_root_files, check_sources_changed, build,
     SCX_OPS, is_scx_active, scx_scheduler_name,
     wait_for_activation, wait_for_deactivation, wait_for_no_scheduler,
@@ -36,112 +36,15 @@ from pandemonium_common import (
     get_possible_cpus, get_online_cpus, compute_core_counts,
     mean_stdev, percentile,
     montauk_trace, montauk_available,
-    measure_ipc_cell, IPC_DEFAULT_ROUNDS, IPC_RTT_PRIMS,
+    measure_ipc_cell, IPC_DEFAULT_ROUNDS, IPC_RTT_PRIMS, IPC_COMM,
+    PrometheusBuilder, table_header, table_row,
+    stall_susceptibility,
 )
 
 
 # CONFIGURATION
 
 DEFAULT_EXTERNALS = []
-
-
-# DMESG MONITORING
-
-class DmesgMonitor:
-    """Active crash detection via dmesg polling.
-
-    Snapshots dmesg at construction, .check() polls for crash patterns,
-    .save() writes new lines to log file with keyword-filtered summary.
-    """
-
-    CRASH_PATTERNS = [
-        "failed to run for",
-        "runnable task stall",
-    ]
-    # Disable lines that indicate a real fault. "(unregistered from user
-    # space)" is a clean userspace shutdown -- not a crash.
-    DISABLE_FAULT_MARKERS = [
-        "(runtime error)",
-        "(timeout)",
-        "errored",
-    ]
-    KEYWORDS = ["sched_ext", "pandemonium", "non-existent DSQ", "zero slice",
-                "panic", "BUG:", "RIP:", "Oops", "Call Trace"]
-
-    def __init__(self):
-        r = subprocess.run(["sudo", "dmesg"], capture_output=True, text=True)
-        self.baseline = len(r.stdout.splitlines()) if r.returncode == 0 else 0
-        self.crashed = False
-        self.crash_msg = ""
-        # Track every sched_ext disable line, even clean ones, for reporting.
-        self.disable_msg = ""
-
-    def _new_lines(self) -> list[str]:
-        r = subprocess.run(["sudo", "dmesg"], capture_output=True, text=True)
-        if r.returncode != 0:
-            return []
-        lines = r.stdout.splitlines()
-        return lines[self.baseline:] if self.baseline < len(lines) else []
-
-    def check(self) -> bool:
-        """Poll for crash patterns. Returns True if a real crash is detected.
-        Records clean shutdown messages in self.disable_msg without flagging
-        as a crash."""
-        for line in self._new_lines():
-            if "sched_ext" in line:
-                log_info(f"  dmesg: {line.strip()}")
-            for pattern in self.CRASH_PATTERNS:
-                if pattern in line:
-                    self.crashed = True
-                    self.crash_msg = line.strip()
-                    return True
-            if "disabled" in line and "sched_ext" in line:
-                self.disable_msg = line.strip()
-                # Only flag as crash for fault-shaped disable reasons.
-                if any(m in line for m in self.DISABLE_FAULT_MARKERS):
-                    self.crashed = True
-                    self.crash_msg = line.strip()
-                    return True
-                # "unregistered from user space" / clean disable: no crash.
-        return False
-
-    def save(self, stamp: str | None = None) -> None:
-        """Save new dmesg lines to log file, print keyword-filtered summary."""
-        new_lines = self._new_lines()
-        if not new_lines:
-            log_info("dmesg: no new kernel messages")
-            return
-
-        if stamp is None:
-            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        dmesg_path = LOG_DIR / f"dmesg-{stamp}.log"
-        dmesg_path.write_text("\n".join(new_lines) + "\n")
-
-        filtered = [l for l in new_lines
-                    if any(kw in l for kw in self.KEYWORDS)]
-
-        if not filtered:
-            log_info(f"dmesg: {len(new_lines)} messages, no scheduler issues")
-            return
-
-        crashes = sum(1 for l in filtered
-                      if "non-existent DSQ" in l or "runtime error" in l)
-        zero_slices = sum(1 for l in filtered if "zero slice" in l)
-        panics = sum(1 for l in filtered
-                     if "panic" in l or "BUG:" in l or "RIP:" in l)
-
-        if panics:
-            log_error(f"dmesg: KERNEL PANIC/BUG -- see {dmesg_path}")
-        if crashes:
-            log_warn(f"dmesg: {crashes} scheduler crash(es)")
-        if zero_slices:
-            log_warn(f"dmesg: {zero_slices} zero-slice warning(s)")
-
-        for line in filtered:
-            log_info(f"  {line.strip()}")
-
-        log_info(f"dmesg: {len(new_lines)} messages saved to {dmesg_path}")
 
 
 # BUILD HELPERS
@@ -347,11 +250,102 @@ def stop_and_wait(guard: SchedulerProcess | None) -> str:
     return stdout
 
 
+# GENERIC MONTAUK TRACE DRIVER -- the single body behind every `bench-* --trace`.
+# Each bench supplies its comm `pattern`, a `label`, and a `body_fn(rec_dir)` that
+# runs its workload; this owns the activate -> montauk --trace -> deactivate
+# lifecycle so no bench re-implements it.
+_XDOM_PATHS = ["sel_tight", "sel_sync", "sel_normal", "sel_dfl",
+               "enq_t1", "enq_t2", "steal", "step5"]
+
+
+def _write_cross_domain_marker(guard, rec_dir):
+    """Producer marker (mirrors bench-enduser's write_stability_markers): after a
+    traced PANDEMONIUM run stops, parse its shutdown [KNOBS] line for the per-path
+    cross-CCX attribution and write it into the recording dir. montauk_analyze
+    --digest surfaces it as a CROSS-CCX PLACEMENT block, so a multi-CCX user can
+    tell SEL_DFL (topology-blind fallback) from STEAL/STEP5 (dispatch-side) in one
+    read instead of only seeing montauk's trace-derived scatter percentage. No-op
+    for EEVDF / external schedulers (no [KNOBS] line)."""
+    if guard is None or rec_dir is None:
+        return
+    try:
+        knobs = parse_knobs_line(guard.read_output())
+    except Exception:
+        return
+    if not any(f"cross_domain_{p}" in knobs for p in _XDOM_PATHS):
+        return
+    lines = []
+    if "cross_domain_scatter_pct" in knobs:
+        lines.append(f"montauk_cross_domain_scatter_pct {knobs['cross_domain_scatter_pct']}")
+    for p in _XDOM_PATHS:
+        k = f"cross_domain_{p}"
+        if k in knobs:
+            lines.append(f'montauk_cross_domain_path{{path="{p}"}} {knobs[k]}')
+    try:
+        (Path(rec_dir) / "cross_domain.prom").write_text("\n".join(lines) + "\n")
+    except OSError:
+        pass
+
+
+def trace_workload(sched_name, activate_cmd, pattern, label, stamp, body_fn, *,
+                   baseline_s=0.0, events=False, pin_cpu=None,
+                   trace_activation=False):
+    """Record `montauk --trace pattern` around a scheduler workload.
+
+    Default: activate `sched_name` via start_and_wait(activate_cmd), record while
+    body_fn(rec_dir) runs, then stop_and_wait. Returns (rec_dir, body_result), or
+    (None, None) if activation failed (nothing to trace).
+
+    trace_activation=True: montauk records FIRST (pattern should match the
+    SCHEDULER comm), then activation is attempted inside the window -- so a FAILED
+    activation lands in the recording instead of vanishing. body_fn runs only if
+    activation took. Returns (rec_dir, body_result) on success, (rec_dir, None) on
+    activation failure (the failure IS the capture).
+
+    The caller owns the workload; this owns montauk and the scheduler lifecycle.
+    """
+    safe = sched_name.replace(" ", "-").replace("(", "").replace(")", "")
+    rlabel = f"{label}-{safe}"
+
+    if trace_activation:
+        with montauk_trace(pattern, rlabel, stamp, baseline_s=baseline_s,
+                           events=events, pin_cpu=pin_cpu) as rec:
+            guard = start_and_wait(activate_cmd, sched_name) if activate_cmd else None
+            if activate_cmd is not None and guard is None:
+                log_error(f"[{sched_name}] failed to activate "
+                          f"-- captured in {rec.dir}")
+                return rec.dir, None
+            try:
+                return rec.dir, body_fn(rec.dir)
+            finally:
+                if guard is not None:
+                    stop_and_wait(guard)
+                    _write_cross_domain_marker(guard, rec.dir)
+
+    guard = None
+    if activate_cmd is not None:
+        log_info(f"[{sched_name}] activating scheduler...")
+        guard = start_and_wait(activate_cmd, sched_name)
+        if guard is None:
+            log_error(f"[{sched_name}] failed to activate, skipping")
+            return None, None
+    rec_dir = None
+    try:
+        with montauk_trace(pattern, rlabel, stamp, baseline_s=baseline_s,
+                           events=events, pin_cpu=pin_cpu) as rec:
+            rec_dir = rec.dir
+            return rec.dir, body_fn(rec.dir)
+    finally:
+        if guard is not None:
+            stop_and_wait(guard)
+            _write_cross_domain_marker(guard, rec_dir)
+
+
 # MEASUREMENT
 
 # PROMETHEUS HISTOGRAM BUCKETS (us). 1-2-5 ladder per decade, 1us..1s,
-# shared across every us-domain latency distribution so bench-analyze can
-# reconstruct per-cell CDFs from the .prom alone.
+# shared across every us-domain latency distribution so per-cell CDFs can be
+# reconstructed from the .prom alone.
 HIST_BUCKETS_US = [
     1, 2, 5, 10, 20, 50, 100, 200, 500,
     1_000, 2_000, 5_000, 10_000, 20_000, 50_000,
@@ -1380,41 +1374,29 @@ def aggregate_ticks(ticks: list[dict]) -> dict:
 
 def write_prometheus(data: dict, stamp: str) -> Path:
     """Write Prometheus exposition format (.prom) to ~/.cache/pandemonium/."""
-    lines = []
-    emitted_types = set()
+    # Delegate to the shared builder (unified schema). The local gauge()/hist()
+    # wrappers strip the historical `pandemonium_bench_` prefix from each call
+    # site so the family becomes `pandemonium_scale_*` -- every call site below
+    # is preserved unchanged.
+    pb = PrometheusBuilder("scale")
+
+    def _suffix(name: str) -> str:
+        return name.replace("pandemonium_bench_", "", 1)
 
     def gauge(name: str, help_text: str, value, labels: dict | None = None):
-        if name not in emitted_types:
-            lines.append(f"# HELP {name} {help_text}")
-            lines.append(f"# TYPE {name} gauge")
-            emitted_types.add(name)
-        if labels:
-            label_str = ",".join(f'{k}="{v}"' for k, v in labels.items())
-            lines.append(f"{name}{{{label_str}}} {value}")
-        else:
-            lines.append(f"{name} {value}")
+        pb.gauge(_suffix(name), value, help=help_text, labels=labels)
 
     def hist(name: str, help_text: str, h: dict | None, labels: dict):
         if not h or not h.get("buckets"):
             return
-        if name not in emitted_types:
-            lines.append(f"# HELP {name} {help_text}")
-            lines.append(f"# TYPE {name} histogram")
-            emitted_types.add(name)
-        base = ",".join(f'{k}="{v}"' for k, v in labels.items())
-        for le, cumulative in h["buckets"]:
-            lines.append(f'{name}_bucket{{{base},le="{le}"}} {cumulative}')
-        lines.append(f"{name}_sum{{{base}}} {h['sum']}")
-        lines.append(f"{name}_count{{{base}}} {h['count']}")
+        pb.hist(_suffix(name), h["buckets"], h["count"], h["sum"],
+                help=help_text, labels=labels)
 
-    # Metadata
+    # Metadata -- single _info gauge + timestamp via the builder.
     version = data.get("version", "unknown")
-    git_commit = data.get("git_commit", "unknown")
-    git_dirty = "true" if data.get("git_dirty") else "false"
-    gauge("pandemonium_bench_info", "Build and run metadata", 1,
-          {"version": version, "git_commit": git_commit, "git_dirty": git_dirty})
-    gauge("pandemonium_bench_timestamp_seconds", "Benchmark start time",
-          int(datetime.strptime(stamp, "%Y%m%d-%H%M%S").timestamp()))
+    pb.info(ts=int(datetime.strptime(stamp, "%Y%m%d-%H%M%S").timestamp()),
+            version=version, git_commit=data.get("git_commit", "unknown"),
+            git_dirty=data.get("git_dirty", False))
     gauge("pandemonium_bench_iterations", "Number of throughput iterations",
           data.get("iterations", 0))
     gauge("pandemonium_bench_max_cpus", "Maximum CPUs available",
@@ -1701,15 +1683,15 @@ def write_prometheus(data: dict, stamp: str) -> Path:
                 # input) + per-path attribution, per mode/cores. Lets the
                 # scaling report compare scatter between BPF and ADAPTIVE and
                 # confirm which placement path dominates the storm.
-                if "xccx_scatter_pct" in knobs:
-                    gauge("pandemonium_bench_xccx_scatter_pct",
+                if "cross_domain_scatter_pct" in knobs:
+                    gauge("pandemonium_bench_cross_domain_scatter_pct",
                           "Placement-side cross-CCX scatter percent",
-                          knobs["xccx_scatter_pct"], telem_labels)
+                          knobs["cross_domain_scatter_pct"], telem_labels)
                 for xk in ["sel_tight", "sel_sync", "sel_normal", "sel_dfl",
                            "enq_t1", "enq_t2", "steal", "step5"]:
-                    key = f"xccx_{xk}"
+                    key = f"cross_domain_{xk}"
                     if key in knobs:
-                        gauge("pandemonium_bench_xccx_path",
+                        gauge("pandemonium_bench_cross_domain_path",
                               "Cross-CCX landings per placement path",
                               knobs[key],
                               {**telem_labels, "path": xk})
@@ -1732,39 +1714,39 @@ def write_prometheus(data: dict, stamp: str) -> Path:
     ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
     version = data.get("version", "unknown")
     path = ARCHIVE_DIR / f"{version}-{stamp}.prom"
-    path.write_text("\n".join(lines) + "\n")
+    path.write_text(pb.render())
     return path
 
 
 # PROMETHEUS LIVE OUTPUT (BENCH-SYS)
 
 _SYS_TICK_FIELDS = [
-    ("dispatches", "pandemonium_bench_dispatches"),
-    ("idle_pct", "pandemonium_bench_idle_pct"),
-    ("shared", "pandemonium_bench_shared"),
-    ("preempt", "pandemonium_bench_preempt"),
-    ("keep", "pandemonium_bench_keep"),
-    ("kick_hard", "pandemonium_bench_kick_hard"),
-    ("kick_soft", "pandemonium_bench_kick_soft"),
-    ("enq_wake", "pandemonium_bench_enq_wake"),
-    ("enq_requeue", "pandemonium_bench_enq_requeue"),
-    ("wake_avg_us", "pandemonium_bench_wake_us"),
-    ("lat_idle_us", "pandemonium_bench_lat_idle_us"),
-    ("lat_kick_us", "pandemonium_bench_lat_kick_us"),
-    ("p99_us", "pandemonium_bench_p99_us"),
-    ("slice_us", "pandemonium_bench_slice_us"),
-    ("batch_us", "pandemonium_bench_batch_us"),
-    ("io_pct", "pandemonium_bench_io_pct"),
-    ("procdb_total", "pandemonium_bench_procdb_total"),
-    ("procdb_confident", "pandemonium_bench_procdb_confident"),
-    ("procdb_hits", "pandemonium_bench_procdb_total"),
+    ("dispatches", "pandemonium_sys_dispatches"),
+    ("idle_pct", "pandemonium_sys_idle_pct"),
+    ("shared", "pandemonium_sys_shared"),
+    ("preempt", "pandemonium_sys_preempt"),
+    ("keep", "pandemonium_sys_keep"),
+    ("kick_hard", "pandemonium_sys_kick_hard"),
+    ("kick_soft", "pandemonium_sys_kick_soft"),
+    ("enq_wake", "pandemonium_sys_enq_wake"),
+    ("enq_requeue", "pandemonium_sys_enq_requeue"),
+    ("wake_avg_us", "pandemonium_sys_wake_us"),
+    ("lat_idle_us", "pandemonium_sys_lat_idle_us"),
+    ("lat_kick_us", "pandemonium_sys_lat_kick_us"),
+    ("p99_us", "pandemonium_sys_p99_us"),
+    ("slice_us", "pandemonium_sys_slice_us"),
+    ("batch_us", "pandemonium_sys_batch_us"),
+    ("io_pct", "pandemonium_sys_io_pct"),
+    ("procdb_total", "pandemonium_sys_procdb_total"),
+    ("procdb_confident", "pandemonium_sys_procdb_confident"),
+    ("procdb_hits", "pandemonium_sys_procdb_total"),
 ]
 
 _SYS_TICK_TIERED = [
-    ("pandemonium_bench_l2_hit_pct",
+    ("pandemonium_sys_l2_hit_pct",
      [("l2_pct_batch", "batch"), ("l2_pct_interactive", "interactive"),
       ("l2_pct_latcrit", "latcrit")]),
-    ("pandemonium_bench_tier_p99_us",
+    ("pandemonium_sys_tier_p99_us",
      [("tier_p99_batch", "batch"), ("tier_p99_interactive", "interactive"),
       ("tier_p99_latcrit", "latcrit")]),
 ]
@@ -1776,51 +1758,51 @@ def prom_sys_create(path: Path, version: str, git: dict, max_cpus: int):
     commit = git.get("commit", "unknown")
 
     decls = [
-        ("pandemonium_bench_dispatches", "Dispatches per second"),
-        ("pandemonium_bench_idle_pct", "Idle hit percentage"),
-        ("pandemonium_bench_shared", "Shared dispatches"),
-        ("pandemonium_bench_preempt", "Preemptions"),
-        ("pandemonium_bench_keep", "Keep running count"),
-        ("pandemonium_bench_kick_hard", "Hard kick count"),
-        ("pandemonium_bench_kick_soft", "Soft kick count"),
-        ("pandemonium_bench_enq_wake", "Enqueue wakeup count"),
-        ("pandemonium_bench_enq_requeue", "Enqueue requeue count"),
-        ("pandemonium_bench_wake_us", "Mean wakeup latency us"),
-        ("pandemonium_bench_lat_idle_us", "Idle path latency us"),
-        ("pandemonium_bench_lat_kick_us", "Kick path latency us"),
-        ("pandemonium_bench_p99_us", "P99 wakeup latency us"),
-        ("pandemonium_bench_slice_us", "Current time slice us"),
-        ("pandemonium_bench_batch_us", "Current batch slice us"),
-        ("pandemonium_bench_io_pct", "IO sleep percentage"),
-        ("pandemonium_bench_procdb_total", "ProcDb profiles"),
-        ("pandemonium_bench_procdb_confident", "Confident ProcDb profiles"),
-        ("pandemonium_bench_l2_hit_pct", "L2 cache hit rate by tier"),
-        ("pandemonium_bench_tier_p99_us", "Per-tier P99 latency us"),
-        ("pandemonium_bench_knob_slice_ns", "Final knob: time slice ns"),
-        ("pandemonium_bench_knob_batch_ns", "Final knob: batch slice ns"),
-        ("pandemonium_bench_knob_preempt_ns", "Final knob: preempt thresh ns"),
-        ("pandemonium_bench_knob_demotion_ns", "Final knob: demotion thresh ns"),
-        ("pandemonium_bench_knob_lag", "Final knob: lag scale"),
-        ("pandemonium_bench_reflex_events", "Reflex tighten events"),
-        ("pandemonium_bench_tightened", "Graduated relax tighten active"),
-        ("pandemonium_bench_regime_ticks", "Ticks spent in each regime"),
-        ("pandemonium_bench_xccx_scatter_pct", "Placement-side cross-CCX scatter percent"),
-        ("pandemonium_bench_xccx_path", "Cross-CCX landings per placement path"),
-        ("pandemonium_bench_latency_samples", "Latency probe samples"),
-        ("pandemonium_bench_latency_median_us", "Median probe latency us"),
-        ("pandemonium_bench_latency_p99_us", "P99 probe latency us"),
-        ("pandemonium_bench_latency_worst_us", "Worst probe latency us"),
+        ("pandemonium_sys_dispatches", "Dispatches per second"),
+        ("pandemonium_sys_idle_pct", "Idle hit percentage"),
+        ("pandemonium_sys_shared", "Shared dispatches"),
+        ("pandemonium_sys_preempt", "Preemptions"),
+        ("pandemonium_sys_keep", "Keep running count"),
+        ("pandemonium_sys_kick_hard", "Hard kick count"),
+        ("pandemonium_sys_kick_soft", "Soft kick count"),
+        ("pandemonium_sys_enq_wake", "Enqueue wakeup count"),
+        ("pandemonium_sys_enq_requeue", "Enqueue requeue count"),
+        ("pandemonium_sys_wake_us", "Mean wakeup latency us"),
+        ("pandemonium_sys_lat_idle_us", "Idle path latency us"),
+        ("pandemonium_sys_lat_kick_us", "Kick path latency us"),
+        ("pandemonium_sys_p99_us", "P99 wakeup latency us"),
+        ("pandemonium_sys_slice_us", "Current time slice us"),
+        ("pandemonium_sys_batch_us", "Current batch slice us"),
+        ("pandemonium_sys_io_pct", "IO sleep percentage"),
+        ("pandemonium_sys_procdb_total", "ProcDb profiles"),
+        ("pandemonium_sys_procdb_confident", "Confident ProcDb profiles"),
+        ("pandemonium_sys_l2_hit_pct", "L2 cache hit rate by tier"),
+        ("pandemonium_sys_tier_p99_us", "Per-tier P99 latency us"),
+        ("pandemonium_sys_knob_slice_ns", "Final knob: time slice ns"),
+        ("pandemonium_sys_knob_batch_ns", "Final knob: batch slice ns"),
+        ("pandemonium_sys_knob_preempt_ns", "Final knob: preempt thresh ns"),
+        ("pandemonium_sys_knob_demotion_ns", "Final knob: demotion thresh ns"),
+        ("pandemonium_sys_knob_lag", "Final knob: lag scale"),
+        ("pandemonium_sys_reflex_events", "Reflex tighten events"),
+        ("pandemonium_sys_tightened", "Graduated relax tighten active"),
+        ("pandemonium_sys_regime_ticks", "Ticks spent in each regime"),
+        ("pandemonium_sys_cross_domain_scatter_pct", "Placement-side cross-CCX scatter percent"),
+        ("pandemonium_sys_cross_domain_path", "Cross-CCX landings per placement path"),
+        ("pandemonium_sys_latency_samples", "Latency probe samples"),
+        ("pandemonium_sys_latency_median_us", "Median probe latency us"),
+        ("pandemonium_sys_latency_p99_us", "P99 probe latency us"),
+        ("pandemonium_sys_latency_worst_us", "Worst probe latency us"),
     ]
 
     ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
-        f.write("# HELP pandemonium_bench_info Build and run metadata\n")
-        f.write("# TYPE pandemonium_bench_info gauge\n")
-        f.write(f'pandemonium_bench_info{{version="{version}",'
+        f.write("# HELP pandemonium_sys_info Build and run metadata\n")
+        f.write("# TYPE pandemonium_sys_info gauge\n")
+        f.write(f'pandemonium_sys_info{{version="{version}",'
                 f'git_commit="{commit}",git_dirty="{dirty}"}} 1\n')
-        f.write("# HELP pandemonium_bench_max_cpus Maximum CPUs available\n")
-        f.write("# TYPE pandemonium_bench_max_cpus gauge\n")
-        f.write(f"pandemonium_bench_max_cpus {max_cpus}\n")
+        f.write("# HELP pandemonium_sys_max_cpus Maximum CPUs available\n")
+        f.write("# TYPE pandemonium_sys_max_cpus gauge\n")
+        f.write(f"pandemonium_sys_max_cpus {max_cpus}\n")
         for name, help_text in decls:
             f.write(f"# HELP {name} {help_text}\n")
             f.write(f"# TYPE {name} gauge\n")
@@ -1855,11 +1837,11 @@ def prom_sys_append_knobs(path: Path, knobs: dict, label_str: str):
     if not knobs:
         return
     knob_map = [
-        ("slice_ns", "pandemonium_bench_knob_slice_ns"),
-        ("batch_slice_ns", "pandemonium_bench_knob_batch_ns"),
-        ("preempt_thresh_ns", "pandemonium_bench_knob_preempt_ns"),
-        ("cpu_bound_thresh_ns", "pandemonium_bench_knob_demotion_ns"),
-        ("lag_scale", "pandemonium_bench_knob_lag"),
+        ("slice_ns", "pandemonium_sys_knob_slice_ns"),
+        ("batch_slice_ns", "pandemonium_sys_knob_batch_ns"),
+        ("preempt_thresh_ns", "pandemonium_sys_knob_preempt_ns"),
+        ("cpu_bound_thresh_ns", "pandemonium_sys_knob_demotion_ns"),
+        ("lag_scale", "pandemonium_sys_knob_lag"),
     ]
     with open(path, "a") as f:
         f.write("# shutdown knobs\n")
@@ -1867,32 +1849,32 @@ def prom_sys_append_knobs(path: Path, knobs: dict, label_str: str):
             if src in knobs:
                 f.write(f"{prom}{{{label_str}}} {knobs[src]}\n")
         if "reflex" in knobs:
-            f.write(f"pandemonium_bench_reflex_events{{{label_str}}} "
+            f.write(f"pandemonium_sys_reflex_events{{{label_str}}} "
                     f"{knobs['reflex']}\n")
         if "tightened" in knobs:
             val = 1 if knobs["tightened"] else 0
-            f.write(f"pandemonium_bench_tightened{{{label_str}}} {val}\n")
+            f.write(f"pandemonium_sys_tightened{{{label_str}}} {val}\n")
         for rk in ["ticks_light", "ticks_mixed", "ticks_heavy"]:
             if rk in knobs:
                 rname = rk.replace("ticks_", "")
-                f.write(f'pandemonium_bench_regime_ticks{{{label_str},'
+                f.write(f'pandemonium_sys_regime_ticks{{{label_str},'
                         f'regime="{rname}"}} {knobs[rk]}\n')
         for lk in ["l2_hit_batch", "l2_hit_interactive", "l2_hit_latcrit"]:
             if lk in knobs:
                 tier = lk.replace("l2_hit_", "")
-                f.write(f'pandemonium_bench_l2_hit_pct{{{label_str},'
+                f.write(f'pandemonium_sys_l2_hit_pct{{{label_str},'
                         f'tier="{tier}"}} {knobs[lk]}\n')
         # CROSS-CCX SCATTER: placement-side fraction (MWU PATHWAY 6 input) plus
         # the per-path attribution. Surfaced for both BPF and ADAPTIVE so the
         # scatter difference between modes is directly comparable per run.
-        if "xccx_scatter_pct" in knobs:
-            f.write(f"pandemonium_bench_xccx_scatter_pct{{{label_str}}} "
-                    f"{knobs['xccx_scatter_pct']}\n")
+        if "cross_domain_scatter_pct" in knobs:
+            f.write(f"pandemonium_sys_cross_domain_scatter_pct{{{label_str}}} "
+                    f"{knobs['cross_domain_scatter_pct']}\n")
         for xk in ["sel_tight", "sel_sync", "sel_normal", "sel_dfl",
                    "enq_t1", "enq_t2", "steal", "step5"]:
-            key = f"xccx_{xk}"
+            key = f"cross_domain_{xk}"
             if key in knobs:
-                f.write(f'pandemonium_bench_xccx_path{{{label_str},'
+                f.write(f'pandemonium_sys_cross_domain_path{{{label_str},'
                         f'path="{xk}"}} {knobs[key]}\n')
 
 
@@ -1902,13 +1884,13 @@ def prom_sys_append_probe(path: Path, lat: dict, label_str: str):
         return
     with open(path, "a") as f:
         f.write("# latency probe\n")
-        f.write(f"pandemonium_bench_latency_samples{{{label_str}}} "
+        f.write(f"pandemonium_sys_latency_samples{{{label_str}}} "
                 f"{lat['samples']}\n")
-        f.write(f"pandemonium_bench_latency_median_us{{{label_str}}} "
+        f.write(f"pandemonium_sys_latency_median_us{{{label_str}}} "
                 f"{lat['median_us']}\n")
-        f.write(f"pandemonium_bench_latency_p99_us{{{label_str}}} "
+        f.write(f"pandemonium_sys_latency_p99_us{{{label_str}}} "
                 f"{lat['p99_us']}\n")
-        f.write(f"pandemonium_bench_latency_worst_us{{{label_str}}} "
+        f.write(f"pandemonium_sys_latency_worst_us{{{label_str}}} "
                 f"{lat['worst_us']}\n")
 
 
@@ -3022,6 +3004,507 @@ def measure_pcpu_starvation(binary: Path, n_cpus: int,
     }
 
 
+# Every installed production scx scheduler, for the traced field sweep (mirrors
+# bench-fork-thread's --all-scx list). scx_chaos (fault injection) is excluded;
+# scx_layered self-skips without a layer spec.
+SCX_FIELD = [
+    "scx_bpfland", "scx_rusty", "scx_lavd", "scx_flow", "scx_rustland",
+    "scx_p2dq", "scx_tickless", "scx_cosmos", "scx_cake", "scx_flash",
+    "scx_beerland", "scx_layered",
+]
+
+
+def field_arms(n_cpus: int, schedulers: str = "", all_scx: bool = False):
+    """Build the (sched_name, activate_cmd) arms for a traced field run.
+
+    EEVDF is always the neutral baseline arm. The default and --all-scx keep
+    PANDEMONIUM; an explicit --schedulers list runs EXACTLY what it names (plus
+    the EEVDF baseline) -- PANDEMONIUM is in only if the caller named it.
+      no flag        -> EEVDF + PANDEMONIUM
+      --all-scx      -> EEVDF + PANDEMONIUM + every installed external
+      --schedulers L -> EEVDF + each named (PANDEMONIUM only if in L)
+    Uninstalled externals are warned and skipped, never fatal.
+    """
+    # Accept either a comma string ("scx_rusty,scx_lavd") or an already-split
+    # list -- callers thread args.schedulers through getattr/subprocess and a
+    # list slips through; normalize so the .split below never sees a non-str.
+    if isinstance(schedulers, (list, tuple)):
+        schedulers = ",".join(str(s) for s in schedulers)
+    pand = ("PANDEMONIUM", [str(BINARY), "--nr-cpus", str(n_cpus)])
+    arms = [("EEVDF", None)]
+    if all_scx:
+        arms.append(pand)
+        for s in SCX_FIELD:
+            if find_scheduler(s):
+                arms.append((s, [s]))
+            else:
+                log_warn(f"{s} not found, skipping")
+    elif schedulers:
+        for raw in schedulers.split(","):
+            s = raw.strip()
+            if not s:
+                continue
+            low = s.lower()
+            if low in ("pandemonium", "scx_pandemonium"):
+                arms.append(pand)
+            elif low == "eevdf":
+                continue  # already the baseline
+            elif find_scheduler(s):
+                arms.append((s, [s]))
+            else:
+                log_warn(f"{s} not found, skipping")
+    else:
+        arms.append(pand)
+    return arms
+
+
+def trace_pcpu_burst(stamp: str, n_cpus: int, duration: int,
+                     schedulers: str = "", all_scx: bool = False) -> int:
+    """One montauk-traced burst-starvation capture, hard-capped at `duration`s.
+    Saturates every CPU, then detonates fork/exec bursts for the window while
+    montauk records the per-event wake-to-run -- so the worst burst wakeup is in
+    the .events for montauk_analyze --digest. Trace IS the artifact; no
+    probe/baseline/recovery measurement here. Workers run the `pandemonium`
+    binary (stress-worker / burst tasks), so montauk targets comm `pandemonium`.
+    montauk pins a drain core (CPUs are saturated) so it never drops events."""
+    if not montauk_available():
+        log_error("montauk not found -- cannot --trace")
+        return 1
+    drain = max(0, n_cpus - 1)
+    log_info(f"[pcpu-burst] tracing burst-starvation {n_cpus}C for {duration}s "
+             f"(montauk on cpu{drain})")
+
+    def body(rec_dir):
+        end = time.monotonic() + duration
+        workers = [subprocess.Popen(
+                       [str(BINARY), "stress-worker", "--cpu", str(c)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                   for c in range(n_cpus)]
+        try:
+            time.sleep(min(2.0, duration * 0.1))  # let the scheduler classify
+            burst_size = max(n_cpus * 20, 100)
+            while time.monotonic() < end:
+                procs = fire_burst_timed(burst_size, 0.5)
+                collect_burst_times(
+                    procs, timeout=max(1, int(end - time.monotonic())))
+        finally:
+            for w in workers:
+                w.send_signal(signal.SIGINT)
+            for w in workers:
+                try:
+                    w.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    w.kill()
+                    w.wait()
+        return None
+
+    # Arms on the IDENTICAL sustained burst. EEVDF (activate_cmd=None) is the
+    # kernel baseline -- the only way to know whether a deep queueing tail is a
+    # PANDEMONIUM deficiency or just the physics of 20x oversubscription. The
+    # field (default EEVDF+PANDEMONIUM; widened by --schedulers/--all-scx) runs
+    # the same body. The stress-worker/burst tasks are the `pandemonium` binary
+    # under every scheduler, so montauk targets comm `pandemonium` for all arms.
+    arms = field_arms(n_cpus, schedulers, all_scx)
+    traced = 0
+    for sched_name, activate_cmd in arms:
+        rec_dir, _ = trace_workload(sched_name, activate_cmd,
+                                    "pandemonium", f"pcpu-burst-{n_cpus}c", stamp,
+                                    body, events=True, pin_cpu=drain)
+        if rec_dir is None:
+            log_error(f"[pcpu-burst] {sched_name} failed to activate -- skipped")
+            continue
+        log_info(f"[pcpu-burst] {sched_name} montauk recording -> {rec_dir}")
+        traced += 1
+    return 0 if traced else 1
+
+
+def _cpufreq_governor_paths():
+    import glob
+    return sorted(glob.glob(
+        "/sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor"))
+
+
+def _set_governor(gov):
+    """Best-effort: set every CPU's cpufreq governor to `gov`, returning a
+    {path: old} map for restore. scaling_governor is root-write (we run under
+    sudo). If `gov` is not in scaling_available_governors the platform lacks it
+    -- warn and leave governors untouched; the cold cycle still runs, just not at
+    the worst-case ramp. Returns {} when nothing was changed."""
+    paths = _cpufreq_governor_paths()
+    if not paths:
+        log_warn("[cold-wake] no cpufreq governor sysfs -- governor unchanged")
+        return {}
+    try:
+        avail = open(paths[0].replace("scaling_governor",
+                                      "scaling_available_governors")).read().split()
+    except OSError:
+        avail = []
+    if avail and gov not in avail:
+        log_warn(f"[cold-wake] governor '{gov}' unavailable "
+                 f"(have: {' '.join(avail)}) -- governor unchanged")
+        return {}
+    saved = {}
+    for p in paths:
+        try:
+            saved[p] = open(p).read().strip()
+        except OSError:
+            pass
+    script = "; ".join(f"echo {gov} > {p}" for p in paths)
+    r = subprocess.run(["sudo", "sh", "-c", script],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if r.returncode != 0:
+        log_warn("[cold-wake] could not set governor -- continuing as-is")
+        return {}
+    log_info(f"[cold-wake] governor set to {gov} ({len(paths)} CPUs)")
+    return saved
+
+
+def _restore_governor(saved):
+    if not saved:
+        return
+    script = "; ".join(f"echo {old} > {p}" for p, old in saved.items())
+    subprocess.run(["sudo", "sh", "-c", script],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    log_info("[cold-wake] governor restored")
+
+
+def _coldq(vals, f):
+    """f-quantile of a list by nearest-rank (vals need not be sorted)."""
+    if not vals:
+        return 0
+    s = sorted(vals)
+    return s[min(len(s) - 1, int(len(s) * f))]
+
+
+def _bytes_lbl(b):
+    if b >= 1 << 20: return f"{b // (1 << 20)}MB"
+    if b >= 1 << 10: return f"{b // (1 << 10)}KB"
+    return f"{b}B"
+
+
+def _parse_coldwork_sizes(text):
+    """coldwork SIZE / MEM lines -> {"cpu": {iters: d}, "mem": {bytes: d}} where d
+    is {cn:[cold ns], cr:[cold ratio], wn:[warm ns], wr:[warm ratio]}. SIZE is the
+    register CPU burst (frequency ramp); MEM is the pointer-chase (cold caches)."""
+    out = {"cpu": {}, "mem": {}}
+    for ln in text.splitlines():
+        p = ln.split()
+        if len(p) == 8 and p[2] == "COLD" and p[5] == "WARM" and p[0] in ("SIZE", "MEM"):
+            try:
+                key, cn, cr, wn, wr = int(p[1]), int(p[3]), int(p[4]), int(p[6]), int(p[7])
+            except ValueError:
+                continue
+            grp = out["cpu" if p[0] == "SIZE" else "mem"]
+            d = grp.setdefault(key, {"cn": [], "cr": [], "wn": [], "wr": []})
+            d["cn"].append(cn); d["cr"].append(cr); d["wn"].append(wn); d["wr"].append(wr)
+    return out
+
+
+def _parse_coldwork_starve(text):
+    """coldwork STARVE lines -> [{phase, interval_us, samples, mean_ns, worst_ns,
+    over1ms, over10ms}]. Each is a pinned-waker sub-phase; worst_ns is the longest
+    a runnable pinned task waited to be dispatched -- the dispatch-stall signal."""
+    rows = []
+    for ln in text.splitlines():
+        p = ln.split()
+        if len(p) == 14 and p[0] == "STARVE":
+            try:
+                rows.append({
+                    "phase": p[1], "interval_us": int(p[3]), "samples": int(p[5]),
+                    "mean_ns": int(p[7]), "worst_ns": int(p[9]),
+                    "over1ms": int(p[11]), "over10ms": int(p[13]),
+                })
+            except (ValueError, IndexError):
+                continue
+    return rows
+
+
+def trace_coldwake_cycle(stamp, n_cpus, duration, dwell=2,
+                         sizes="100000,500000,1000000,4000000,16000000,50000000",
+                         mem_sizes="32768,262144,2097152,8388608,33554432,134217728",
+                         schedulers="", all_scx=False) -> int:
+    """montauk-traced cold-core ramp capture with VARIED burst sizes. A single
+    fixed quantum averages a fast frequency ramp away -- if the core ramps in the
+    first few ms, a 50ms burst runs mostly warm and the cold start is invisible.
+    But a user feels SHORT bursts (a cursor move, a keypress, a menu open), so this
+    sweeps `sizes` (iteration counts) from sub-millisecond to tens of ms and
+    measures each off a genuinely cold core against a warmed reference. The
+    cold/warm penalty at each size says AT WHAT WORK SIZE a cold core costs the
+    user -- the small end is where a fast ramp shows. aperf/mperf gives the actual
+    delivered frequency per burst (cause beside effect).
+
+    Governor pinned to powersave for the window, restored after. montauk traces
+    comm `coldwork`. EEVDF baseline + PANDEMONIUM by default -- the same sweep runs
+    under every arm, so the per-size penalty is the scheduler comparison."""
+    if not montauk_available():
+        log_error("montauk not found -- cannot --trace")
+        return 1
+    # Build the ramp generator: a deterministic CPU quantum with a distinct comm.
+    # Unique per-run path -- a fixed /tmp/coldwork left root-owned by a prior sudo
+    # run is unwritable by a later non-root gcc ("cannot open output file").
+    src = Path(__file__).resolve().parent / "coldwork.c"
+    cwbin = f"/tmp/coldwork-{stamp}"
+    cc = subprocess.run(["gcc", "-O2", "-march=native", "-pthread",
+                         "-o", cwbin, str(src)],
+                        capture_output=True, text=True)
+    if cc.returncode != 0:
+        log_error(f"[cold-wake] coldwork build failed: {cc.stderr.strip()}")
+        return 1
+    drain = max(0, n_cpus - 1)            # montauk's pinned drain core
+    wake_core = 1 if n_cpus > 2 else 0    # the core we let go cold (not the drain)
+    nsz = len([s for s in sizes.split(",") if s.strip()])
+    nmem = len([s for s in mem_sizes.split(",") if s.strip()])
+    log_info(f"[cold-wake] cold-core sweep on cpu{wake_core}: idle({dwell}s) -> "
+             f"{nsz} CPU burst sizes + {nmem} memory working sets, {duration}s per "
+             f"arm (montauk on cpu{drain})")
+    # Susceptibility profile up front: whether THIS box can even produce the dark
+    # strand. A LOW score is the answer to "my machines never reproduce it."
+    susc_lines, susc_score = stall_susceptibility()
+    for ln in susc_lines:
+        log_info(f"[cold-wake] {ln}" if ln == susc_lines[0] else f"           {ln}")
+    if susc_score < 4:
+        log_warn("[cold-wake] LOW susceptibility -- if no stall appears, the box "
+                 "config (HZ/tickless/cores), not the scheduler, is likely why")
+    saved_gov = _set_governor("powersave")
+
+    def body(rec_dir):
+        # Run under sudo so coldwork can read /dev/cpu/N/msr for the aperf/mperf
+        # ratio (sudo creds were cached by cmd_bench_coldwake's `sudo true`).
+        r = subprocess.run(["sudo", cwbin, str(wake_core), str(int(dwell * 1000)),
+                            sizes, mem_sizes, str(duration)],
+                           capture_output=True, text=True)
+        # Persist the raw SIZE rows into the recording so the per-size ramp is
+        # self-describing and re-analyzable, not just on the terminal.
+        try:
+            (Path(rec_dir) / "coldwork-quanta.txt").write_text(r.stdout)
+        except OSError:
+            pass
+        return _parse_coldwork_sizes(r.stdout)
+
+    try:
+        arms = field_arms(n_cpus, schedulers, all_scx)
+        traced = 0
+        worst = []   # (sched_name, max_penalty_pct, size_ms) for the cross-arm verdict
+        starve_worst = []   # (sched_name, worst_dispatch_ns) -- the stall verdict
+        for sched_name, activate_cmd in arms:
+            rec_dir, by_size = trace_workload(sched_name, activate_cmd,
+                                              "coldwork", f"cold-wake-{n_cpus}c", stamp,
+                                              body, events=True, pin_cpu=drain)
+            if rec_dir is None:
+                log_error(f"[cold-wake] {sched_name} failed to activate -- skipped")
+                continue
+            data = by_size or {"cpu": {}, "mem": {}}
+            # CPU sweep: the frequency ramp (small -- base->boost over a few ms).
+            log_info(f"[cold-wake] {sched_name} CPU sweep -- frequency ramp "
+                     f"(cold burst off idle vs warm):")
+            for it in sorted(data.get("cpu", {})):
+                d = data["cpu"][it]
+                cold = _coldq(d["cn"], 0.5); warm = _coldq(d["wn"], 0.5)
+                cr = _coldq([x for x in d["cr"] if x], 0.5)
+                wr = _coldq([x for x in d["wr"] if x], 0.5)
+                pen = (100.0 * (cold - warm) / warm) if warm else 0.0
+                fq = (f"freq {cr / 1000:.2f}x->{wr / 1000:.2f}x" if (cr or wr) else "")
+                log_info(f"    cpu ~{warm / 1e6:6.2f}ms: cold {cold / 1e6:6.2f}ms "
+                         f"{pen:+4.0f}%  {fq}")
+            # MEMORY sweep: the cold-cache penalty -- the felt one, scaling with the
+            # working set (milliseconds for L3-sized work off a cold core).
+            log_info(f"[cold-wake] {sched_name} MEMORY sweep -- cold caches "
+                     f"(pointer-chase off idle vs warm):")
+            mem_pen, mem_lbl = 0.0, ""
+            for by in sorted(data.get("mem", {})):
+                d = data["mem"][by]
+                cold = _coldq(d["cn"], 0.5); warm = _coldq(d["wn"], 0.5)
+                pen = (100.0 * (cold - warm) / warm) if warm else 0.0
+                mult = (cold / warm) if warm else 1.0
+                log_info(f"    mem {_bytes_lbl(by):>6}: cold {cold / 1e6:8.3f}ms vs "
+                         f"warm {warm / 1e6:8.3f}ms  {mult:.1f}x ({pen:+.0f}%)")
+                if pen > mem_pen:
+                    mem_pen, mem_lbl = pen, _bytes_lbl(by)
+            worst.append((sched_name, mem_pen, mem_lbl))
+
+            # STARVE capture: the dispatch-stall cell on the same arm. A pinned
+            # waker (cannot be stolen) measures how long a runnable task waits to
+            # be dispatched -- IDLE (alone on an idle core) and HOG (behind a
+            # non-yielding hog on the same core). This is the kworker-stall repro
+            # the cold-cache sweep above structurally cannot induce. Its own
+            # montauk capture so wake2run is analyzable apart from the cache wakes.
+            def starve_body(rec_dir):
+                r = subprocess.run(["sudo", cwbin, str(wake_core), "0", "", "",
+                                    str(duration), "starve"],
+                                   capture_output=True, text=True)
+                try:
+                    (Path(rec_dir) / "coldwork-starve.txt").write_text(r.stdout)
+                    (Path(rec_dir) / "machine-profile.txt").write_text(
+                        "\n".join(susc_lines) + "\n")
+                except OSError:
+                    pass
+                return _parse_coldwork_starve(r.stdout)
+
+            srec, srows = trace_workload(sched_name, activate_cmd, "coldwork",
+                                         f"cold-wake-starve-{n_cpus}c", stamp,
+                                         starve_body, events=True, pin_cpu=drain)
+            if srec is not None and srows:
+                log_info(f"[cold-wake] {sched_name} STARVE -- pinned-waker "
+                         f"dispatch latency (worst = longest a runnable pinned "
+                         f"task waited):")
+                arm_worst = 0
+                for sr in srows:
+                    arm_worst = max(arm_worst, sr["worst_ns"])
+                    flag = "  <-- STALL" if sr["worst_ns"] >= 100000000 else ""
+                    log_info(f"    {sr['phase']:>4} @{sr['interval_us'] // 1000:>2}ms wake: "
+                             f"worst {sr['worst_ns'] / 1e6:8.2f}ms  mean "
+                             f"{sr['mean_ns'] / 1e3:6.0f}us  "
+                             f">1ms {sr['over1ms']:>4}  >10ms {sr['over10ms']:>3}{flag}")
+                starve_worst.append((sched_name, arm_worst))
+            traced += 1
+        # Cross-arm verdict on the cold-cache penalty (the felt regime). The
+        # scheduler barely moves cache coldness -- it is a platform cost -- but
+        # report it so a real difference would show.
+        for name, mp, lbl in worst:
+            log_info(f"[cold-wake] {name}: worst cold-cache penalty {mp:+.0f}% "
+                     f"at {lbl} working set")
+        if len(worst) >= 2:
+            best = min(worst, key=lambda t: t[1])
+            log_info(f"[cold-wake] lowest cold-cache penalty: {best[0]} ({best[1]:+.0f}%)")
+        # STARVE verdict: the dispatch-stall signal. A worst dispatch latency in
+        # the hundreds of ms (let alone seconds) is the stall reproducing -- a
+        # runnable pinned task the scheduler left un-dispatched.
+        for name, w in starve_worst:
+            tag = "  STALL REPRODUCED" if w >= 100000000 else ("  elevated" if w >= 10000000 else "")
+            log_info(f"[cold-wake] {name}: worst pinned-waker dispatch latency "
+                     f"{w / 1e6:.1f}ms{tag}")
+        return 0 if traced else 1
+    finally:
+        _restore_governor(saved_gov)
+        subprocess.run(["sudo", "rm", "-f", cwbin], capture_output=True)
+
+
+def cmd_bench_coldwake(args) -> int:
+    """Cold-wake latency vs frequency-at-wake. Trace-only: cycles a pinned core
+    idle->bare-wake under powersave so montauk's COLD-WAKE block can tell a
+    governor / architecture frequency-ramp apart from a scheduler dispatch delay.
+    Mirrors bench-power's idle framing; the montauk trace is the artifact."""
+    if os.geteuid() != 0:
+        # SELF-ELEVATE: cold-wake needs root end-to-end -- montauk eBPF attach,
+        # sched_ext activation, governor write, /dev/cpu/N/msr -- and the trace
+        # dir under /tmp/pandemonium is root-owned from prior runs, so a non-root
+        # mkdir there fails. Re-exec under sudo so `./pandemonium.py bench-coldwake`
+        # works without a sudo prefix, matching bench-enduser's main().
+        os.execvp("sudo", ["sudo", sys.executable, *sys.argv])
+    subprocess.run(["sudo", "true"])
+    # The aperf/mperf frequency read needs /dev/cpu/N/msr (the msr module). Load
+    # it best-effort; coldwork reports freq 0 and the bench notes n/a if absent.
+    subprocess.run(["sudo", "modprobe", "msr"], capture_output=True)
+    nuke_stale_build()
+    if not build():
+        return 1
+    # Clear any registered scheduler before the arms run -- above all the systemd
+    # pandemonium service (back after a reboot). Without this the EEVDF arm traces
+    # under whatever is loaded and the PANDEMONIUM arm wedges on "stale scheduler
+    # ... still registered". Same pre-flight stop bench-scale uses.
+    if is_scx_active():
+        log_warn(f"sched_ext active ({scx_scheduler_name()}) -- stopping "
+                 f"pandemonium service")
+        subprocess.run(["sudo", "systemctl", "stop", "pandemonium"],
+                       capture_output=True)
+        if not wait_for_deactivation(5.0):
+            log_error("could not deactivate sched_ext -- clear it "
+                      "(sudo systemctl stop pandemonium)")
+            return 1
+    n_cpus = get_online_cpus()
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    if getattr(args, "storm", False):
+        return trace_storm_cycle(stamp, n_cpus, args.duration,
+                                 busy_per_cpu=args.busy_per_cpu,
+                                 sleep_us=args.rt_sleep_us, spin_us=args.rt_spin_us,
+                                 schedulers=args.schedulers, all_scx=args.all_scx)
+    return trace_coldwake_cycle(stamp, n_cpus, args.duration, dwell=args.dwell,
+                                sizes=args.sizes, mem_sizes=args.mem_sizes,
+                                schedulers=args.schedulers, all_scx=args.all_scx)
+
+
+def trace_storm_cycle(stamp, n_cpus, duration, busy_per_cpu=4,
+                      sleep_us=100, spin_us=10,
+                      schedulers="", all_scx=False) -> int:
+    """cpu_release kick-storm reproducer -- the test that actually recreates the
+    reboot live-lock (cold-wake measures cold caches, a different cost). Under
+    powersave, stormwork drives the boot condition: a busy sched_ext population
+    plus one SCHED_FIFO thread per CPU whose every wake yanks its CPU from scx
+    (cpu_release -> reenqueue_local). The scheduler's own --verbose tick stdout is
+    captured and scored for storm fraction and -- via the truthful kick H counting
+    -- REAL IPI storm vs IDLE re-enqueue churn. EEVDF cannot storm (no Tier-0 kick
+    loop), so the scored arms are the PANDEMONIUM variants; default is BPF."""
+    import storm_score
+    src = Path(__file__).resolve().parent / "stormwork.c"
+    swbin = f"/tmp/stormwork-{stamp}"
+    cc = subprocess.run(["gcc", "-O2", "-march=native", "-o", swbin, str(src),
+                         "-lpthread"], capture_output=True, text=True)
+    if cc.returncode != 0:
+        log_error(f"[storm] stormwork build failed: {cc.stderr.strip()}")
+        return 1
+
+    if schedulers:
+        arms = [a for a in field_arms(n_cpus, schedulers, all_scx) if a[1] is not None]
+    else:
+        arms = [("PANDEMONIUM (BPF)", [str(BINARY), "--no-adaptive"])]
+    if not arms:
+        log_error("[storm] no scx arm to score (EEVDF cannot storm)")
+        subprocess.run(["sudo", "rm", "-f", swbin], capture_output=True)
+        return 1
+
+    log_info(f"[storm] cpu_release flood: {n_cpus} RT FIFO threads + "
+             f"{n_cpus * busy_per_cpu} busy workers, {duration}s/arm under powersave")
+    saved_gov = _set_governor("powersave")
+
+    results = []
+    try:
+        for sched_name, cmd in arms:
+            vcmd = list(cmd)
+            if "--verbose" not in vcmd:
+                vcmd.insert(1, "--verbose")
+            guard = start_and_wait(vcmd, sched_name)
+            if guard is None:
+                log_error(f"[storm] {sched_name} failed to activate -- skipped")
+                continue
+            log_info(f"[storm] {sched_name}: flooding {duration}s")
+            subprocess.run(["sudo", swbin, str(duration), str(busy_per_cpu),
+                            str(sleep_us), str(spin_us)],
+                           capture_output=True, text=True)
+            guard.stop()
+            wait_for_deactivation(5.0)
+            # stdout carries the tick lines; stderr carries the [WATCHDOG] abort
+            # (eprintln!). Score BOTH so a monitor-starvation self-eject -- the
+            # storm's terminal outcome -- is detected, not silently dropped.
+            ticks = guard.drain_stdout() + "\n" + guard.read_stderr(limit=65536)
+            tag = sched_name.replace(" ", "_").replace("(", "").replace(")", "")
+            out = LOG_DIR / f"storm-{tag}-{stamp}.tick"
+            try:
+                out.write_text(ticks)
+            except OSError:
+                out = None
+            results.append((sched_name, storm_score.score(ticks, is_text=True), out))
+            guard.cleanup()
+
+        for sched_name, d, out in results:
+            if "error" in d:
+                log_warn(f"[storm] {sched_name}: {d['error']}")
+                continue
+            log_info(f"[storm] {sched_name}: {d['pct']:.1f}% storm "
+                     f"({d['storm']}/{d['ticks']} ticks), d/s p50={d['p50']} max={d['dmax']}")
+            if d["sample"]:
+                log_info(f"[storm] {sched_name}: {d['real']} real-IPI / {d['churn']} "
+                         f"idle-churn -- {d['kind']} "
+                         f"(kickH/enqR={d['sample']['ratio']:.2f})")
+            else:
+                log_info(f"[storm] {sched_name}: no storm ticks -- clean")
+            if out:
+                log_info(f"TICKLOG: {out}")
+        return 0 if results else 1
+    finally:
+        _restore_governor(saved_gov)
+        subprocess.run(["sudo", "rm", "-f", swbin], capture_output=True)
+
+
 def cmd_bench_pcpu(args) -> int:
     """Per-CPU DSQ visibility stress test.
 
@@ -3054,6 +3537,30 @@ def cmd_bench_pcpu(args) -> int:
     version = get_version()
     git = get_git_info()
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+    # --trace: capped montauk recordings of the burst-starvation load at EVERY
+    # core width (2,4,8,...,max -- the suite's scaling), each its own capture, so
+    # the width-specific cadence (2C strand vs wide spread) is visible. restrict
+    # the online CPUs per width like the matrix path, restore after.
+    if getattr(args, "trace", False):
+        if not log.child:
+            log_info(f"PANDEMONIUMv{version} BENCH-PCPU --trace  core counts: {core_counts}")
+        rc = 0
+        try:
+            for nr in core_counts:
+                # restrict_cpus only offlines -- restore to all-online first so an
+                # ascending sweep (2,4,8,..) actually widens instead of staying at
+                # the narrowest width.
+                restore_all_cpus(max_cpus)
+                if not restrict_cpus(nr, max_cpus):
+                    log_warn(f"[pcpu-burst] could not restrict to {nr}C -- skipped")
+                    continue
+                rc |= trace_pcpu_burst(stamp, nr, args.duration,
+                                       getattr(args, "schedulers", "") or "",
+                                       getattr(args, "all_scx", False))
+        finally:
+            restore_all_cpus(max_cpus)
+        return rc
 
     log_info(f"PANDEMONIUMv{version} BENCH-PCPU")
     log_info(f"Core counts: {core_counts}")
@@ -3159,7 +3666,7 @@ def cmd_bench_pcpu(args) -> int:
                 time.sleep(2)
 
     except KeyboardInterrupt:
-        log_info("Interrupted")
+        log.interrupted()
         overall_pass = False
     finally:
         restore_all_cpus(max_cpus)
@@ -3212,38 +3719,35 @@ def cmd_bench_pcpu(args) -> int:
     else:
         log_info("OVERALL: FAIL")
 
-    # PROMETHEUS OUTPUT
+    # PROMETHEUS OUTPUT (unified schema via the shared builder; metadata is now a
+    # real _info/_timestamp gauge pair, not file comments)
     prom_path = LOG_DIR / f"bench-pcpu-{stamp}.prom"
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    with open(prom_path, "w") as f:
-        f.write(f'# PANDEMONIUM bench-pcpu v{version}\n')
-        f.write(f'# {datetime.now().isoformat()}\n')
-        for nr_cpus in sorted(all_results.keys()):
-            cr = all_results[nr_cpus]
-            for test_name in ["burst", "steal", "sojourn", "pcpu_starve"]:
-                results = cr[test_name]
-                if not results:
-                    continue
-                r = results[-1]
-                label = f'test="{test_name}",cpus="{nr_cpus}"'
-                f.write(f'pandemonium_pcpu_pass{{{label}}} '
-                        f'{1 if r.get("pass", False) else 0}\n')
-                if test_name == "burst" and not r.get("skip"):
-                    f.write(f'pandemonium_pcpu_burst_max_delay_s{{{label}}} '
-                            f'{r.get("max_delay_s", 0)}\n')
-                    bl = r.get("burst_latency", {})
-                    f.write(f'pandemonium_pcpu_burst_p99_us{{{label}}} '
-                            f'{bl.get("p99_us", 0)}\n')
-                elif test_name == "steal" and not r.get("skip"):
-                    f.write(f'pandemonium_pcpu_steal_ratio{{{label}}} '
-                            f'{r.get("ratio", 0)}\n')
-                elif test_name == "sojourn" and not r.get("skip"):
-                    f.write(f'pandemonium_pcpu_sojourn_max_delay_s{{{label}}} '
-                            f'{r.get("max_delay_s", 0)}\n')
-                elif test_name == "pcpu_starve" and not r.get("skip"):
-                    f.write(f'pandemonium_pcpu_starve_elapsed_s{{{label}}} '
-                            f'{r.get("emitter_elapsed_s", 0)}\n')
-    log_info(f"Prometheus: {prom_path}")
+    pb = PrometheusBuilder("pcpu")
+    git = get_git_info()
+    pb.info(version=version, git_commit=git["commit"], git_dirty=git["dirty"])
+    for nr_cpus in sorted(all_results.keys()):
+        cr = all_results[nr_cpus]
+        for test_name in ["burst", "steal", "sojourn", "pcpu_starve"]:
+            results = cr[test_name]
+            if not results:
+                continue
+            r = results[-1]
+            lbl = {"test": test_name, "cpus": str(nr_cpus)}
+            pb.gauge("pass", 1 if r.get("pass", False) else 0,
+                     help="per-test pass (1) / fail (0)", labels=lbl)
+            if test_name == "burst" and not r.get("skip"):
+                pb.gauge("burst_max_delay_s", r.get("max_delay_s", 0), labels=lbl)
+                bl = r.get("burst_latency", {})
+                pb.gauge("burst_p99_us", bl.get("p99_us", 0), labels=lbl)
+            elif test_name == "steal" and not r.get("skip"):
+                pb.gauge("steal_ratio", r.get("ratio", 0), labels=lbl)
+            elif test_name == "sojourn" and not r.get("skip"):
+                pb.gauge("sojourn_max_delay_s", r.get("max_delay_s", 0), labels=lbl)
+            elif test_name == "pcpu_starve" and not r.get("skip"):
+                pb.gauge("starve_elapsed_s", r.get("emitter_elapsed_s", 0), labels=lbl)
+    prom_path.write_text(pb.render())
+    log_info(f"METRICS: {prom_path}")
 
     return 0 if overall_pass else 1
 
@@ -3300,7 +3804,8 @@ def cmd_bench_scale(args) -> int:
     time.sleep(0.5)
 
     # Pre-flight: verify PANDEMONIUM can load BPF and activate
-    log_info("Pre-flight: verifying PANDEMONIUM can activate...")
+    if not log.child:
+        log_info("Pre-flight: verifying PANDEMONIUM can activate...")
     preflight = start_and_wait([str(BINARY)], "PANDEMONIUM")
     if preflight is None:
         log_error("Pre-flight FAILED -- PANDEMONIUM cannot activate")
@@ -3308,8 +3813,9 @@ def cmd_bench_scale(args) -> int:
         dmesg.save()
         return 1
     stop_and_wait(preflight)
-    log_info("Pre-flight PASSED")
-    print()
+    if not log.child:
+        log_info("Pre-flight PASSED")
+        log.blank()
 
     # Build entry list
     if getattr(args, "pandemonium_only", False):
@@ -3319,12 +3825,21 @@ def cmd_bench_scale(args) -> int:
         ]
         log_info("PANDEMONIUM-ONLY MODE: skipping EEVDF and external schedulers")
     else:
-        base_entries: list[tuple[str, list[str] | None]] = [
-            ("EEVDF", None),
-            ("PANDEMONIUM (BPF)", [str(BINARY), "--verbose", "--no-adaptive"]),
-            ("PANDEMONIUM (ADAPTIVE)", [str(BINARY), "--verbose"]),
-        ]
-        for name in args.schedulers:
+        # A named --schedulers field is EEVDF vs EXACTLY those (PANDEMONIUM only if
+        # named) -- consistent with field_arms / bench-cachyos. Default keeps
+        # PANDEMONIUM. schedulers may arrive as a list or a comma string.
+        _sl = args.schedulers or []
+        if isinstance(_sl, str):
+            _sl = [s.strip() for s in _sl.split(",") if s.strip()]
+        _named = {str(s).strip().lower() for s in _sl}
+        _field_only = bool(_sl) and not getattr(args, "all_scx", False)
+        base_entries: list[tuple[str, list[str] | None]] = [("EEVDF", None)]
+        if (not _field_only) or (_named & {"pandemonium", "scx_pandemonium"}):
+            base_entries.append(("PANDEMONIUM (BPF)", [str(BINARY), "--verbose", "--no-adaptive"]))
+            base_entries.append(("PANDEMONIUM (ADAPTIVE)", [str(BINARY), "--verbose"]))
+        for name in _sl:
+            if str(name).strip().lower() in ("pandemonium", "scx_pandemonium", "eevdf"):
+                continue
             path = find_scheduler(name)
             if path:
                 log_info(f"Found: {name} ({path})")
@@ -3517,8 +4032,22 @@ def cmd_bench_scale(args) -> int:
                     sched_result["deadline"] = deadline_result
 
                 if run_full or args.ipc:
-                    # IPC round-trip (pipe ping-pong)
-                    ipc_result = measure_ipc(BINARY, n)
+                    # IPC round-trip (pipe ping-pong). Under --trace, wrap the
+                    # measurement in a montauk pand-ipc recording with the raw
+                    # per-event log (events=True) -- the only instrument fine
+                    # enough to resolve a single RTT landing on the CONFIG_HZ tick
+                    # floor. The IPC engine is one clean handoff pair per primitive
+                    # (cores unsaturated), so montauk needs no pinned drain core.
+                    if getattr(args, "trace", False) and montauk_available():
+                        safe = (sched_name.replace(" ", "-")
+                                .replace("(", "").replace(")", ""))
+                        with montauk_trace(IPC_COMM, f"ipc-{safe}-{n}c", stamp,
+                                           events=True) as _rec:
+                            ipc_result = measure_ipc(BINARY, n)
+                        log_info(f"[{sched_name}] {n}C IPC montauk trace -> "
+                                 f"{_rec.dir}")
+                    else:
+                        ipc_result = measure_ipc(BINARY, n)
                     if guard is not None and guard.proc.poll() is not None:
                         ipc_result["survived"] = False
                         log_error(f"{sched_name} CRASHED during IPC test "
@@ -3564,17 +4093,17 @@ def cmd_bench_scale(args) -> int:
     # Report
     report = format_report(data)
     print()
-    print(report)
+    log.report(report)
 
     # Save log
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     report_path = LOG_DIR / f"bench-scale-{stamp}.log"
     report_path.write_text(report)
-    log_info(f"Report saved to {report_path}")
+    log_info(f"REPORT: {report_path}")
 
     # Write Prometheus metrics
     prom_path = write_prometheus(data, stamp)
-    log_info(f"Prometheus metrics saved to {prom_path}")
+    log_info(f"METRICS: {prom_path}")
 
     # Dmesg
     dmesg.save(stamp)
@@ -3701,7 +4230,7 @@ def cmd_bench_sys(args) -> int:
     label_str = ",".join(f'{k}="{v}"' for k, v in labels.items())
 
     prom_sys_create(prom_path, version, git, max_cpus)
-    log_info(f"Prometheus: {prom_path}")
+    log_info(f"METRICS: {prom_path}")
 
     log_info(f"{sched_display} is active ({max_cpus} CPUs)")
     log_info("Use your system normally. Ctrl+C to stop and collect.")
@@ -3770,7 +4299,7 @@ def cmd_bench_sys(args) -> int:
         print()
         log_info(f"SESSION: {sched_display}, {max_cpus} CPUs, "
                  f"{ticks_written} ticks")
-        log_info(f"Prometheus: {prom_path}")
+        log_info(f"METRICS: {prom_path}")
 
         dmesg.save(stamp)
         fix_ownership()
@@ -3840,8 +4369,14 @@ class _LatencyProbe:
         self.proc = None
 
     def start(self):
+        # Rename the probe's comm to 'pand-cont' (prctl PR_SET_NAME) so a
+        # montauk --trace pand-cont targets exactly this latency-sensitive task
+        # under the storm -- the batch workers create the contention; this is the
+        # wakee whose wake-to-run we want, without tracing the orchestrator.
         script = (
-            f"import time, sys\n"
+            f"import time, sys, ctypes, ctypes.util\n"
+            f"ctypes.CDLL(ctypes.util.find_library('c')).prctl("
+            f"15, b'pand-cont', 0, 0, 0)\n"
             f"end = time.monotonic() + {self.duration}\n"
             "while time.monotonic() < end:\n"
             "    t0 = time.monotonic()\n"
@@ -3921,7 +4456,7 @@ def _burst_processes(count):
 
 
 
-# SCHEDULER LIFECYCLE HELPERS (shared by bench-trace, bench-contention)
+# SCHEDULER LIFECYCLE HELPERS (shared by bench-contention)
 
 def _trace_start_scheduler(nr_cpus=None):
     """Start PANDEMONIUM with stale detection and settle verification."""
@@ -4421,25 +4956,14 @@ def _contention_run_iteration(iteration, total, nr_cpus):
 def _write_contention_prometheus(version, git, stamp, max_cpus, iterations,
                                   core_counts, results, all_phase_data) -> Path:
     """Write Prometheus exposition format (.prom) for bench-contention."""
-    lines = []
-    emitted = set()
+    pb = PrometheusBuilder("contention")
 
     def gauge(name, help_text, value, labels=None):
-        if name not in emitted:
-            lines.append(f"# HELP {name} {help_text}")
-            lines.append(f"# TYPE {name} gauge")
-            emitted.add(name)
-        if labels:
-            label_str = ",".join(f'{k}="{v}"' for k, v in labels.items())
-            lines.append(f"{name}{{{label_str}}} {value}")
-        else:
-            lines.append(f"{name} {value}")
+        pb.gauge(name.replace("pandemonium_contention_", "", 1), value,
+                 help=help_text, labels=labels)
 
-    dirty = "true" if git["dirty"] else "false"
-    gauge("pandemonium_contention_info", "Build and run metadata", 1,
-          {"version": version, "git_commit": git["commit"], "git_dirty": dirty})
-    gauge("pandemonium_contention_timestamp_seconds", "Test start time",
-          int(datetime.strptime(stamp, "%Y%m%d-%H%M%S").timestamp()))
+    pb.info(ts=int(datetime.strptime(stamp, "%Y%m%d-%H%M%S").timestamp()),
+            version=version, git_commit=git["commit"], git_dirty=git["dirty"])
     gauge("pandemonium_contention_iterations", "Iterations per core count", iterations)
     gauge("pandemonium_contention_max_cpus", "Maximum CPUs available", max_cpus)
 
@@ -4499,8 +5023,52 @@ def _write_contention_prometheus(version, git, stamp, max_cpus, iterations,
 
     ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
     path = ARCHIVE_DIR / f"contention-{version}-{stamp}.prom"
-    path.write_text("\n".join(lines) + "\n")
+    path.write_text(pb.render())
     return path
+
+
+def trace_contention_storm(stamp: str, n_cpus: int, duration: int,
+                           schedulers: str = "", all_scx: bool = False,
+                           phase: str = "deficit-storm") -> int:
+    """One montauk-traced contention phase, hard-capped at `duration`s. Runs the
+    requested phase -- deficit-storm (ncpu interactive + ncpu*2 batch) or
+    sojourn-pressure (ncpu*4 deep batch flood + interactive probes) -- under each
+    scheduler while montauk records the latency probe's wake-to-run (comm
+    pand-cont): the batch workers create the runqueue pressure, the probe is the
+    wakee we measure. montauk pins a drain core (cores are saturated)."""
+    if not montauk_available():
+        log_error("montauk not found -- cannot --trace")
+        return 1
+    phase_fns = {
+        "deficit-storm": _contention_phase_deficit_storm,
+        "sojourn-pressure": _contention_phase_sojourn_pressure,
+    }
+    phase_fn = phase_fns.get(phase, _contention_phase_deficit_storm)
+    drain = max(0, n_cpus - 1)
+    log_info(f"[contention/{phase}] tracing {n_cpus}C for {duration}s "
+             f"(montauk on cpu{drain}, comm pand-cont)")
+
+    def body(rec_dir):
+        dmesg = DmesgMonitor()
+        phase_fn(n_cpus, dmesg, lambda: True, duration=duration)
+        return None
+
+    # Field on the identical storm (default EEVDF+PANDEMONIUM; widened by
+    # --schedulers/--all-scx). The probe renames its comm to pand-cont under
+    # every scheduler, so montauk targets it for all arms. The recording label is
+    # the phase, so per-phase per-width captures stay distinct in the digest.
+    arms = field_arms(n_cpus, schedulers, all_scx)
+    traced = 0
+    for sched_name, activate_cmd in arms:
+        rec_dir, _ = trace_workload(sched_name, activate_cmd,
+                                    "pand-cont", f"{phase}-{n_cpus}c", stamp, body,
+                                    events=True, pin_cpu=drain)
+        if rec_dir is None:
+            log_error(f"[contention/{phase}] {sched_name} failed to activate -- skipped")
+            continue
+        log_info(f"[contention/{phase}] {sched_name} montauk recording -> {rec_dir}")
+        traced += 1
+    return 0 if traced else 1
 
 
 def cmd_bench_contention(args) -> int:
@@ -4537,6 +5105,34 @@ def cmd_bench_contention(args) -> int:
 
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    # --trace: capped montauk recordings of the contention phase at EVERY core
+    # width (the suite's scaling), each its own capture, so the width-specific
+    # fault is visible -- sojourn-pressure blows up at 8C, deficit-storm floors
+    # at 2C. --phase picks which (default deficit-storm). restrict the online
+    # CPUs per width like the matrix path, restore after.
+    if getattr(args, "trace", False):
+        trace_phase = phase_filter or "deficit-storm"
+        if not log.child:
+            log_info(f"bench-contention v{get_version()} --trace {trace_phase}  "
+                     f"core counts: {core_counts}")
+        rc = 0
+        try:
+            for nr in core_counts:
+                # restrict_cpus only offlines -- restore first so an ascending
+                # sweep actually widens instead of staying at the narrowest width.
+                restore_all_cpus(max_cpus)
+                if not restrict_cpus(nr, max_cpus):
+                    log_warn(f"[contention/{trace_phase}] could not restrict to "
+                             f"{nr}C -- skipped")
+                    continue
+                rc |= trace_contention_storm(stamp, nr, args.duration,
+                                             getattr(args, "schedulers", "") or "",
+                                             getattr(args, "all_scx", False),
+                                             phase=trace_phase)
+        finally:
+            restore_all_cpus(max_cpus)
+        return rc
 
     ver = get_version()
     git = get_git_info()
@@ -4591,7 +5187,7 @@ def cmd_bench_contention(args) -> int:
                 time.sleep(2)
 
     except KeyboardInterrupt:
-        log_info("Interrupted")
+        log.interrupted()
     finally:
         restore_all_cpus(max_cpus)
 
@@ -4611,7 +5207,7 @@ def cmd_bench_contention(args) -> int:
             ver, git, stamp, max_cpus, args.iterations,
             core_counts, results, all_phase_data,
         )
-        log_info(f"Prometheus: {prom_path}")
+        log_info(f"METRICS: {prom_path}")
 
         # WRITE HUMAN-READABLE .log
         report_path = LOG_DIR / f"bench-contention-{stamp}.log"
@@ -4648,7 +5244,7 @@ def cmd_bench_contention(args) -> int:
         report_lines.append(f"TOTAL: {total_survived}/{total_survived+total_crashed}")
         report = "\n".join(report_lines) + "\n"
         report_path.write_text(report)
-        log_info(f"Report: {report_path}")
+        log_info(f"REPORT: {report_path}")
 
     return 0 if total_crashed == 0 else 1
 
@@ -4740,90 +5336,6 @@ def _extract_panic_context(stderr_text: str, stdout_text: str) -> list[str]:
     out = [lines[i] for i in sorted(keep) if lines[i].strip()]
     return out[:40]
 
-
-def cmd_bench_trace(args) -> int:
-    """Montauk scheduling flight-recorder for a target workload.
-
-    Activates the scheduler, records a montauk eBPF trace over the capture
-    window while the target workload runs, watching dmesg for a scheduler
-    crash. The recording is analyzable with `bench-analyze.py --trace`
-    (intra/cross-CCX migration + cache split) or `--fractal-dir` (timeline).
-    """
-    subprocess.run(["sudo", "true"])
-    if not montauk_available():
-        log_error("montauk not found")
-        return 1
-
-    target = args.target  # may be None
-    pattern = target if target else "pandemonium"
-    capture_duration = args.duration or TRACE_CAPTURE_S
-
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    ver = get_version()
-    git = get_git_info()
-    dirty = " (dirty)" if git["dirty"] else ""
-    log_info(f"bench-trace v{ver} [{git['commit']}{dirty}]  "
-             f"pattern='{pattern}'  capture={capture_duration}s  (montauk)")
-    print()
-
-    dmesg = DmesgMonitor()
-    sched_proc = None
-    crashed = False
-    rec_dir = None
-
-    try:
-        sched_proc = _trace_start_scheduler()
-        if sched_proc is None:
-            return 1
-
-        if target is not None and _find_process(target) is None:
-            print()
-            log_info(f">>> Please launch '{target}' now. <<<")
-            log_info(f"Waiting for '{target}' (timeout {TRACE_LAUNCH_TIMEOUT}s)...")
-            if _wait_for_process(target, TRACE_LAUNCH_TIMEOUT) is None:
-                log_error(f"'{target}' did not appear within {TRACE_LAUNCH_TIMEOUT}s")
-                return 1
-            log_info(f"'{target}' detected")
-
-        with montauk_trace(pattern, f"trace-{pattern}", stamp) as rec:
-            rec_dir = rec.dir
-            log_info(f"CAPTURING: {capture_duration}s -> {rec.dir} "
-                     "(run your workload now; Ctrl+C to stop early)")
-            t0 = time.monotonic()
-            while time.monotonic() - t0 < capture_duration:
-                time.sleep(2)
-                elapsed = time.monotonic() - t0
-                if dmesg.check():
-                    log_error(f"SCHEDULER CRASH at {elapsed:.0f}s: {dmesg.crash_msg}")
-                    crashed = True
-                    break
-                if sched_proc.poll() is not None:
-                    log_warn(f"Scheduler exited at {elapsed:.0f}s "
-                             f"(code {sched_proc.returncode})")
-                    break
-                if target is not None and _find_process(target) is None:
-                    log_warn(f"'{target}' exited at {elapsed:.0f}s")
-                    break
-                log_info(f"  [{elapsed:.0f}s] recording...")
-    except KeyboardInterrupt:
-        log_info("Interrupted by user")
-    finally:
-        log_info("Stopping...")
-        _trace_stop_scheduler(sched_proc)
-        if target is not None and _find_process(target):
-            log_info(f"Killing '{target}'")
-            _kill_process(target)
-        dmesg.save(stamp)
-
-    print()
-    if crashed:
-        log_error(f"scheduler crashed -- partial recording: {rec_dir}")
-        return 1
-    log_info(f"montauk recording: {rec_dir}")
-    log_info(f"  migration/cache split: bench-analyze.py --trace --trace-dir '{rec_dir}'")
-    log_info(f"  timeline (Hurst/fractal): bench-analyze.py --fractal-dir '{rec_dir}'")
-    return 0
 
 SCX_CI_FAIL_PATTERNS = ["BUG:", "WARNING:"]
 SCX_CI_FAIL_ICASE = ["error", "stall", "timeout"]
@@ -5046,7 +5558,7 @@ def cmd_bench_scx(args) -> int:
                 time.sleep(2)
 
     except KeyboardInterrupt:
-        log_info("Interrupted")
+        log.interrupted()
         overall_pass = False
     finally:
         restore_all_cpus(max_cpus)
@@ -5079,28 +5591,29 @@ def cmd_bench_scx(args) -> int:
     else:
         log_info("OVERALL: FAIL")
 
-    # PROMETHEUS OUTPUT
+    # PROMETHEUS OUTPUT (unified schema; metadata as real gauges, not comments)
     prom_path = LOG_DIR / f"bench-scx-{stamp}.prom"
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    with open(prom_path, "w") as f:
-        f.write(f'# PANDEMONIUM bench-scx v{version}\n')
-        f.write(f'# {datetime.now().isoformat()}\n')
-        for nr_cpus in sorted(all_results.keys()):
-            cr = all_results[nr_cpus]
-            for test_name in ["functional", "stress"]:
-                r = cr.get(test_name, {})
-                label = f'test="{test_name}",cpus="{nr_cpus}"'
-                f.write(f'pandemonium_scx_pass{{{label}}} '
-                        f'{1 if r.get("pass", False) else 0}\n')
-                f.write(f'pandemonium_scx_survived{{{label}}} '
-                        f'{1 if r.get("survived", False) else 0}\n')
-                if test_name == "functional":
-                    f.write(f'pandemonium_scx_violations{{{label}}} '
-                            f'{len(r.get("failures", []))}\n')
-                elif test_name == "stress":
-                    f.write(f'pandemonium_scx_stress_exit{{{label}}} '
-                            f'{r.get("stress_exit", -1)}\n')
-    log_info(f"Prometheus: {prom_path}")
+    pb = PrometheusBuilder("scx")
+    git = get_git_info()
+    pb.info(version=version, git_commit=git["commit"], git_dirty=git["dirty"])
+    for nr_cpus in sorted(all_results.keys()):
+        cr = all_results[nr_cpus]
+        for test_name in ["functional", "stress"]:
+            r = cr.get(test_name, {})
+            lbl = {"test": test_name, "cpus": str(nr_cpus)}
+            pb.gauge("pass", 1 if r.get("pass", False) else 0,
+                     help="per-test pass (1) / fail (0)", labels=lbl)
+            pb.gauge("survived", 1 if r.get("survived", False) else 0,
+                     help="scheduler survived the test (1) / crashed (0)", labels=lbl)
+            if test_name == "functional":
+                pb.gauge("violations", len(r.get("failures", [])),
+                         help="functional violations", labels=lbl)
+            elif test_name == "stress":
+                pb.gauge("stress_exit", r.get("stress_exit", -1),
+                         help="stress-ng exit code", labels=lbl)
+    prom_path.write_text(pb.render())
+    log_info(f"METRICS: {prom_path}")
 
     return 0 if overall_pass else 1
 
@@ -5252,6 +5765,12 @@ def main() -> int:
     bench.add_argument("--pandemonium-only", action="store_true",
                        help="Skip EEVDF and external schedulers, run only "
                             "PANDEMONIUM (BPF) and PANDEMONIUM (ADAPTIVE)")
+    bench.add_argument("--trace", action="store_true",
+                       help="Wrap each IPC measurement in a montauk --trace "
+                            "pand-ipc recording (raw per-event log) to "
+                            "/tmp/pandemonium -- resolves individual RTTs at the "
+                            "tick floor. Diagnostic; latency numbers are "
+                            "contaminated. Pairs with --ipc (also via bench-ipc).")
 
 
     contention_bench = sub.add_parser("bench-contention",
@@ -5265,6 +5784,20 @@ def main() -> int:
                                   help="Run single phase: regime-sweep, deficit-storm, "
                                        "sojourn-pressure, longrun-interactive, "
                                        "burst-recovery, mixed-storm")
+    contention_bench.add_argument("--trace", action="store_true",
+                                  help="Capture one montauk eBPF recording of the "
+                                       "contention storm (PANDEMONIUM), capped at "
+                                       "--duration, instead of the full matrix")
+    contention_bench.add_argument("--duration", type=int, default=20,
+                                  help="With --trace: capture window seconds "
+                                       "(default: 20)")
+    contention_bench.add_argument("--schedulers", type=str, default="",
+                                  help="With --trace: comma-separated scheduler "
+                                       "field (EEVDF baseline always; PANDEMONIUM "
+                                       "only if named)")
+    contention_bench.add_argument("--all-scx", action="store_true",
+                                  help="With --trace: loop the full installed scx "
+                                       "field (EEVDF + PANDEMONIUM + every external)")
 
     sys_bench = sub.add_parser("bench-sys",
                                help="Live system telemetry capture")
@@ -5285,15 +5818,52 @@ def main() -> int:
     pcpu_bench.add_argument("--core-counts", type=str, default=None,
                             help="Comma-separated core counts "
                                  "(default: auto 2,4,8,...,max)")
+    pcpu_bench.add_argument("--trace", action="store_true",
+                            help="Capture one montauk eBPF recording of the "
+                                 "burst-starvation load (PANDEMONIUM), capped at "
+                                 "--duration, instead of the full matrix")
+    pcpu_bench.add_argument("--duration", type=int, default=20,
+                            help="With --trace: capture window seconds (default: 20)")
+    pcpu_bench.add_argument("--schedulers", type=str, default="",
+                            help="With --trace: comma-separated scheduler field "
+                                 "(EEVDF baseline always; PANDEMONIUM only if named)")
+    pcpu_bench.add_argument("--all-scx", action="store_true",
+                            help="With --trace: loop the full installed scx field "
+                                 "(EEVDF + PANDEMONIUM + every external)")
 
-    trace_bench = sub.add_parser("bench-trace",
-                                help="montauk trace capture for an external workload")
-    trace_bench.add_argument("--target", type=str, default=None,
-                           help="Process comm-prefix to trace; if omitted, "
-                                "capture all scheduling activity (Ctrl+C "
-                                "to stop, or wait for scheduler crash)")
-    trace_bench.add_argument("--duration", type=int, default=0,
-                           help="Capture duration in seconds (default: 120)")
+    coldwake_bench = sub.add_parser("bench-coldwake",
+        help="Cold-wake latency vs frequency-at-wake (idle->bare-wake, powersave)")
+    coldwake_bench.add_argument("--trace", action="store_true",
+        help="Capture montauk recordings of the cold-wake cycle (the only mode)")
+    coldwake_bench.add_argument("--duration", type=int, default=60,
+        help="Cold-wake cycle window seconds per scheduler arm (default: 60)")
+    coldwake_bench.add_argument("--dwell", type=int, default=2,
+        help="Idle seconds per cycle before the core goes cold (default: 2)")
+    coldwake_bench.add_argument("--sizes", type=str,
+        default="100000,500000,1000000,4000000,16000000,50000000",
+        help="CPU burst sizes (iteration counts) swept cold->warm; small ~sub-ms "
+             "(cursor/keypress) to large ~50ms (default spans both)")
+    coldwake_bench.add_argument("--mem-sizes", dest="mem_sizes", type=str,
+        default="32768,262144,2097152,8388608,33554432,134217728",
+        help="Memory working sets (bytes) for the cold-cache pointer-chase, L1 to "
+             "DRAM (default 32KB,256KB,2MB,8MB,32MB,128MB)")
+    coldwake_bench.add_argument("--core-counts", type=str, default=None,
+        help="Accepted for suite uniformity; cold-wake pins one core regardless")
+    coldwake_bench.add_argument("--schedulers", type=str, default="",
+        help="Comma-separated scheduler field (EEVDF baseline always; "
+             "PANDEMONIUM only if named)")
+    coldwake_bench.add_argument("--all-scx", action="store_true",
+        help="Loop the full installed scx field")
+    coldwake_bench.add_argument("--storm", action="store_true",
+        help="cpu_release kick-storm reproducer (powersave) instead of the "
+             "cold-cache sweep -- recreates the reboot live-lock and scores storm "
+             "fraction + real-IPI-vs-IDLE-churn from the scheduler tick log")
+    coldwake_bench.add_argument("--busy-per-cpu", dest="busy_per_cpu", type=int,
+        default=4, help="storm mode: busy sched_ext workers per CPU (queue depth)")
+    coldwake_bench.add_argument("--rt-sleep-us", dest="rt_sleep_us", type=int,
+        default=100, help="storm mode: SCHED_FIFO sleep period us (release rate)")
+    coldwake_bench.add_argument("--rt-spin-us", dest="rt_spin_us", type=int,
+        default=10, help="storm mode: SCHED_FIFO spin us per wake (RT duty)")
 
     scx_bench = sub.add_parser("bench-scx",
                                 help="scx CI compatibility test")
@@ -5333,8 +5903,8 @@ def main() -> int:
         return cmd_bench_sys(args)
     if args.command == "bench-pcpu":
         return cmd_bench_pcpu(args)
-    if args.command == "bench-trace":
-        return cmd_bench_trace(args)
+    if args.command == "bench-coldwake":
+        return cmd_bench_coldwake(args)
     if args.command == "bench-scx":
         return cmd_bench_scx(args)
     if args.command == "low-cpu-deadline":
@@ -5348,5 +5918,5 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except KeyboardInterrupt:
-        print("\nInterrupted by user.")
+        log.interrupted()
         sys.exit(130)

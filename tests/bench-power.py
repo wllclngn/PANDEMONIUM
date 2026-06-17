@@ -55,11 +55,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent.resolve()))
 from pandemonium_common import (
     LOG_DIR, ARCHIVE_DIR, BINARY,
     get_version, get_git_info,
-    log_info, log_warn, log_error,
+    log, log_info, log_warn, log_error,
     mean_stdev,
     is_scx_active, scx_scheduler_name,
     wait_for_deactivation,
-    ensure_build,
+    ensure_build, PrometheusBuilder,
 )
 
 
@@ -708,95 +708,64 @@ def write_prometheus(version: str, git: dict, stamp: str, ncpus: int,
                      vendor: str, model: str, power_events: list[str],
                      runs: int, cooldown_secs: int,
                      all_results: dict) -> Path:
-    lines: list[str] = []
-    emitted: set[str] = set()
-
-    def gauge(name: str, help_text: str, value, labels: dict | None = None) -> None:
-        if name not in emitted:
-            lines.append(f"# HELP {name} {help_text}")
-            lines.append(f"# TYPE {name} gauge")
-            emitted.add(name)
-        if labels:
-            ls = ",".join(f'{k}="{v}"' for k, v in labels.items())
-            lines.append(f"{name}{{{ls}}} {value}")
-        else:
-            lines.append(f"{name} {value}")
-
-    dirty = "true" if git["dirty"] else "false"
-    gauge("pandemonium_bench_power_info", "Build and run metadata", 1,
-          {"version": version, "git_commit": git["commit"], "git_dirty": dirty,
-           "vendor": vendor, "model": model})
-    gauge("pandemonium_bench_power_timestamp_seconds", "Test start time",
-          int(datetime.strptime(stamp, "%Y%m%d-%H%M%S").timestamp()))
-    gauge("pandemonium_bench_power_cpus", "CPUs available", ncpus)
-    gauge("pandemonium_bench_power_runs", "Iterations per cell", runs)
-    gauge("pandemonium_bench_power_cooldown_seconds", "Cooldown between runs",
-          cooldown_secs)
-    gauge("pandemonium_bench_power_rapl_events", "RAPL events used",
-          len(power_events))
+    pb = PrometheusBuilder("power")
+    pb.info(ts=int(datetime.strptime(stamp, "%Y%m%d-%H%M%S").timestamp()),
+            version=version, git_commit=git["commit"], git_dirty=git["dirty"],
+            vendor=vendor, model=model)
+    pb.gauge("cpus", ncpus, help="CPUs available")
+    pb.gauge("runs", runs, help="iterations per cell")
+    pb.gauge("cooldown_seconds", cooldown_secs, help="cooldown between runs")
+    pb.gauge("rapl_events", len(power_events), help="RAPL events used")
 
     for sched_name, by_workload in all_results.items():
         for wl, sd in by_workload.items():
             if not sd or sd.get("runs", 0) == 0:
                 continue
             ls = {"scheduler": sched_name, "workload": wl}
-            gauge("pandemonium_bench_power_iterations",
-                  "Successful run count for this cell",
-                  sd["runs"], ls)
-            gauge("pandemonium_bench_power_wall_seconds",
-                  "Wall-clock time (mean)",
-                  f"{sd.get('wall_s_mean', 0):.4f}", ls)
-            gauge("pandemonium_bench_power_wall_seconds_stdev",
-                  "Wall-clock time (stddev)",
-                  f"{sd.get('wall_s_stdev', 0):.4f}", ls)
-            gauge("pandemonium_bench_power_joules_pkg",
-                  "Package energy (mean joules)",
-                  f"{sd.get('power/energy-pkg/_mean', 0):.4f}", ls)
-            gauge("pandemonium_bench_power_joules_pkg_stdev",
-                  "Package energy (stddev joules)",
-                  f"{sd.get('power/energy-pkg/_stdev', 0):.4f}", ls)
+            pb.gauge("iterations", sd["runs"],
+                     help="successful run count for this cell", labels=ls)
+            pb.gauge("wall_seconds", f"{sd.get('wall_s_mean', 0):.4f}",
+                     help="wall-clock time (mean)", labels=ls)
+            pb.gauge("wall_seconds_stdev", f"{sd.get('wall_s_stdev', 0):.4f}",
+                     help="wall-clock time (stddev)", labels=ls)
+            pb.gauge("joules_pkg", f"{sd.get('power/energy-pkg/_mean', 0):.4f}",
+                     help="package energy (mean joules)", labels=ls)
+            pb.gauge("joules_pkg_stdev", f"{sd.get('power/energy-pkg/_stdev', 0):.4f}",
+                     help="package energy (stddev joules)", labels=ls)
             cores = sd.get("power/energy-cores/_mean")
             if cores is not None:
-                gauge("pandemonium_bench_power_joules_cores",
-                      "Cores energy (mean joules)",
-                      f"{cores:.4f}", ls)
+                pb.gauge("joules_cores", f"{cores:.4f}",
+                         help="cores energy (mean joules)", labels=ls)
             ram = sd.get("power/energy-ram/_mean")
             if ram is not None:
-                gauge("pandemonium_bench_power_joules_ram",
-                      "RAM energy (mean joules)",
-                      f"{ram:.4f}", ls)
+                pb.gauge("joules_ram", f"{ram:.4f}",
+                         help="RAM energy (mean joules)", labels=ls)
             if "avg_watts_mean" in sd:
-                gauge("pandemonium_bench_power_avg_watts",
-                      "Average package wattage during run",
-                      f"{sd['avg_watts_mean']:.4f}", ls)
+                pb.gauge("avg_watts", f"{sd['avg_watts_mean']:.4f}",
+                         help="average package wattage during run", labels=ls)
             if "j_per_op_mean" in sd:
-                gauge("pandemonium_bench_power_joules_per_op",
-                      "Joules per work unit (label varies per workload)",
-                      f"{sd['j_per_op_mean']:.6e}", ls)
-                gauge("pandemonium_bench_power_work_unit_count",
-                      "Total work units in run (mean)",
-                      f"{sd.get('work_unit_mean', 0):.0f}", ls)
+                pb.gauge("joules_per_op", f"{sd['j_per_op_mean']:.6e}",
+                         help="joules per work unit (label varies per workload)", labels=ls)
+                pb.gauge("work_unit_count", f"{sd.get('work_unit_mean', 0):.0f}",
+                         help="total work units in run (mean)", labels=ls)
             if "ipc_mean" in sd:
-                gauge("pandemonium_bench_power_ipc",
-                      "Instructions per cycle (mean)",
-                      f"{sd['ipc_mean']:.4f}", ls)
+                pb.gauge("ipc", f"{sd['ipc_mean']:.4f}",
+                         help="instructions per cycle (mean)", labels=ls)
             if "epi_mean" in sd:
-                gauge("pandemonium_bench_power_epi_joules",
-                      "Energy per instruction (mean joules)",
-                      f"{sd['epi_mean']:.4e}", ls)
+                pb.gauge("epi_joules", f"{sd['epi_mean']:.4e}",
+                         help="energy per instruction (mean joules)", labels=ls)
             for ts_key in ("Avg_MHz", "Busy%", "C1%", "C6%", "Pkg%pc6",
                            "PkgWatt", "PkgTmp"):
                 key = f"ts_{ts_key}_mean"
                 if key not in sd:
                     continue
                 safe = ts_key.replace("%", "_pct").replace("/", "_")
-                gauge(f"pandemonium_bench_power_turbostat_{safe}",
-                      f"turbostat {ts_key} averaged across run samples",
-                      f"{sd[key]:.4f}", ls)
+                pb.gauge(f"turbostat_{safe}", f"{sd[key]:.4f}",
+                         help=f"turbostat {ts_key} averaged across run samples", labels=ls)
 
     ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
     path = ARCHIVE_DIR / f"bench-power-{version}-{stamp}.prom"
-    path.write_text("\n".join(lines) + "\n")
+    path.write_text(pb.render())
     return path
 
 
@@ -1001,9 +970,9 @@ def main() -> int:
         prom_path = write_prometheus(ver, git, stamp, n_cpus, vendor, model,
                                      power_events, args.runs, args.cooldown,
                                      all_results)
-        print(report_path.read_text())
-        log_info(f"Report: {report_path}")
-        log_info(f"Prometheus: {prom_path}")
+        log.report(report_path.read_text())
+        log_info(f"REPORT: {report_path}")
+        log_info(f"METRICS: {prom_path}")
     else:
         log_error("No successful results to report")
         return 1
@@ -1015,5 +984,5 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except KeyboardInterrupt:
-        log_warn("Interrupted")
+        log.interrupted()
         sys.exit(130)

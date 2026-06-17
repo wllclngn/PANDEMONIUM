@@ -184,10 +184,28 @@ fn run_scheduler(
                     spectrum.phi_dist_scale_q16 = pv;
                 }
                 topo.log_resistance_affinity(&reff, &rank, spectrum);
+                // T2: derive the emergent de-facto-NUMA domain tree from the cache
+                // graph (min-conductance cuts) and log it. T3's bounded steal reads it.
+                let domains = topo.compute_domain_tree();
+                topo.log_domains(&domains);
+                // T3b.1: flatten the tree to the per-CPU-pair crossing-price matrix
+                // and write it 1:1 with the affinity rank (domain_phi map).
+                let domain_phi = topo.domain_cross_phi_matrix(&domains);
                 if let Err(e) = topo.populate_affinity_rank_map(
-                    &sched, &reff, &rank, spectrum.phi_dist_scale_q16) {
+                    &sched, &reff, &rank, spectrum.phi_dist_scale_q16, &domain_phi) {
                     log_warn!("AFFINITY RANK MAP WRITE FAILED: {}", e);
                 }
+                // T3b.2: partition the tree into emergent overflow domains (L3
+                // granularity) and write cpu_domain -- the the discrete domain map replacement.
+                let ov_domains = topo.overflow_domain_count();
+                let cpu_dom = topo.domain_partition(&domains, ov_domains);
+                for (cpu, &d) in cpu_dom.iter().enumerate() {
+                    if let Err(e) = sched.write_cpu_domain(cpu as u32, d) {
+                        log_warn!("CPU DOMAIN MAP WRITE FAILED (cpu {}): {}", cpu, e);
+                        break;
+                    }
+                }
+                log_info!("OVERFLOW DOMAINS: {} (emergent, cpu_domain populated)", ov_domains);
                 // WRITE tau_ns + codel_eq_ns INTO tuning_knobs. BPF'S tick() ON
                 // CPU 0 PICKS THESE UP AND DERIVES THE TAU-SCALED TIMING STATICS
                 // AND THE R_eff-DERIVED CODEL EQUILIBRIUM TARGET.
@@ -351,11 +369,11 @@ fn run_scheduler(
             } else {
                 0
             };
-            // CROSS-CCX SCATTER ATTRIBUTION (PER XCCX_* PATH), ON THE [KNOBS]
+            // CROSS-DOMAIN SCATTER ATTRIBUTION (PER XDOM_* PATH), ON THE [KNOBS]
             // LINE SO THE BENCH SUITE CAPTURES IT UNIFORMLY ACROSS BPF/ADAPTIVE
             // (LETS THE SUITE COMPARE SCATTER BETWEEN MODES). scatter_pct IS THE
             // PLACEMENT-SIDE FRACTION (idx 0..6).
-            let x = &final_stats.nr_xccx;
+            let x = &final_stats.nr_cross_domain;
             let x_scatter: u64 = x[0..6].iter().sum();
             let x_scatter_pct = if final_stats.nr_dispatches > 0 {
                 x_scatter * 100 / final_stats.nr_dispatches
@@ -363,7 +381,7 @@ fn run_scheduler(
                 0
             };
             println!(
-                "[KNOBS] regime=BPF slice_ns={} batch_ns={} preempt_ns={} l2_hit=B:{}%/I:{}%/L:{}% xccx_scatter_pct={} xccx_sel_tight={} xccx_sel_sync={} xccx_sel_normal={} xccx_sel_dfl={} xccx_enq_t1={} xccx_enq_t2={} xccx_steal={} xccx_step5={}",
+                "[KNOBS] regime=BPF slice_ns={} batch_ns={} preempt_ns={} l2_hit=B:{}%/I:{}%/L:{}% cross_domain_scatter_pct={} cross_domain_sel_tight={} cross_domain_sel_sync={} cross_domain_sel_normal={} cross_domain_sel_dfl={} cross_domain_enq_t1={} cross_domain_enq_t2={} cross_domain_steal={} cross_domain_step5={}",
                 knobs.slice_ns, knobs.batch_slice_ns,
                 knobs.preempt_thresh_ns,
                 l2_cum_b, l2_cum_i, l2_cum_l,

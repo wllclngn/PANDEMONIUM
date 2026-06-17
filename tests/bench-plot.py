@@ -25,6 +25,9 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from pandemonium_common import log_info, log_error  # noqa: E402
+
 CACHE_DIR = (Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
              / "pandemonium")
 
@@ -174,8 +177,7 @@ def render_bars(path, args):
     vals, meta = parse_prom(path, {gauge})
     cell = vals.get(gauge, {})
     if not cell:
-        print(f"metric '{args.metric}' ({gauge}) not present in {path.name}",
-              file=sys.stderr)
+        log_error(f"metric '{args.metric}' ({gauge}) not present in {path.name}")
         return None
     exclude = {x.strip() for x in args.exclude.split(",") if x.strip()}
     scheds = sorted({s for (s, _) in cell if not any(e in s for e in exclude)},
@@ -223,13 +225,13 @@ def render_cachyos(path, args):
     vals, meta = parse_prom(path, gauges)
     all_cores = sorted({c for g in gauges for (_, c) in vals.get(g, {})})
     if not all_cores:
-        print("no workload data found", file=sys.stderr)
+        log_error("no workload data found")
         return None
     cores = args.cores if args.cores else all_cores[-1]
     exclude = {x.strip() for x in args.exclude.split(",") if x.strip()}
     scheds = schedulers_at(vals, gauges, cores, exclude)
     if not scheds:
-        print(f"no schedulers at {cores}C", file=sys.stderr)
+        log_error(f"no schedulers at {cores}C")
         return None
 
     labels = [lbl for lbl, _ in CACHYOS_WORKLOADS]
@@ -298,8 +300,7 @@ def parse_cachyos_suite(path):
 def render_cachyos_suite(path, args):
     data, meta = parse_cachyos_suite(path)
     if not data:
-        print("no bench-cachyos suite data (expected pandemonium_bench_cachyos_seconds)",
-              file=sys.stderr)
+        log_error("no bench-cachyos suite data (expected pandemonium_cachyos_seconds)")
         return None
     exclude = {x.strip() for x in args.exclude.split(",") if x.strip()}
     nwl = max((len(w) for w in data.values()), default=0)
@@ -308,12 +309,11 @@ def render_cachyos_suite(path, args):
         if any(e in s for e in exclude):
             continue
         if len(wls) < nwl:   # only schedulers that ran the full set get a fair total
-            print(f"  {s}: {len(wls)}/{nwl} workloads -- excluded from total",
-                  file=sys.stderr)
+            log_error(f"{s}: {len(wls)}/{nwl} workloads -- excluded from total")
             continue
         totals[s] = sum(wls.values())
     if not totals:
-        print("no scheduler ran the full workload set", file=sys.stderr)
+        log_error("no scheduler ran the full workload set")
         return None
     scheds = sorted(totals, key=lambda s: totals[s])   # fastest first
 
@@ -374,7 +374,7 @@ def main():
         cands = sorted(Path(args.cache_dir).glob("bench-cachyos-*.prom"),
                        key=lambda p: p.stat().st_mtime, reverse=True)
         if not cands:
-            print("no bench-cachyos .prom found", file=sys.stderr)
+            log_error("no bench-cachyos .prom found")
             return 1
         path = cands[0]
     else:
@@ -383,7 +383,7 @@ def main():
                  if not p.name.startswith("analysis-")
                  and re.match(r"\d+\.\d+\.\d+-", p.name)]
         if not cands:
-            print("no bench-scale .prom found", file=sys.stderr)
+            log_error("no bench-scale .prom found")
             return 1
         path = cands[0]
 
@@ -398,7 +398,7 @@ def main():
     fig, out_name, note = result
     out = Path(args.out) if args.out else Path(__file__).resolve().parent.parent / out_name
     fig.savefig(out, facecolor=fig.get_facecolor())
-    print(f"wrote {out}  ({note})")
+    log_info(f"wrote {out}  ({note})")
     return 0
 
 

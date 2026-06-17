@@ -27,10 +27,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent.resolve()))
 from pandemonium_common import (
     LOG_DIR, ARCHIVE_DIR, BINARY,
     get_version, get_git_info,
-    log_info, log_warn, log_error,
+    log, log_info, log_warn, log_error,
     is_scx_active, scx_scheduler_name,
     wait_for_deactivation,
-    montauk_trace, montauk_available, MONTAUK_LOG_INTERVAL_MS,
+    montauk_available, MONTAUK_LOG_INTERVAL_MS,
+    table_header, table_row, LABEL_W, PrometheusBuilder,
 )
 
 sys.path.insert(0, str(Path(__file__).parent.resolve()))
@@ -39,6 +40,7 @@ _tests = import_module("pandemonium-tests")
 start_and_wait = _tests.start_and_wait
 stop_and_wait = _tests.stop_and_wait
 find_scheduler = _tests.find_scheduler
+trace_workload = _tests.trace_workload
 
 NUM_GROUPS = 24
 NR_LOOPS_FULL = 6000
@@ -109,65 +111,78 @@ def _fmt_count(val):
     return f"{val:.0f}"
 
 
-def write_prometheus(version, git, stamp, ncpus, all_results):
-    lines = []
-    emitted = set()
+def _spread_stats(xs):
+    # Per-iteration spread for an --iterations run. The median stays the headline
+    # (continuity with the historical archives); the spread is what separates a
+    # real regression from run-to-run noise. None if there are no samples.
+    xs = [x for x in xs if x is not None]
+    if not xs:
+        return None
+    n = len(xs)
+    return {
+        "n": n,
+        "mean": statistics.mean(xs),
+        "stddev": statistics.stdev(xs) if n > 1 else 0.0,
+        "min": min(xs),
+        "max": max(xs),
+        "median": statistics.median(xs),
+    }
 
-    def gauge(name, help_text, value, labels=None):
-        if name not in emitted:
-            lines.append(f"# HELP {name} {help_text}")
-            lines.append(f"# TYPE {name} gauge")
-            emitted.add(name)
-        if labels:
-            label_str = ",".join(f'{k}="{v}"' for k, v in labels.items())
-            lines.append(f"{name}{{{label_str}}} {value}")
-        else:
-            lines.append(f"{name} {value}")
 
-    dirty = "true" if git["dirty"] else "false"
-    gauge("pandemonium_fork_thread_info", "Build and run metadata", 1,
-          {"version": version, "git_commit": git["commit"], "git_dirty": dirty})
-    gauge("pandemonium_fork_thread_timestamp_seconds", "Test start time",
-          int(datetime.strptime(stamp, "%Y%m%d-%H%M%S").timestamp()))
-    gauge("pandemonium_fork_thread_cpus", "CPUs available", ncpus)
-    gauge("pandemonium_fork_thread_groups", "Message groups", NUM_GROUPS)
-    gauge("pandemonium_fork_thread_loops", "Loops per sender per receiver", NR_LOOPS)
+def write_prometheus(version, git, stamp, ncpus, all_results, all_spreads=None):
+    pb = PrometheusBuilder("fork_thread")
+    pb.info(ts=int(datetime.strptime(stamp, "%Y%m%d-%H%M%S").timestamp()),
+            version=version, git_commit=git["commit"], git_dirty=git["dirty"])
+    pb.gauge("cpus", ncpus, help="CPUs available")
+    pb.gauge("groups", NUM_GROUPS, help="message groups")
+    pb.gauge("loops", NR_LOOPS, help="loops per sender per receiver")
 
     for sched_name, (elapsed, counters) in all_results.items():
         sl = {"scheduler": sched_name}
-        if elapsed is not None:
-            gauge("pandemonium_fork_thread_seconds",
-                  "perf bench sched messaging elapsed time", f"{elapsed:.4f}", sl)
-        else:
-            gauge("pandemonium_fork_thread_seconds",
-                  "perf bench sched messaging elapsed time", "-1", sl)
+        if elapsed is None:
+            pb.gauge("seconds", "-1",
+                     help="perf bench sched messaging elapsed time", labels=sl)
             continue
+        pb.gauge("seconds", f"{elapsed:.4f}",
+                 help="perf bench sched messaging elapsed time", labels=sl)
 
         if counters:
             for cn, cv in counters.items():
                 safe = cn.replace("-", "_").replace(".", "_")
-                gauge(f"pandemonium_fork_thread_{safe}",
-                      f"perf stat {cn}", f"{cv:.0f}", sl)
+                pb.gauge(safe, f"{cv:.0f}", help=f"perf stat {cn}", labels=sl)
 
             cycles = counters.get("cycles", 0)
             instructions = counters.get("instructions", 0)
             cache_miss = counters.get("cache-misses", 0)
             cache_ref = counters.get("cache-references", 0)
-
             if cycles > 0 and instructions > 0:
-                gauge("pandemonium_fork_thread_ipc",
-                      "Instructions per cycle", f"{instructions / cycles:.3f}", sl)
+                pb.gauge("ipc", f"{instructions / cycles:.3f}",
+                         help="instructions per cycle", labels=sl)
             if cache_ref > 0:
-                gauge("pandemonium_fork_thread_cache_miss_rate",
-                      "Cache miss rate", f"{cache_miss / cache_ref:.6f}", sl)
+                pb.gauge("cache_miss_rate", f"{cache_miss / cache_ref:.6f}",
+                         help="cache miss rate", labels=sl)
+
+        sp = (all_spreads or {}).get(sched_name)
+        cs = sp.get("cache_miss_rate") if sp else None
+        if cs:
+            pb.gauge("cache_miss_rate_mean", f"{cs['mean']:.6f}",
+                     help="cache miss rate mean across iterations", labels=sl)
+            pb.gauge("cache_miss_rate_stddev", f"{cs['stddev']:.6f}",
+                     help="cache miss rate stddev across iterations", labels=sl)
+            pb.gauge("cache_miss_rate_min", f"{cs['min']:.6f}",
+                     help="cache miss rate min across iterations", labels=sl)
+            pb.gauge("cache_miss_rate_max", f"{cs['max']:.6f}",
+                     help="cache miss rate max across iterations", labels=sl)
+            pb.gauge("cache_miss_rate_n", cs["n"],
+                     help="iterations contributing to the cache miss rate", labels=sl)
 
     ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
     path = ARCHIVE_DIR / f"bench-fork-thread-{version}-{stamp}.prom"
-    path.write_text("\n".join(lines) + "\n")
+    path.write_text(pb.render())
     return path
 
 
-def write_report(version, git, stamp, ncpus, all_results):
+def write_report(version, git, stamp, ncpus, all_results, all_spreads=None):
     report = []
     report.append(f"bench-fork-thread v{version} [{git['commit']}]")
     report.append(f"cpus: {ncpus}  command: perf bench sched messaging "
@@ -178,19 +193,19 @@ def write_report(version, git, stamp, ncpus, all_results):
     if "EEVDF" in all_results:
         eevdf_elapsed = all_results["EEVDF"][0]
 
-    # TIMING TABLE
-    report.append(f"{'SCHEDULER':<30} {'TIME':>10}  {'VS EEVDF':>10}")
+    # TIMING TABLE (canonical SCHEDULER-keyed shape -> shared helper)
+    report.append(table_header("SCHEDULER", ["TIME", "VS EEVDF"]))
     for sched_name, (elapsed, _) in all_results.items():
         if elapsed is None:
-            report.append(f"{sched_name:<30} {'FAILED':>10}")
+            report.append(table_row(sched_name, ["FAILED", ""]))
         elif sched_name == "EEVDF":
-            report.append(f"{sched_name:<30} {elapsed:>9.3f}s  {'(baseline)':>10}")
+            report.append(table_row(sched_name, [f"{elapsed:.3f}s", "(baseline)"]))
         elif eevdf_elapsed and eevdf_elapsed > 0:
             delta = (elapsed - eevdf_elapsed) / eevdf_elapsed * 100
             sign = "+" if delta > 0 else ""
-            report.append(f"{sched_name:<30} {elapsed:>9.3f}s  {sign}{delta:>8.1f}%")
+            report.append(table_row(sched_name, [f"{elapsed:.3f}s", f"{sign}{delta:.1f}%"]))
         else:
-            report.append(f"{sched_name:<30} {elapsed:>9.3f}s")
+            report.append(table_row(sched_name, [f"{elapsed:.3f}s", ""]))
     report.append("")
 
     # COUNTER TABLE
@@ -237,6 +252,24 @@ def write_report(version, git, stamp, ncpus, all_results):
     derived_row("Cycles/miss", lambda e, c: f"{c['cycles'] / c['cache-misses']:,.0f}" if c['cache-misses'] > 0 else "N/A")
     report.append("")
 
+    # ITERATION SPREAD -- only meaningful with --iterations > 1. This is the row
+    # that says whether a cache-miss delta is signal or noise: a regression must
+    # clear the stddev, not just the median.
+    if all_spreads and any(all_spreads.get(sn) for sn in sched_names):
+        report.append("ITERATION SPREAD (cache miss %, per-iteration)")
+        report.append(table_header("SCHEDULER", ["mean", "stddev", "min", "max", "n"]))
+        for sn in sched_names:
+            sp = all_spreads.get(sn)
+            cs = sp.get("cache_miss_rate") if sp else None
+            if cs:
+                report.append(table_row(sn, [
+                    f"{cs['mean'] * 100:.2f}%", f"{cs['stddev'] * 100:.2f}%",
+                    f"{cs['min'] * 100:.2f}%", f"{cs['max'] * 100:.2f}%",
+                    str(cs['n'])]))
+            else:
+                report.append(table_row(sn, ["N/A", "", "", "", ""]))
+        report.append("")
+
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     path = LOG_DIR / f"bench-fork-thread-{stamp}.log"
     path.write_text("\n".join(report) + "\n")
@@ -268,35 +301,24 @@ def _run_load_traced(timeout):
 
 
 def trace_capture(sched_name, cmd, stamp, duration):
-    safe = sched_name.replace(" ", "-").replace("(", "").replace(")", "")
-    guard = None
-    if cmd is not None:
-        log_info(f"[{sched_name}] activating scheduler...")
-        guard = start_and_wait(cmd, sched_name)
-        if guard is None:
-            log_error(f"[{sched_name}] failed to activate, skipping")
-            return None
+    load_timeout = duration if duration > 0 else LOAD_SAFETY_TIMEOUT
 
-    rec_dir = None
-    try:
-        log_info(f"[{sched_name}] starting montauk trace...")
-        with montauk_trace(TRACE_PATTERN, f"fork-thread-{safe}", stamp,
-                           baseline_s=BASELINE_SECONDS) as rec:
-            rec_dir = rec.dir
-            load_timeout = duration if duration > 0 else LOAD_SAFETY_TIMEOUT
-            log_info(f"[{sched_name}] running storm "
-                     f"(montauk recording, window {load_timeout:.0f}s)...")
-            elapsed = _run_load_traced(load_timeout)
-            if elapsed is not None:
-                log_info(f"[{sched_name}] load completed in {elapsed:.3f}s")
-            else:
-                log_info(f"[{sched_name}] capture window "
-                         f"({load_timeout:.0f}s) elapsed -- load cut")
-    finally:
-        if guard is not None:
-            stop_and_wait(guard)
+    def body(rec_dir):
+        log_info(f"[{sched_name}] running storm "
+                 f"(montauk recording, window {load_timeout:.0f}s)...")
+        elapsed = _run_load_traced(load_timeout)
+        if elapsed is not None:
+            log_info(f"[{sched_name}] load completed in {elapsed:.3f}s")
+        else:
+            log_info(f"[{sched_name}] capture window "
+                     f"({load_timeout:.0f}s) elapsed -- load cut")
+        return elapsed
 
-    log_info(f"[{sched_name}] recording: {rec_dir}")
+    rec_dir, _ = trace_workload(sched_name, cmd, TRACE_PATTERN, "fork-thread",
+                                stamp, body, baseline_s=BASELINE_SECONDS,
+                                events=True)
+    if rec_dir is not None:
+        log_info(f"[{sched_name}] recording: {rec_dir}")
     return rec_dir
 
 
@@ -313,10 +335,11 @@ def run_trace(args):
     ver = get_version()
     git = get_git_info()
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    log_info(f"bench-fork-thread --trace v{ver} [{git['commit']}]  "
-             f"trace='{TRACE_PATTERN}'  interval={MONTAUK_LOG_INTERVAL_MS}ms  "
-             f"load=perf bench sched messaging -t -g {NUM_GROUPS} -l {NR_LOOPS}")
-    print()
+    if not log.child:
+        log_info(f"bench-fork-thread --trace v{ver} [{git['commit']}]  "
+                 f"trace='{TRACE_PATTERN}'  interval={MONTAUK_LOG_INTERVAL_MS}ms  "
+                 f"load=perf bench sched messaging -t -g {NUM_GROUPS} -l {NR_LOOPS}")
+        log.blank()
 
     if is_scx_active():
         log_warn(f"sched_ext active ({scx_scheduler_name()}) -- stopping pandemonium")
@@ -324,9 +347,29 @@ def run_trace(args):
         wait_for_deactivation(5.0)
     time.sleep(1)
 
-    entries = [("PANDEMONIUM (BPF)", [str(BINARY), "--no-adaptive"])]
-    if args.compare_eevdf:
-        entries.insert(0, ("EEVDF", None))
+    # Field: EEVDF baseline + PANDEMONIUM (BPF + ADAPTIVE) by default. --all-scx
+    # adds every installed scx; --schedulers L runs EEVDF vs EXACTLY L (PANDEMONIUM
+    # only if named) -- matching field_arms / bench-cachyos. --pandemonium-only
+    # drops EEVDF and externals. EEVDF rides along whenever a field is requested.
+    _sched = getattr(args, "schedulers", "") or ""
+    _all = getattr(args, "all_scx", False)
+    _field_only = bool(_sched) and not _all and not args.pandemonium_only
+    _named = {s.strip().lower() for s in _sched.split(",")} if _sched else set()
+    entries: list[tuple[str, list[str] | None]] = []
+    if not args.pandemonium_only and (args.compare_eevdf or _sched or _all):
+        entries.append(("EEVDF", None))
+    if (not _field_only) or (_named & {"pandemonium", "scx_pandemonium"}):
+        entries.append(("PANDEMONIUM (BPF)", [str(BINARY), "--no-adaptive"]))
+        entries.append(("PANDEMONIUM (ADAPTIVE)", [str(BINARY)]))
+    if not args.pandemonium_only:
+        ext = _tests.SCX_FIELD if _all else [s.strip() for s in _sched.split(",")]
+        for e in ext:
+            if not e or e.lower() in ("pandemonium", "scx_pandemonium", "eevdf"):
+                continue
+            if find_scheduler(e):
+                entries.append((e, [e]))
+            else:
+                log_warn(f"  external scheduler {e} not found in PATH, skipping")
 
     recs = {}
     try:
@@ -335,7 +378,7 @@ def run_trace(args):
             time.sleep(2)
             print()
     except KeyboardInterrupt:
-        log_info("Interrupted")
+        log.interrupted()
     finally:
         if is_scx_active():
             wait_for_deactivation(5.0)
@@ -361,14 +404,24 @@ def main():
                     help="With --trace: capture window seconds (0 = bench to "
                          "completion, hard-capped at 180s)")
     ap.add_argument("--iterations", type=int, default=1,
-                    help="Run each scheduler N times and report the MEDIAN "
-                         "(robust to a poisoned outlier run). Default 1.")
+                    help="Run each scheduler N times. The MEDIAN is the headline "
+                         "(robust to a poisoned outlier run); the per-iteration "
+                         "cache-miss spread (mean/stddev/min/max/n) is recorded in "
+                         "the report and archive so a delta can be judged against "
+                         "the noise. Default 1.")
+    ap.add_argument("--schedulers", type=str, default="",
+                    help="With --trace: comma-separated external scx field "
+                         "(EEVDF baseline always; PANDEMONIUM only if named). "
+                         "Runs EEVDF vs exactly the named schedulers.")
     ap.add_argument("--all-scx", action="store_true",
                     help="Also run the full installed scx scheduler field "
                          "(scx_bpfland, scx_rusty, scx_lavd, scx_flow, "
                          "scx_rustland, scx_p2dq, scx_tickless, scx_cosmos, "
                          "scx_cake, scx_flash, scx_beerland, scx_layered). "
                          "Default: EEVDF + PANDEMONIUM (BPF + ADAPTIVE) only.")
+    ap.add_argument("--pandemonium-only", action="store_true",
+                    help="Run only PANDEMONIUM entries -- drop EEVDF and any "
+                         "external scx schedulers from the field.")
     ap.add_argument("--phi-sweep", type=str, nargs="?", const="0", default=None,
                     metavar="VALUES",
                     help="Phi A/B: instead of the full scx field, run PANDEMONIUM "
@@ -453,7 +506,11 @@ def main():
                 else:
                     log_warn(f"{s} not found, skipping")
 
+    if args.pandemonium_only:
+        entries = [(n, c) for n, c in entries if "PANDEMONIUM" in n]
+
     all_results = {}
+    all_spreads = {}
 
     try:
         for sched_name, cmd in entries:
@@ -497,9 +554,24 @@ def main():
                 cyc = counters.get("cycles", 0)
                 ins = counters.get("instructions", 0)
                 ipc = ins / cyc if cyc > 0 else 0
+                # Keep the per-iteration spread of the metric we compare across
+                # versions: the median above is robust to a poisoned run, but it
+                # hides whether a delta is real. cache_miss_rate is computed
+                # per-iteration (ratio of that iteration's own counters), not as a
+                # ratio of medians.
+                rates = [ct["cache-misses"] / ct["cache-references"]
+                         for _, ct in samples
+                         if ct and ct.get("cache-references", 0) > 0]
+                all_spreads[sched_name] = {
+                    "cache_miss_rate": _spread_stats(rates),
+                    "seconds": _spread_stats([s[0] for s in samples]),
+                }
+                cs = all_spreads[sched_name]["cache_miss_rate"]
+                spread_msg = (f"  miss%={cs['mean'] * 100:.2f}±{cs['stddev'] * 100:.2f} "
+                              f"[{cs['min'] * 100:.2f},{cs['max'] * 100:.2f}]") if cs else ""
                 log_info(f"[{sched_name}] MEDIAN {elapsed:.3f}s  IPC={ipc:.3f}  "
                          f"cache-misses={_fmt_count(counters.get('cache-misses', 0))}  "
-                         f"(n={len(samples)}/{args.iterations})")
+                         f"(n={len(samples)}/{args.iterations}){spread_msg}")
             else:
                 elapsed, counters = None, None
                 log_error(f"[{sched_name}] all {args.iterations} iterations failed")
@@ -513,7 +585,7 @@ def main():
             print()
 
     except KeyboardInterrupt:
-        log_info("Interrupted")
+        log.interrupted()
     finally:
         # DISENGAGE AT END (MATCHES OTHER BENCHES). EACH PER-SCHEDULER
         # stop_and_wait() ALREADY TORE DOWN ITS OWN INSTANCE; WE JUST MAKE
@@ -523,12 +595,12 @@ def main():
 
     if all_results:
         print()
-        prom_path = write_prometheus(ver, git, stamp, ncpus, all_results)
-        report_path = write_report(ver, git, stamp, ncpus, all_results)
+        prom_path = write_prometheus(ver, git, stamp, ncpus, all_results, all_spreads)
+        report_path = write_report(ver, git, stamp, ncpus, all_results, all_spreads)
 
-        print(report_path.read_text())
-        log_info(f"Report: {report_path}")
-        log_info(f"Prometheus: {prom_path}")
+        log.report(report_path.read_text())
+        log_info(f"REPORT: {report_path}")
+        log_info(f"METRICS: {prom_path}")
 
     return 0
 
@@ -537,5 +609,5 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except KeyboardInterrupt:
-        print("\nInterrupted.")
+        log.interrupted()
         sys.exit(130)

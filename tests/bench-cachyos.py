@@ -51,8 +51,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent.resolve()))
 from pandemonium_common import (
     ARCHIVE_DIR, BINARY, LOG_DIR,
     get_git_info, get_version,
-    is_scx_active, log_error, log_info, log_warn,
-    mean_stdev, scx_scheduler_name, wait_for_deactivation,
+    is_scx_active, log, log_error, log_info, log_warn,
+    mean_stdev, montauk_available, montauk_trace, scx_scheduler_name,
+    wait_for_deactivation, PrometheusBuilder,
 )
 
 sys.path.insert(0, str(Path(__file__).parent.resolve()))
@@ -490,30 +491,34 @@ def write_prometheus(ver: str, git: dict, stamp: str, ncpus: int,
     """Prometheus textfile-collector style emission."""
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     path = LOG_DIR / f"bench-cachyos-{stamp}.prom"
-    lines = [
-        "# HELP pandemonium_bench_cachyos_seconds Wall-clock seconds per CachyOS-suite workload",
-        "# TYPE pandemonium_bench_cachyos_seconds gauge",
-        "# HELP pandemonium_bench_cachyos_scheduler_skipped Scheduler crashed/ejected/fell through to EEVDF (not measured)",
-        "# TYPE pandemonium_bench_cachyos_scheduler_skipped gauge",
-    ]
+    pb = PrometheusBuilder("cachyos")
+    # Metadata lives in ONE _info gauge -- version/commit are no longer repeated
+    # on every sample line.
+    try:
+        ts = int(datetime.strptime(stamp, "%Y%m%d-%H%M%S").timestamp())
+    except ValueError:
+        ts = None
+    pb.info(ts=ts, version=ver, git_commit=git["commit"], git_dirty=git.get("dirty", False))
+    pb.gauge("cpus", ncpus, help="CPUs available")
     # SKIPPED schedulers: crashed / ejected / fell through to EEVDF. Emitted so
     # a missing scheduler is explicit, never mistaken for an EEVDF re-measure.
     for sched, reason in (skipped or {}).items():
         rl = reason.replace('"', "'")
-        lines.append(f'pandemonium_bench_cachyos_scheduler_skipped'
-                     f'{{scheduler="{sched}",reason="{rl}",'
-                     f'version="{ver}",commit="{git["commit"]}"}} 1')
+        pb.gauge("scheduler_skipped", 1,
+                 help="scheduler crashed/ejected/fell through to EEVDF (not measured)",
+                 labels={"scheduler": sched, "reason": rl})
     for sched, by_wl in results.items():
         for wl_name in wl_order:
             v = by_wl.get(wl_name)
             if v is None or v[0] is None:
                 continue
             mean, sd = v
-            labels = (f'scheduler="{sched}",workload="{wl_name}",'
-                      f'version="{ver}",commit="{git["commit"]}"')
-            lines.append(f"pandemonium_bench_cachyos_seconds{{{labels},stat=\"mean\"}} {mean:.6f}")
-            lines.append(f"pandemonium_bench_cachyos_seconds{{{labels},stat=\"stdev\"}} {sd:.6f}")
-    path.write_text("\n".join(lines) + "\n")
+            pb.gauge("seconds", f"{mean:.6f}",
+                     help="wall-clock seconds per CachyOS-suite workload",
+                     labels={"scheduler": sched, "workload": wl_name, "stat": "mean"})
+            pb.gauge("seconds", f"{sd:.6f}",
+                     labels={"scheduler": sched, "workload": wl_name, "stat": "stdev"})
+    path.write_text(pb.render())
     return path
 
 
@@ -547,6 +552,72 @@ def _sched_crashed(guard, expected_ops=""):
     return None
 
 
+# montauk comm to trace per workload (the binary doing the actual computation).
+# Build workloads (compilation/defconfig) are process TREES -- trace the build
+# driver and montauk fork-tracking follows it down to the gcc/cc1 children.
+WORKLOAD_TRACE_COMM = {
+    "stress-ng-cpu-cache-mem": "stress-ng",
+    "perf-sched-msg-fork-thread": "perf",
+    "perf-memcpy": "perf",
+    "argon2-hashing": "argon2",
+    "xz-compression": "xz",
+    "primes": "stress-ng",
+    "x265-encoding": "ffmpeg",
+    "ffmpeg-compilation": "make",
+    "blender-render": "blender",
+    "kernel-defconfig": "make",
+}
+
+
+def run_trace(entries, active, stamp, ncpus) -> int:
+    """`bench-cachyos --trace`: cycle the full matrix (every scheduler x every
+    workload) with montauk recording each workload's actual computation -- one
+    recording per (scheduler, workload), patterned on that workload's comm.
+
+    Not a benchmark: montauk trace overhead makes the wall-times unusable, and
+    each scheduler is activated ONCE around its whole workload run. The recordings
+    (preempt_*, migrations_cross_ccx, per-thread state) are the point; they land in
+    /tmp/pandemonium and can be sizable on the long workloads (ffmpeg, kernel)."""
+    if not montauk_available():
+        log_error("montauk not found -- cannot --trace")
+        return 1
+
+    recs: dict[str, Path] = {}
+    try:
+        for sched_name, cmd in entries:
+            guard = None
+            if cmd is not None:
+                log_info(f"[{sched_name}] activating...")
+                guard = start_and_wait(cmd, sched_name)
+                if guard is None:
+                    log_error(f"[{sched_name}] failed to activate -- SKIPPED")
+                    continue
+            safe = sched_name.replace(" ", "-").replace("(", "").replace(")", "")
+            try:
+                for wl in active:
+                    comm = WORKLOAD_TRACE_COMM.get(wl.name, wl.name)
+                    _refresh_sudo()
+                    log_info(f"  [{sched_name}] tracing {wl.label} (comm='{comm}')")
+                    with montauk_trace(comm, f"cachyos-{safe}-{wl.name}",
+                                       stamp) as rec:
+                        elapsed = wl.run(ncpus)
+                    recs[f"{sched_name}/{wl.name}"] = rec.dir
+                    tag = f"{elapsed:.3f}s" if elapsed is not None else "no timing"
+                    log_info(f"    {wl.label}: {tag} (traced) -> {rec.dir}")
+            finally:
+                if guard is not None:
+                    stop_and_wait(guard)
+            print()
+    except KeyboardInterrupt:
+        log.interrupted()
+    finally:
+        if is_scx_active():
+            wait_for_deactivation(5.0)
+
+    log_info(f"TRACE COMPLETE: {len(recs)} recording(s) under /tmp/pandemonium")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="PANDEMONIUM bench-cachyos: CachyOS Mini-Benchmarker-style suite",
@@ -555,8 +626,10 @@ def main() -> int:
                     help=f"Iterations per workload (default: {DEFAULT_RUNS})")
     ap.add_argument("--workloads", type=str, default="",
                     help="Comma-separated workload names (default: all available)")
-    ap.add_argument("--schedulers", type=str, default="scx_cake",
-                    help="External schedulers (default: scx_cake)")
+    ap.add_argument("--schedulers", type=str, default="",
+                    help="Comma-separated external scx schedulers to add to the "
+                         "EEVDF + PANDEMONIUM field (e.g. scx_rusty,scx_lavd). "
+                         "Default: none")
     ap.add_argument("--all-scx", action="store_true",
                     help="Run the full installed scx scheduler field "
                          "(scx_bpfland, scx_rusty, scx_lavd, scx_flow, "
@@ -568,6 +641,11 @@ def main() -> int:
                     help="Skip EEVDF and external schedulers")
     ap.add_argument("--no-eevdf", action="store_true",
                     help="Skip EEVDF baseline")
+    ap.add_argument("--trace", action="store_true",
+                    help="Diagnostic pass (not a benchmark): cycle the full "
+                         "scheduler x workload matrix with montauk recording each "
+                         "workload's computation (preempt/migration/thread data) "
+                         "to /tmp/pandemonium. Wall-times are contaminated; ignored.")
     args = ap.parse_args()
 
     _warm_sudo()
@@ -578,8 +656,9 @@ def main() -> int:
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     dirty = " (dirty)" if git["dirty"] else ""
 
-    log_info(f"bench-cachyos v{ver} [{git['commit']}{dirty}]")
-    log_info(f"CPUs: {ncpus}  Iterations: {args.runs}")
+    if not log.child:
+        log_info(f"bench-cachyos v{ver} [{git['commit']}{dirty}]")
+        log_info(f"CPUs: {ncpus}  Iterations: {args.runs}")
 
     # WORKLOAD SELECTION + AVAILABILITY PROBE.
     wl_filter = set(w.strip() for w in args.workloads.split(",") if w.strip())
@@ -594,15 +673,23 @@ def main() -> int:
     if not active:
         log_error("No workloads available; exiting.")
         return 1
-    log_info(f"workloads ({len(active)}): {', '.join(w.label for w in active)}")
+    if not log.child:
+        log_info(f"workloads ({len(active)}): {', '.join(w.label for w in active)}")
 
     # SCHEDULER MATRIX. EEVDF, PANDEMONIUM BPF, PANDEMONIUM ADAPTIVE,
     # PLUS ANY EXTERNALS THE USER REQUESTED.
     entries: list[tuple[str, Optional[list[str]]]] = []
     if not args.pandemonium_only and not args.no_eevdf:
         entries.append(("EEVDF", None))
-    entries.append(("PANDEMONIUM (BPF)", [str(BINARY), "--no-adaptive"]))
-    entries.append(("PANDEMONIUM (ADAPTIVE)", [str(BINARY)]))
+    # A named --schedulers field is EEVDF vs EXACTLY those (PANDEMONIUM only if
+    # named) -- matching field_arms -- so PANDEMONIUM is not auto-added to a run
+    # that named someone else. Default and --all-scx / --pandemonium-only keep it.
+    _field_only = bool(args.schedulers) and not args.all_scx and not args.pandemonium_only
+    _named = ({s.strip().lower() for s in args.schedulers.split(",")}
+              if args.schedulers else set())
+    if (not _field_only) or (_named & {"pandemonium", "scx_pandemonium"}):
+        entries.append(("PANDEMONIUM (BPF)", [str(BINARY), "--no-adaptive"]))
+        entries.append(("PANDEMONIUM (ADAPTIVE)", [str(BINARY)]))
     if not args.pandemonium_only:
         # --all-scx runs the full installed production scx field (same set as
         # bench-fork-thread). scx_chaos is excluded (fault-injection test
@@ -617,15 +704,17 @@ def main() -> int:
         else:
             ext_list = [s.strip() for s in args.schedulers.split(",")]
         for ext in ext_list:
-            if not ext:
-                continue
+            if not ext or ext.strip().lower() in ("pandemonium", "scx_pandemonium",
+                                                  "eevdf"):
+                continue  # baseline / handled above, not an external to resolve
             p = find_scheduler(ext)
             if p:
                 entries.append((ext, [ext]))
             else:
                 log_warn(f"  external scheduler {ext} not found in PATH, skipping")
 
-    log_info(f"schedulers ({len(entries)}): {', '.join(n for n, _ in entries)}")
+    if not log.child:
+        log_info(f"schedulers ({len(entries)}): {', '.join(n for n, _ in entries)}")
     print()
 
     # DEACTIVATE ANY RUNNING SCX SCHEDULER BEFORE STARTING.
@@ -637,6 +726,9 @@ def main() -> int:
             log_error("Could not deactivate sched_ext")
             return 1
     time.sleep(1)
+
+    if args.trace:
+        return run_trace(entries, active, stamp, ncpus)
 
     # MAIN MATRIX LOOP.
     results: dict[str, dict[str, tuple[Optional[float], float]]] = {}
@@ -684,6 +776,11 @@ def main() -> int:
                     results[sched_name][wl.name] = (mean, sd)
                 else:
                     results[sched_name][wl.name] = (None, 0.0)
+                # Incremental .prom: rewrite from results-so-far after every cell
+                # so the run is watchable live (matches the rest of the suite).
+                # The authoritative final write happens after the loop.
+                write_prometheus(ver, git, stamp, ncpus, results,
+                                 [w.name for w in active], skipped)
                 time.sleep(1)
             stop_evt.set()
             if watch.get("reason") and sched_name not in skipped:
@@ -693,7 +790,7 @@ def main() -> int:
             time.sleep(2)
             print()
     except KeyboardInterrupt:
-        log_info("Interrupted")
+        log.interrupted()
     finally:
         if is_scx_active():
             wait_for_deactivation(5.0)
@@ -711,9 +808,9 @@ def main() -> int:
         report_path = write_report(ver, git, stamp, ncpus, results, args.runs, wl_order)
         prom_path = write_prometheus(ver, git, stamp, ncpus, results, wl_order, skipped)
         print()
-        print(report_path.read_text())
-        log_info(f"Report: {report_path}")
-        log_info(f"Prometheus: {prom_path}")
+        log.report(report_path.read_text())
+        log_info(f"REPORT: {report_path}")
+        log_info(f"METRICS: {prom_path}")
 
     return 0
 

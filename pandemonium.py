@@ -5,14 +5,18 @@ PANDEMONIUM build/run/install manager.
 Usage:
     ./pandemonium.py bench-scale  Unified throughput + latency benchmark
     ./pandemonium.py bench-pcpu        Per-CPU DSQ visibility stress test (v5.4.8)
+    ./pandemonium.py bench-coldwake    Cold-core ramp: cold-vs-warm work quantum + aperf/mperf freq
     ./pandemonium.py bench-contention  Contention stress test for v5.4.x features
     ./pandemonium.py bench-scx         scx CI compatibility test
     ./pandemonium.py bench-fork-thread  Fork/thread IPC benchmark + hw counters + non-compensatory regression gate
     ./pandemonium.py bench-ipc         IPC round-trip latency (front-end over bench-scale --ipc; same lifecycle + logging)
-    ./pandemonium.py bench-trace       montauk trace capture for external workloads (Ctrl+C to stop)
     ./pandemonium.py bench-power       Energy-efficiency benchmark (RAPL J/op + idle floor + C-state)
     ./pandemonium.py bench-cachyos     CachyOS Mini-Benchmarker suite (12 workloads, scheduler matrix)
     ./pandemonium.py bench-sys         Live system telemetry capture (Ctrl+C to stop)
+    ./pandemonium.py bench-enduser     One-command shareable report: specs + ranked misbehaving items + metrics (redacted, small)
+    ./pandemonium.py bench-enduser --workload "<cmd>"   Same report, captured on YOUR isolated workload (or --attach <comm>)
+    ./pandemonium.py bench-strand  Per-CPU kthread dispatch-strand gate (writeback-freeze repro, montauk kstrand verdict) [sudo]
+    ./pandemonium.py bench-locality Placement-locality probe (sched-messaging storm, montauk locality report: cache-tier migration distance + decay) [sudo]
     ./pandemonium.py install      Build + install + activate systemd service
     ./pandemonium.py clean        Wipe build artifacts
     ./pandemonium.py status       Show build/install status
@@ -227,6 +231,12 @@ def main() -> int:
              "bench-pcpu"] + sys.argv[2:],
             cwd=SCRIPT_DIR,
         ).returncode
+    elif cmd == "bench-coldwake":
+        return subprocess.run(
+            [sys.executable, str(SCRIPT_DIR / "tests" / "pandemonium-tests.py"),
+             "bench-coldwake"] + sys.argv[2:],
+            cwd=SCRIPT_DIR,
+        ).returncode
     elif cmd == "bench-fork-thread":
         return subprocess.run(
             [sys.executable, str(SCRIPT_DIR / "tests" / "bench-fork-thread.py")]
@@ -239,12 +249,6 @@ def main() -> int:
             + sys.argv[2:],
             cwd=SCRIPT_DIR,
         ).returncode
-    elif cmd == "bench-trace":
-        return subprocess.run(
-            [sys.executable, str(SCRIPT_DIR / "tests" / "pandemonium-tests.py"),
-             "bench-trace"] + sys.argv[2:],
-            cwd=SCRIPT_DIR,
-        ).returncode
     elif cmd == "bench-power":
         return subprocess.run(
             [sys.executable, str(SCRIPT_DIR / "tests" / "bench-power.py")]
@@ -254,6 +258,24 @@ def main() -> int:
     elif cmd == "bench-cachyos":
         return subprocess.run(
             [sys.executable, str(SCRIPT_DIR / "tests" / "bench-cachyos.py")]
+            + sys.argv[2:],
+            cwd=SCRIPT_DIR,
+        ).returncode
+    elif cmd == "bench-enduser":
+        return subprocess.run(
+            [sys.executable, str(SCRIPT_DIR / "tests" / "bench-enduser.py")]
+            + sys.argv[2:],
+            cwd=SCRIPT_DIR,
+        ).returncode
+    elif cmd == "bench-strand":
+        return subprocess.run(
+            [sys.executable, str(SCRIPT_DIR / "tests" / "bench-strand.py")]
+            + sys.argv[2:],
+            cwd=SCRIPT_DIR,
+        ).returncode
+    elif cmd == "bench-locality":
+        return subprocess.run(
+            [sys.executable, str(SCRIPT_DIR / "tests" / "bench-locality.py")]
             + sys.argv[2:],
             cwd=SCRIPT_DIR,
         ).returncode
