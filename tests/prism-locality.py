@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# bench-locality: placement-locality probe via montauk's generic `locality` report.
+# prism-locality: placement-locality probe via montauk's generic `locality` report.
 #
 # Runs a migration-heavy load (perf bench sched messaging -- the same storm the
 # fork-thread gate uses), captures it under montauk (--trace-out per-event stream
@@ -10,7 +10,7 @@
 # part the cross-L3/cross-socket tiers populate and the decay vs phi is the gate.
 #
 # The harness owns the montauk and load lifecycles -- no manual --trace / pkill.
-# Standalone (run under sudo) and part of the bench-* family.
+# Standalone (run under sudo) and part of the prism-* family.
 
 import argparse
 import os
@@ -113,6 +113,9 @@ def main() -> int:
                     help="perf bench sched messaging -l (messages/loop, default 1000)")
     ap.add_argument("--no-build", action="store_true",
                     help="skip the source-change rebuild check")
+    ap.add_argument("--pandemonium-only", action="store_true",
+                    help="accepted for `prism --dev` parity; this bench is "
+                         "PANDEMONIUM-only already (no EEVDF arm), so it is a no-op")
     args = ap.parse_args()
 
     if os.geteuid() != 0:
@@ -180,7 +183,7 @@ def main() -> int:
 
     # REPORT
     print()
-    log_info(f"bench-locality  (scheduler={sched or 'none'}, cores={online}, "
+    log_info(f"prism-locality  (scheduler={sched or 'none'}, cores={online}, "
              f"duration={args.duration:.0f}s)")
     if p.get("tiers"):
         print(table_header("tier", ["moves", "pct"]))

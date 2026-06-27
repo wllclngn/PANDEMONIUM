@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PANDEMONIUM bench-cachyos: CachyOS Mini-Benchmarker-style application suite.
+PANDEMONIUM prism-cachyos: CachyOS Mini-Benchmarker-style application suite.
 
 Models the Mini-Benchmarker workload set the CachyOS project uses for
 cross-kernel scheduler comparisons. Each workload runs N iterations under
@@ -23,12 +23,12 @@ asset setup):
     kernel-defconfig          requires kernel source clone (skip)
 
 Usage:
-    ./tests/bench-cachyos.py
-    ./tests/bench-cachyos.py --runs 5
-    ./tests/bench-cachyos.py --workloads xz-compression,primes
-    ./tests/bench-cachyos.py --schedulers scx_cake
-    ./tests/bench-cachyos.py --all-scx
-    ./tests/bench-cachyos.py --pandemonium-only
+    ./tests/prism-cachyos.py
+    ./tests/prism-cachyos.py --iterations 5
+    ./tests/prism-cachyos.py --workloads xz-compression,primes
+    ./tests/prism-cachyos.py --schedulers scx_cake
+    ./tests/prism-cachyos.py --all-scx
+    ./tests/prism-cachyos.py --pandemonium-only
 
 Prompts for sudo on entry; credentials are cached for the run and
 refreshed between schedulers.
@@ -66,7 +66,7 @@ find_scheduler = _tests.find_scheduler
 
 def _warm_sudo() -> None:
     """Prompt for sudo password if not cached. Subsequent sudo calls in
-    this script will use the cached credentials. Mirrors bench-power.py."""
+    this script will use the cached credentials. Mirrors prism-power.py."""
     r = subprocess.run(["sudo", "true"])
     if r.returncode != 0:
         log_error("sudo authentication failed")
@@ -79,7 +79,7 @@ def _refresh_sudo() -> None:
 
 # ASSET DIRECTORY. PERSISTENT TEST CORPUS, GENERATED FFMPEG CLONE,
 # AND GENERATED XZ INPUT FILE LIVE HERE BETWEEN INVOCATIONS.
-ASSET_DIR = LOG_DIR / "bench-cachyos-assets"
+ASSET_DIR = LOG_DIR / "prism-cachyos-assets"
 XZ_CORPUS = ASSET_DIR / "xz-corpus.bin"
 FFMPEG_SRC = ASSET_DIR / "ffmpeg-src"
 X265_OUTPUT = ASSET_DIR / "x265-output.hevc"
@@ -135,7 +135,7 @@ def run_stress_ng_cache(ncpus: int) -> Optional[float]:
 
 def run_perf_sched(ncpus: int) -> Optional[float]:
     # PERF BENCH SCHED MESSAGING, FIXED-WORK INVOCATION.
-    # MATCHES THE bench-fork-thread.py DEFAULT (-g 24 -l 6000) AT 12C
+    # MATCHES THE prism-fork-thread.py DEFAULT (-g 24 -l 6000) AT 12C
     # BUT SCALES THE LOOP COUNT DOWN AT LOWER CORE COUNTS.
     groups = 24
     loops = 6000
@@ -480,7 +480,7 @@ def write_report(ver: str, git: dict, stamp: str, ncpus: int,
         lines.append("* MARKS WINNER (LOWEST MEAN) PER ROW")
     text = "\n".join(lines) + "\n"
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    path = LOG_DIR / f"bench-cachyos-{stamp}.log"
+    path = LOG_DIR / f"prism-cachyos-{stamp}.log"
     path.write_text(text)
     return path
 
@@ -490,7 +490,7 @@ def write_prometheus(ver: str, git: dict, stamp: str, ncpus: int,
                      skipped: Optional[dict] = None) -> Path:
     """Prometheus textfile-collector style emission."""
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    path = LOG_DIR / f"bench-cachyos-{stamp}.prom"
+    path = LOG_DIR / f"prism-cachyos-{stamp}.prom"
     pb = PrometheusBuilder("cachyos")
     # Metadata lives in ONE _info gauge -- version/commit are no longer repeated
     # on every sample line.
@@ -570,7 +570,7 @@ WORKLOAD_TRACE_COMM = {
 
 
 def run_trace(entries, active, stamp, ncpus) -> int:
-    """`bench-cachyos --trace`: cycle the full matrix (every scheduler x every
+    """`prism-cachyos --trace`: cycle the full matrix (every scheduler x every
     workload) with montauk recording each workload's actual computation -- one
     recording per (scheduler, workload), patterned on that workload's comm.
 
@@ -620,9 +620,9 @@ def run_trace(entries, active, stamp, ncpus) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="PANDEMONIUM bench-cachyos: CachyOS Mini-Benchmarker-style suite",
+        description="PANDEMONIUM prism-cachyos: CachyOS Mini-Benchmarker-style suite",
     )
-    ap.add_argument("--runs", type=int, default=DEFAULT_RUNS,
+    ap.add_argument("--iterations", type=int, default=DEFAULT_RUNS,
                     help=f"Iterations per workload (default: {DEFAULT_RUNS})")
     ap.add_argument("--workloads", type=str, default="",
                     help="Comma-separated workload names (default: all available)")
@@ -657,8 +657,8 @@ def main() -> int:
     dirty = " (dirty)" if git["dirty"] else ""
 
     if not log.child:
-        log_info(f"bench-cachyos v{ver} [{git['commit']}{dirty}]")
-        log_info(f"CPUs: {ncpus}  Iterations: {args.runs}")
+        log_info(f"prism-cachyos v{ver} [{git['commit']}{dirty}]")
+        log_info(f"CPUs: {ncpus}  Iterations: {args.iterations}")
 
     # WORKLOAD SELECTION + AVAILABILITY PROBE.
     wl_filter = set(w.strip() for w in args.workloads.split(",") if w.strip())
@@ -692,7 +692,7 @@ def main() -> int:
         entries.append(("PANDEMONIUM (ADAPTIVE)", [str(BINARY)]))
     if not args.pandemonium_only:
         # --all-scx runs the full installed production scx field (same set as
-        # bench-fork-thread). scx_chaos is excluded (fault-injection test
+        # prism-fork-thread). scx_chaos is excluded (fault-injection test
         # scheduler, not a contender); scx_layered needs a layer spec and may
         # self-skip without one. Otherwise honor --schedulers.
         if args.all_scx:
@@ -721,7 +721,7 @@ def main() -> int:
     if is_scx_active():
         name = scx_scheduler_name()
         log_warn(f"sched_ext is active ({name}) -- stopping pandemonium service")
-        subprocess.run(["sudo", "systemctl", "stop", "pandemonium"], capture_output=True)
+        _tests.stop_systemd_scheduler()
         if not wait_for_deactivation(5.0):
             log_error("Could not deactivate sched_ext")
             return 1
@@ -762,7 +762,7 @@ def main() -> int:
             for wl in active:
                 _refresh_sudo()
                 log_info(f"  [{sched_name}] {wl.label}")
-                samples = run_workload_n_times(wl, args.runs, ncpus)
+                samples = run_workload_n_times(wl, args.iterations, ncpus)
                 reason = watch.get("reason") or _sched_crashed(guard, expected_ops)
                 if reason:
                     log_error(f"[{sched_name}] CRASHED during {wl.label} -- {reason}")
@@ -805,7 +805,7 @@ def main() -> int:
 
     if results:
         wl_order = [w.name for w in active]
-        report_path = write_report(ver, git, stamp, ncpus, results, args.runs, wl_order)
+        report_path = write_report(ver, git, stamp, ncpus, results, args.iterations, wl_order)
         prom_path = write_prometheus(ver, git, stamp, ncpus, results, wl_order, skipped)
         print()
         log.report(report_path.read_text())

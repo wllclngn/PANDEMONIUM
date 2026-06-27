@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""bench-enduser: turn a scheduler problem into one shareable file.
+"""prism: turn a scheduler problem into one shareable file.
 
 For when the system stutters or lags under load. It runs a short fixed profile
 (cachyos + fork-thread + ipc) under your scheduler and EEVDF as a neutral
@@ -32,9 +32,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from pandemonium_common import (  # noqa: E402
     log, get_version, get_git_info, log_info, log_warn, log_error,
     MONTAUK, montauk_available, DmesgMonitor, montauk_trace, install_hint,
-    TRACE_DIR, LOG_DIR, get_online_cpus,
+    TRACE_DIR, LOG_DIR, get_online_cpus, get_possible_cpus,
     is_scx_active, scx_scheduler_name, wait_for_deactivation,
-    stall_susceptibility,
+    stall_susceptibility, median, restore_all_cpus,
+    eject_scheduler, install_exit_guard,
 )
 
 TESTS_DIR = Path(__file__).resolve().parent
@@ -44,7 +45,7 @@ REPO_ROOT = TESTS_DIR.parent
 MONTAUK_INSTALLED = Path(MONTAUK)
 MONTAUK_ANALYZE_INSTALLED = MONTAUK_INSTALLED.with_name("montauk_analyze")
 
-# montauk is not bundled. When it is missing, bench-enduser clones it from the
+# montauk is not bundled. When it is missing, prism clones it from the
 # canonical repo and drives montauk's OWN installer -- it is a wrapper, not a
 # packager. The clone is a fresh shallow checkout each run.
 MONTAUK_REPO = "https://github.com/wllclngn/montauk.git"
@@ -72,7 +73,7 @@ MONTAUK_BUILD_HINTS = {
 }
 
 # Frozen profile: short, native-core, traced. Kept stable so a report compares
-# against the archived bench-enduser baseline (and across users).
+# against the archived prism baseline (and across users).
 PROFILE_ITERATIONS = 3
 # Light cachyos workloads ONLY -- the suite's ffmpeg/kernel-build workloads are
 # far too heavy for an end-user report. Cache-relevant and fast.
@@ -123,24 +124,23 @@ def _prompt_yn(question: str) -> bool:
 
 
 def welcome(trace_mode: bool = False) -> None:
-    log_info("bench-enduser: turn a scheduler problem into one shareable file")
+    log_info("PRISM turns a scheduler problem into one shareable file.")
+    log_info("These are synthetic benchmarks -- they approximate the stutter and lag")
+    log_info("you feel under load, but are not real-world usage.")
+    print()
     if trace_mode:
-        log_info("  you have isolated the problem to one program -- this traces")
-        log_info("  THAT program under the scheduler you are running now and")
-        log_info("  names what misbehaves, captured on your real workload.")
+        log_info("You isolated it to one program: this traces THAT program under your")
+        log_info("current scheduler and names what misbehaves on your workload.")
     else:
-        log_info("  for when the system stutters or lags under load: it runs a")
-        log_info("  short profile under your scheduler and EEVDF (a neutral")
-        log_info("  reference) and names what misbehaves under each.")
-    log_info("  montauk measures it; the report ranks the offenders by name --")
-    log_info("  hot CPUs, livelocking tasks, waiters left unsignaled -- over")
-    log_info("  your specs and the key latency metrics, in ONE small file.")
-    log_info("  the maintainer reads the same ranked list you do, so nothing")
-    log_info("  is lost in translation. names are hashed, nothing is uploaded,")
-    log_info("  raw traces stay local. share the one file it prints at the end.")
+        log_info("A short profile runs under your scheduler and EEVDF (a neutral")
+        log_info("reference), naming what misbehaves under each.")
+    log_info("montauk measures; the report ranks the offenders by name -- hot CPUs,")
+    log_info("livelocking tasks, unsignaled waiters -- with your specs and the key")
+    log_info("latency metrics, in one small file a maintainer reads as you do.")
+    log_info("Names are hashed, nothing is uploaded, raw traces stay local; share the")
+    log_info("one file it prints at the end.")
     if not trace_mode:
-        log_info("  this may take five-plus minutes depending on your system "
-                 "architecture.")
+        log_info("This may take five-plus minutes depending on your system.")
     print()
 
 
@@ -232,7 +232,7 @@ def _repo_montauk_version() -> tuple | None:
 
 def ensure_montauk() -> tuple[bool, bool, bool]:
     """(available, installed_by_us, uninstall_after). Asks both consent prompts
-    up front, clones the repo, and drives montauk's OWN installer -- bench-enduser
+    up front, clones the repo, and drives montauk's OWN installer -- prism
     wraps montauk's install, it does not package binaries. A KEEP install runs
     `install.py` (permanent, capped, to /usr/local); an ephemeral one builds the
     clone and copies the two binaries into place for a clean two-file removal.
@@ -357,10 +357,10 @@ def _sched_flags(bench: str, schedulers: str, all_scx: bool) -> list[str]:
     named); --all-scx runs the full installed field; neither runs EEVDF +
     PANDEMONIUM. Each bench gets only the flag form it parses:
       cachyos / fork-thread / burst-starvation / sojourn-pressure : --all-scx | --schedulers
-      ipc (-> bench-scale)                                        : --schedulers"""
+      ipc (-> prism-scale)                                        : --schedulers"""
     takes_all = bench in ("cachyos", "fork-thread", "burst-starvation",
                           "sojourn-pressure", "cold-wake")
-    takes_list = bench in ("cachyos", "fork-thread", "ipc", "burst-starvation",
+    takes_list = bench in ("cachyos", "fork-thread", "ipc", "scale", "burst-starvation",
                            "sojourn-pressure", "cold-wake")
     if all_scx and takes_all:
         return ["--all-scx"]
@@ -375,52 +375,26 @@ def _stop_running_scheduler() -> None:
     registered -- above all the systemd `pandemonium` service. If one is, every
     bench's activation wedges on it ("waiting for scheduler cleanup: pandemonium
     still registered"). The service is Restart=on-failure, so a clean stop sticks
-    for the whole run. We already run as root (the main() self-elevate)."""
+    for the whole run. Called post-elevation (run_profile, already root) and
+    pre-elevation (the --dev path), so prefix sudo only when not already root."""
     if not is_scx_active():
         return
     log_warn(f"sched_ext active ({scx_scheduler_name()}) -- stopping the "
              f"pandemonium service for the profile")
-    subprocess.run(["systemctl", "stop", "pandemonium"], capture_output=True)
+    sudo = [] if os.geteuid() == 0 else ["sudo"]
+    subprocess.run(sudo + ["systemctl", "stop", "pandemonium"], capture_output=True)
     if not wait_for_deactivation(10.0):
         log_warn("a scheduler is still registered after stop -- benches may "
                  "fail to activate (clear it: sudo systemctl stop pandemonium)")
 
 
-def _eject_scheduler() -> None:
-    """On Ctrl+C, leave NO sched_ext scheduler registered -- the user interrupted
-    and expects the box back on stock EEVDF, not stranded under a bench's
-    scheduler. Ctrl+C already SIGINT'd the bench subprocess and the scheduler it
-    spawned (shared process group); the systemd pandemonium service is NOT in
-    that group, so stop it explicitly, then wait. If a scheduler ignored the
-    signal, force-kill it by exact comm (safe -- never matches the harness)."""
-    if not is_scx_active():
-        return
-    name = scx_scheduler_name()
-    log_warn(f"interrupted -- ejecting active scheduler ({name})")
-    subprocess.run(["systemctl", "stop", "pandemonium"], capture_output=True)
-    if wait_for_deactivation(8.0):
-        log_info("scheduler ejected -- back on stock EEVDF")
-        return
-    # An external scheduler (scx_cake etc.) loaded by a child bench is a bare
-    # process that systemctl does not own, and its sched_ext OPS name ("cake")
-    # differs from its process comm ("scx_cake") -- so a pkill on the OPS name
-    # alone misses it. Try the ops name, the scx_-prefixed comm, then a cmdline
-    # match, killing whichever the running scheduler actually goes by.
-    if name:
-        pats = [name] if name.startswith("scx_") else [name, f"scx_{name}"]
-        for p in pats:
-            subprocess.run(["pkill", "-KILL", "-x", p], capture_output=True)
-        if not wait_for_deactivation(3.0):
-            subprocess.run(["pkill", "-KILL", "-f", f"scx_{name}"],
-                           capture_output=True)
-    if wait_for_deactivation(5.0):
-        log_info("scheduler force-ejected -- back on stock EEVDF")
-    else:
-        log_warn("scheduler still registered -- clear with: "
-                 "sudo systemctl stop pandemonium  (or reboot)")
+# The scheduler eject moved to pandemonium_common.eject_scheduler -- the suite's
+# one canonical exit cleanup (imported above), shared with pandemonium-tests.py
+# and every other entry point. No private copy here.
 
 
-def run_profile(schedulers: str, all_scx: bool, ultra: bool = False) -> list[Path]:
+def run_profile(schedulers: str, all_scx: bool, ultra: bool = False,
+                pandemonium_only: bool = False) -> list[Path]:
     """Run the frozen profile, traced. Returns fresh recording dirs. With no flag
     the field is EEVDF + PANDEMONIUM; --all-scx adds every installed scx (keeps
     PANDEMONIUM); --schedulers L compares EEVDF vs exactly the named schedulers
@@ -437,50 +411,51 @@ def run_profile(schedulers: str, all_scx: bool, ultra: bool = False) -> list[Pat
     # drops the pin so they fall to the suite's full compute_core_counts() sweep.
     width_flags = [] if ultra else ["--core-counts", str(ncpus)]
     benches = [
-        ("cachyos", [py, str(TESTS_DIR / "bench-cachyos.py"),
-                     "--trace", "--runs", "1",
+        ("cachyos", [py, str(TESTS_DIR / "prism-cachyos.py"),
+                     "--trace", "--iterations", "1",
                      "--workloads", PROFILE_CACHYOS_WORKLOADS]),
-        ("fork-thread", [py, str(TESTS_DIR / "bench-fork-thread.py"),
+        ("fork-thread", [py, str(TESTS_DIR / "prism-fork-thread.py"),
                          "--quick", "--trace", "--compare-eevdf",
                          "--iterations", str(PROFILE_ITERATIONS)]),
-        ("ipc", [py, str(TESTS_DIR / "bench-ipc.py"),
+        ("ipc", [py, str(TESTS_DIR / "prism-ipc.py"),
                  "--trace", "--core-counts", str(ncpus)]),
-        # The two width-specific faults: burst-starvation (bench-pcpu's per-CPU
-        # DSQ "probe during burst") bites at 2C, sojourn-pressure (bench-
+        # The two width-specific faults: burst-starvation (prism-pcpu's per-CPU
+        # DSQ "probe during burst") bites at 2C, sojourn-pressure (prism-
         # contention's deep-batch rescue phase) blows up at 8C. Native width by
         # default; --ultra sweeps all widths so the cadence is visible. Each
         # capture is capped to its natural test-suite duration (15s), not longer.
         ("burst-starvation", [py, str(TESTS_DIR / "pandemonium-tests.py"),
-                              "bench-pcpu", "--trace", "--duration", "15",
+                              "prism-pcpu", "--trace", "--duration", "15",
                               *width_flags]),
         ("sojourn-pressure", [py, str(TESTS_DIR / "pandemonium-tests.py"),
-                              "bench-contention", "--phase", "sojourn-pressure",
+                              "prism-contention", "--phase", "sojourn-pressure",
                               "--trace", "--duration", "15", *width_flags]),
         # Cold-wake: cycle a pinned core idle->bare-wake under powersave so
         # montauk's COLD-WAKE block separates a frequency-ramp (governor /
         # architecture) from a dispatch delay (the scheduler) on the first wake
         # off a deep-idle core -- the cost side of the envelope's idle win.
         ("cold-wake", [py, str(TESTS_DIR / "pandemonium-tests.py"),
-                       "bench-coldwake", "--trace", "--duration", "60"]),
+                       "prism-coldwake", "--trace", "--duration", "60"]),
         # Storm: the cpu_release kick-storm reproducer (powersave). Drives the
         # boot/heavy-fork condition synthetically and scores storm% + real-IPI vs
         # IDLE-churn from the scheduler tick log -- the failure mode the other
         # benches (warm, controlled) never trigger. BPF arm only.
         ("storm", [py, str(TESTS_DIR / "pandemonium-tests.py"),
-                   "bench-coldwake", "--storm", "--duration", "30"]),
+                   "prism-coldwake", "--storm", "--duration", "30"]),
     ]
     for name, cmd in benches:
         # Stop any registered scheduler before EVERY bench, not just once: some
         # benches restore the systemd pandemonium service when they finish (ipc /
-        # bench-scale logs "PANDEMONIUM service restored"), which would re-wedge
+        # prism-scale logs "PANDEMONIUM service restored"), which would re-wedge
         # the next bench's activation. A clean stop sticks (Restart=on-failure).
         _stop_running_scheduler()
         log.section(f"{_PROFILE_LABELS.get(name, name)}: TRACE")
         # Child mode: the sub-bench suppresses its own banner/preamble/report/
         # dmesg so the profile reads as one uniform progress log (TERMINAL_STYLE).
         child_env = {**os.environ, "PANDEMONIUM_CHILD": "1"}
-        r = subprocess.run(cmd + _sched_flags(name, schedulers, all_scx),
-                           cwd=TESTS_DIR, env=child_env)
+        sflags = (["--pandemonium-only"] if pandemonium_only
+                  else _sched_flags(name, schedulers, all_scx))
+        r = subprocess.run(cmd + sflags, cwd=TESTS_DIR, env=child_env)
         if r.returncode != 0:
             log_warn(f"[{name}] exited {r.returncode} -- continuing")
     # Recordings created this run (montauk --trace writes dirs under TRACE_DIR).
@@ -761,9 +736,8 @@ def _coldwork_ramp(rec_dir: Path) -> str | None:
         return None
     if not cpu and not mem:
         return None
-    def p50(v: list) -> int:
-        s = sorted(v)
-        return s[len(s) // 2] if s else 0
+    def p50(v: list) -> float:
+        return median(v) if v else 0.0
     parts = []
     if mem:
         wmult, wlbl, wcold = 1.0, "", 0.0
@@ -785,33 +759,25 @@ def _coldwork_ramp(rec_dir: Path) -> str | None:
 
 
 def _storm_section() -> str:
-    """Score the storm reproducer's tick log into a report block. bench-coldwake
-    --storm writes storm-*.tick to LOG_DIR; the newest is this run's. The storm is
-    the one failure the warm/controlled benches never trigger, so the shareable
-    report has to carry its verdict -- storm% and real-IPI-vs-IDLE-churn, plus a
-    WATCHDOG-ABORT flag if the monitor starved and the scheduler self-ejected."""
+    """Surface montauk's storm verdict into the report. trace_storm_cycle writes
+    storm-*.storm (the `montauk_analyze --report storm` output) to LOG_DIR; the newest
+    is this run's. The storm is the one failure the warm/controlled benches never
+    trigger, so the shareable report carries montauk's verdict -- storm% and the
+    REAL-IPI-vs-IDLE-churn classification, straight from the trace."""
+    reps = sorted(LOG_DIR.glob("storm-*.storm"), key=lambda p: p.stat().st_mtime)
+    if not reps:
+        return ""
     try:
-        import storm_score
-    except Exception:
+        text = reps[-1].read_text()
+    except OSError:
         return ""
-    ticks = sorted(LOG_DIR.glob("storm-*.tick"), key=lambda p: p.stat().st_mtime)
-    if not ticks:
+    verdict = next((ln.strip() for ln in text.splitlines()
+                    if ln.strip().startswith("VERDICT")), "")
+    if not verdict:
         return ""
-    d = storm_score.score(str(ticks[-1]))
-    if "error" in d:
-        note = " -- WATCHDOG ABORT (scheduler self-ejected)" if d.get("aborted") else ""
-        return f"STORM  (cpu_release flood, powersave)\n  {d['error']}{note}"
-    out = ["STORM  (cpu_release flood, powersave -- lower storm% is better)"]
-    if d.get("aborted"):
-        out.append("  WATCHDOG ABORT -- monitor starved >10s, scheduler self-ejected")
-    out.append(f"  storm        {d['pct']:.1f}% ({d['storm']}/{d['ticks']} ticks)  "
-               f"d/s p50={d['p50']} max={d['dmax']}")
-    if d["sample"]:
-        out.append(f"  kicks        {d['real']} real-IPI / {d['churn']} idle-churn "
-                   f"-- {d['kind']}")
-    else:
-        out.append("  kicks        no storm ticks -- clean")
-    return "\n".join(out)
+    body = verdict[len("VERDICT:"):].strip() if verdict.startswith("VERDICT:") else verdict
+    return ("STORM  (cpu_release flood, powersave -- lower storm% is better)\n"
+            f"  {body}")
 
 
 def build_report(recs: list[Path], tag: str, stamp: str,
@@ -822,7 +788,7 @@ def build_report(recs: list[Path], tag: str, stamp: str,
     dirty = "-dirty" if git.get("dirty") else ""
     # Header matches the suite convention: <name> v<ver> [<commit><dirty>] [<mode>]
     # then a meta line; no decorative separators anywhere.
-    lines = [f"bench-enduser v{ver} [{git['commit']}{dirty}] [{tag}]",
+    lines = [f"PRISM v{ver} [{git['commit']}{dirty}] [{tag}]",
              f"captured: {stamp}",
              ""]
     analyze = _analyze_bin()
@@ -878,13 +844,18 @@ def build_report(recs: list[Path], tag: str, stamp: str,
     if dmesg.crashed and not stab_text:
         lines += ["", f"SCHEDULER CRASH: {dmesg.crash_msg}"]
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    path = LOG_DIR / f"enduser-report-{ver}-{stamp}.txt"
+    path = LOG_DIR / f"prism-report-{ver}-{stamp}.txt"
     path.write_text("\n".join(lines) + "\n")
     return path
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__)
+    ap = argparse.ArgumentParser(
+        description="PRISM: shine a system under load through it and read the "
+                    "diagnostic spectrum. Default (no flag) = the end-user pass "
+                    "(a short profile plus the forensics scrape, one shareable "
+                    "report). --dev <name> runs one sustained validation; "
+                    "--dev all the full sweep; --list shows the workloads.")
     ap.add_argument("--schedulers", default="", metavar="LIST",
                     help="comma-separated scx schedulers to add to the cachyos "
                          "suite, e.g. scx_rusty,scx_lavd (EEVDF + PANDEMONIUM are "
@@ -911,6 +882,21 @@ def main() -> int:
                          "instead of native width only. Surfaces width-cadence "
                          "bugs but writes one trace dir per width per scheduler -- "
                          "many files, sizes from KB to hundreds of MB")
+    ap.add_argument("--dev", nargs="*", default=None, metavar="WORKLOAD",
+                    help="run ONE OR MORE sustained dev validations by name (fork-thread, "
+                         "strand, storm, pcpu, contention, scale, locality, cold-wake, "
+                         "ipc, power, cachyos, scx), or 'all' for the full sweep. "
+                         "Bare --dev lists them.")
+    ap.add_argument("--list", action="store_true",
+                    help="list the PRISM workloads (default + dev tiers) and exit")
+    ap.add_argument("--trace", action="store_true",
+                    help="force a montauk capture for --dev workloads (trace-capable "
+                         "ones capture anyway; this also forces the longrun/mixed probe "
+                         "capture in scale)")
+    ap.add_argument("--pandemonium-only", action="store_true",
+                    help="skip the EEVDF baseline (and any external schedulers) -- run "
+                         "only the PANDEMONIUM arms. Propagates to the default profile "
+                         "and every --dev workload.")
     args = ap.parse_args()
 
     # --schedulers and --all-scx are two ways to pick the SAME thing (the
@@ -922,10 +908,78 @@ def main() -> int:
         log_warn("  --all-scx                          compare against the full field")
         return 1
 
+    # PRISM dev tier: the sustained validations, gated behind --dev. PRISM is the one
+    # bench entry -- it dispatches each workload to its implementer script DIRECTLY
+    # (pandemonium-tests.py / prism-*.py), never back through pandemonium.py.
+    _pt = str(TESTS_DIR / "pandemonium-tests.py")
+    PRISM_DEV = {
+        "fork-thread": [str(TESTS_DIR / "prism-fork-thread.py")],
+        "strand":      [str(TESTS_DIR / "prism-strand.py")],
+        "locality":    [str(TESTS_DIR / "prism-locality.py")],
+        "cold-wake":   [_pt, "prism-coldwake"],
+        "storm":       [_pt, "prism-coldwake", "--storm"],
+        "pcpu":        [_pt, "prism-pcpu"],
+        "contention":  [_pt, "prism-contention"],
+        "scale":       [_pt, "prism-scale"],
+        "ipc":         [str(TESTS_DIR / "prism-ipc.py")],
+        "power":       [str(TESTS_DIR / "prism-power.py")],
+        "cachyos":     [str(TESTS_DIR / "prism-cachyos.py")],
+        "scx":         [_pt, "prism-scx"],
+    }
+    # Iteration-based dev workloads: each runs N trials and pools samples, so
+    # --iterations N beats down their per-run p99 noise. The duration-based benches
+    # (cold-wake, power, locality, ...) sample over time, not trials, so PRISM does
+    # not pass --iterations to them (they would reject the flag).
+    PRISM_DEV_ITER = {"fork-thread", "ipc", "scale", "cachyos"}
+    if args.list or args.dev == []:
+        log_info("PRISM -- shine the system through it, read the spectrum:")
+        log_info("  (no flag)         the end-user pass: short profile + forensics scrape, one report")
+        for n in PRISM_DEV:
+            log_info(f"  --dev {n:<13} sustained validation (dev-gated)")
+        log_info("  --dev all         run every sustained validation in sequence")
+        return 0
+    if args.dev:
+        names = list(PRISM_DEV) if "all" in args.dev else args.dev
+        unknown = [n for n in names if n not in PRISM_DEV]
+        if unknown:
+            log_error(f"unknown --dev workload: {', '.join(unknown)} (try --list)")
+            return 2
+        # SELF-ELEVATE only when --trace is explicitly passed: the montauk capture needs
+        # root (eBPF attach + a writable /tmp/pandemonium), so re-exec under sudo rather
+        # than make the user type it. Without --trace, --dev stays pre-elevation, no re-exec.
+        if os.geteuid() != 0 and args.trace:
+            os.execvp("sudo", ["sudo", sys.executable, *sys.argv])
+        # Canonical exit guard for the --dev path (the profile path ejects in main's
+        # except/finally). On Ctrl+C: eject the benched scheduler and re-online every
+        # CPU the width loop offlined -- an interrupt never leaves the box stuck on a
+        # CPU subset under PANDEMONIUM. The child bench installs the same guard; both
+        # are idempotent.
+        install_exit_guard(eject=True)
+        rc = 0
+        for n in names:
+            log_info(f"PRISM --dev: {n}")
+            # Pre-flight stop, exactly as run_profile does before every bench: a prior
+            # run restores the systemd pandemonium service, so the implementer's width
+            # loop would otherwise offline cores under a stale scheduler (hotplug) and
+            # wedge on its bpffs-pin teardown (libbpf statfs -ENOENT). --dev is
+            # pre-elevation; _stop_running_scheduler sudo's as needed.
+            _stop_running_scheduler()
+            dev_cmd = list(PRISM_DEV[n])
+            if args.pandemonium_only:
+                dev_cmd.append("--pandemonium-only")
+            elif args.schedulers or args.all_scx:
+                dev_cmd += _sched_flags(n, args.schedulers, args.all_scx)
+            if args.iterations > 1 and n in PRISM_DEV_ITER:
+                dev_cmd += ["--iterations", str(args.iterations)]
+            if args.trace:
+                dev_cmd.append("--trace")
+            rc = subprocess.run([sys.executable, *dev_cmd]).returncode or rc
+        return rc
+
     if os.geteuid() != 0:
         # SELF-ELEVATE: the report flow needs root end-to-end (montauk eBPF
         # attach + sched_ext load + RAPL/PMU), so re-exec under sudo rather than
-        # make the user type it -- matches bench-fork-thread and the rest of the
+        # make the user type it -- matches prism-fork-thread and the rest of the
         # suite. Everything below then inherits root; recordings chown back via
         # SUDO_USER and the report lands in the invoking user's ~/.cache.
         os.execvp("sudo", ["sudo", sys.executable, *sys.argv])
@@ -945,7 +999,7 @@ def main() -> int:
     ver = get_version()
     git = get_git_info()
     dirty = "-dirty" if git.get("dirty") else ""
-    log_info(f"bench-enduser v{ver} [{git['commit']}{dirty}] [{tag}]")
+    log_info(f"PRISM v{ver} [{git['commit']}{dirty}] [{tag}]")
     print()
     welcome(trace_mode)
 
@@ -991,7 +1045,8 @@ def main() -> int:
                 print()
                 report = build_report([rec], tag, stamp, dmesg, cleanroom)
             else:
-                recs = run_profile(args.schedulers, args.all_scx, args.ultra)
+                recs = run_profile(args.schedulers, args.all_scx, args.ultra,
+                                   args.pandemonium_only)
                 dmesg.check()
                 if not recs:
                     # No-load fallback: the scheduler never produced a recording
@@ -1019,11 +1074,25 @@ def main() -> int:
         # whatever is registered and leave the box on stock EEVDF. Trace mode
         # rides the user's CURRENT scheduler -- never eject that.
         print()
-        if not trace_mode:
-            _eject_scheduler()
+        # Re-online every CPU BEFORE the eject -- disabling sched_ext while a CPU
+        # is offline deadlocks cpu_hotplug_lock on 7.1.1+ (silent box freeze). The
+        # finally below restores as a backstop; doing it here keeps the eject from
+        # ever running on a hotplugged-down CPU set.
+        try:
+            restore_all_cpus(get_possible_cpus())
+        except Exception:
+            pass
+        eject_scheduler(trace_mode)
         raise
     finally:
         remove_montauk_if_ours(installed_by_us, uninstall_after)
+        # BACKSTOP: the scale/contention arms offline CPUs via hotplug; the bench subprocess
+        # restores them on its own SIGINT (_cleanup_on_exit), but if it was killed before that
+        # could run, restore here so the box is NEVER left stuck on a subset of cores. Idempotent.
+        try:
+            restore_all_cpus(get_possible_cpus())
+        except Exception:
+            pass
     return 0
 
 
@@ -1033,3 +1102,511 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         log.interrupted()
         sys.exit(130)
+
+
+# system-forensics (absorbed) -- the hang-finder: discover log sources, find the
+# event, scrape its window, analyze. Entry renamed main -> forensics_main and the
+# standalone __main__ block dropped; logic otherwise unchanged. Wiring into the run
+# sequence and the unified report happens in the adjustments pass.
+
+#!/usr/bin/env python3
+"""
+system-forensics.py -- find a past hang and explain it.
+
+This is a backward-looking hang-finder. It scrapes the system to DISCOVER every
+log source (no paths supplied), searches them to FIND the hang event, SCRAPES the
+window around it, ANALYZES that window, and REPORTS what the hang was. Run with no
+arguments and it locates the most recent hang on the box and tells you the cause.
+
+It classifies into the failure taxonomy this night produced:
+
+  GPU-DISPLAY   amdgpu DMUB/FAMS2/DRR firmware hang, NVIDIA Xid, or a compositor
+                blocked/crashed in its DRM present path
+  IO-WEDGE      a per-CPU kworker that completes writeback or mm-drains is not
+                running -- D-state piles up; khugepaged stuck in lru_add_drain is
+                the mm-workqueue-livelock variant
+  SCHED-WEDGE   sched_ext ejected/faulted, a lockup/RCU stall, or a runnable task
+                left undispatched
+  USER-CRASH    a userspace process segfaulted; the coredump names the frame
+
+montauk is the only tracer; sublimation does the stream and numeric analysis. The
+silence-gap heuristic catches the wedge that kills journald before it can flush.
+
+Modes:
+  (no args)         find + analyze the most recent hang
+  --list            discover sources + list every candidate event, no deep dive
+  --boot N          restrict to journald boot N (0=current, -1=previous, ...)
+  --at "HH:MM"      analyze the event nearest a time
+  --live            snapshot the CURRENT system state instead of hunting the past
+  --wedge           live: trigger sysrq dumps first (run over SSH while frozen)
+"""
+
+import argparse
+import glob
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+REPORT_LINES: list[str] = []
+
+
+def log(level: str, msg: str) -> None:
+    line = f"[{datetime.now():%H:%M:%S}] [{level:<5}]   {msg}"
+    print(line, flush=True)
+    REPORT_LINES.append(line)
+
+
+def info(m): log("INFO", m)
+def warn(m): log("WARN", m)
+def error(m): log("ERROR", m)
+
+
+def section(title: str) -> None:
+    REPORT_LINES.append("")
+    info(title)
+
+
+def run(cmd: list[str], stdin: str | None = None, timeout: float = 30.0) -> tuple[int, str]:
+    try:
+        p = subprocess.run(cmd, input=stdin, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, (p.stdout or "") + (p.stderr or "")
+    except FileNotFoundError:
+        return 127, ""
+    except subprocess.TimeoutExpired:
+        return 124, ""
+
+
+def read(path: str) -> str:
+    try:
+        with open(path, "r", errors="replace") as fp:
+            return fp.read()
+    except OSError:
+        return ""
+
+
+class Tools:
+    def __init__(self):
+        self.montauk = shutil.which("montauk")
+        self.montauk_analyze = shutil.which("montauk_analyze")
+        self.sublimation = shutil.which("sublimation")
+        self.coredumpctl = shutil.which("coredumpctl")
+        self.journalctl = shutil.which("journalctl")
+        self.is_root = (os.geteuid() == 0)
+
+
+# sublimation does stream filtering and numeric shape, per the standing rule.
+def sub_grep(t: Tools, text: str, pattern: str, flags: list[str] | None = None) -> list[str]:
+    if not text:
+        return []
+    if t.sublimation:
+        rc, out = run([t.sublimation, "grep", *(flags or []), pattern], stdin=text)
+        if rc in (0, 1):
+            return [ln for ln in out.splitlines() if ln]
+    rx = re.compile(pattern, re.IGNORECASE if (flags and "-i" in flags) else 0)
+    return [ln for ln in text.splitlines() if rx.search(ln)]
+
+
+def sub_classify(t: Tools, numbers: list[float]) -> str:
+    if not numbers:
+        return "(empty)"
+    if t.sublimation:
+        rc, out = run([t.sublimation, "classify"], stdin="\n".join(map(str, numbers)) + "\n")
+        if rc == 0 and out.strip():
+            return out.strip()
+    return f"n={len(numbers)} min={min(numbers):.1f} max={max(numbers):.1f}"
+
+
+# DISCOVER ------------------------------------------------------------------
+class Source:
+    def __init__(self, name: str, kind: str, recency: int):
+        self.name = name        # human label
+        self.kind = kind        # journal-boot | dmesg | varlog | captured | pstore | montauk
+        self.recency = recency  # higher = more recent; current boot beats prior
+        self._text: str | None = None
+        self._fetch = None      # callable -> str
+
+    def text(self) -> str:
+        if self._text is None:
+            self._text = self._fetch() if self._fetch else ""
+        return self._text
+
+
+def discover_sources(t: Tools) -> list[Source]:
+    section("DISCOVER  (scraping the system for log sources)")
+    sources: list[Source] = []
+
+    # journald boots -- enumerate so prior boots (where a wedge lives) are reachable
+    if t.journalctl:
+        rc, out = run([t.journalctl, "--list-boots", "--no-pager"], timeout=15)
+        if rc == 0:
+            boots = []
+            for ln in out.splitlines():
+                m = re.match(r"\s*(-?\d+)\s", ln)
+                if m:
+                    boots.append(int(m.group(1)))
+            for b in sorted(boots, reverse=True)[:5]:  # current + 4 prior
+                s = Source(f"journal boot {b}", "journal-boot", 1000 + b)
+                s._fetch = (lambda bb=b: run([t.journalctl, "-k", "-b", str(bb), "--no-pager"], timeout=25)[1])
+                sources.append(s)
+
+    # current kernel ring buffer
+    s = Source("dmesg (live ring buffer)", "dmesg", 999)
+    s._fetch = lambda: run(["dmesg", "-T"])[1]
+    sources.append(s)
+
+    # /var/log text logs
+    for pat in ("kern.log", "messages", "syslog", "Xorg.0.log", "Xorg.0.log.old"):
+        for p in glob.glob(f"/var/log/{pat}"):
+            s = Source(p, "varlog", 500)
+            s._fetch = (lambda pp=p: read(pp))
+            sources.append(s)
+
+    # pstore -- a crash dmesg saved across a reboot, if ramoops/ERST is set up
+    for p in glob.glob("/sys/fs/pstore/*"):
+        s = Source(p, "pstore", 800)
+        s._fetch = (lambda pp=p: read(pp))
+        sources.append(s)
+
+    # artifacts the operator already captured
+    for pat in (os.path.expanduser("~/hang-*.log"),
+                "/tmp/pandemonium/*.stdout", "/tmp/pandemonium/*.txt",
+                "/tmp/*hang*.log", "/tmp/*stack*.txt"):
+        for p in glob.glob(pat):
+            if os.path.basename(p).startswith("forensics-"):
+                continue  # our own report output -- not a log, would self-reference
+            s = Source(p, "captured", 700)
+            s._fetch = (lambda pp=p: read(pp))
+            sources.append(s)
+
+    for s in sources:
+        info(f"  found: {s.name}")
+    if not sources:
+        warn("no log sources discovered")
+    return sources
+
+
+# FIND ----------------------------------------------------------------------
+# pattern -> (kind, severity). Higher severity wins when ranking events.
+SIGNATURES = [
+    (r"blocked for more than \d+ seconds|hung_task",              "hung_task",   9),
+    (r"watchdog: BUG: soft lockup|hard LOCKUP",                   "lockup",      9),
+    (r"rcu_sched.*stall|rcu_preempt.*stall|RCU.*CPU.*stall",      "rcu_stall",   8),
+    (r"kernel BUG|general protection fault|Oops:|Kernel panic",   "oops",        9),
+    (r"Out of memory|invoked oom-killer|oom-kill",               "oom",         7),
+    (r"sched_ext.*(ops_error|error exit|EXIT)|scx.*ops_error",    "scx_eject",   8),
+    (r"segfault at|SIGSEGV|traps:.*SIGSEGV",                      "segfault",    6),
+    (r"NVRM:?.*Xid|Xid \(PCI",                                    "nvidia_xid",  7),
+    (r"ring .* timeout|amdgpu.*reset|\[drm\].*reset",            "gpu_reset",   8),
+]
+
+
+class Event:
+    def __init__(self, kind: str, severity: int, source: Source, line: str):
+        self.kind = kind
+        self.severity = severity
+        self.source = source
+        self.line = line.strip()
+        self.ts = leading_timestamp(line)
+        self.order = 0  # line index within the source, for windowing
+
+
+def leading_timestamp(line: str) -> str:
+    m = re.match(r"\[(.*?)\]", line)                          # dmesg -T or [secs]
+    if m:
+        return m.group(1)
+    m = re.match(r"([A-Z][a-z]{2}\s+\d+\s+\d\d:\d\d:\d\d)", line)  # journald
+    if m:
+        return m.group(1)
+    return "?"
+
+
+def find_events(t: Tools, sources: list[Source]) -> list[Event]:
+    section("FIND  (searching every source for hang signatures)")
+    events: list[Event] = []
+    for s in sources:
+        text = s.text()
+        if not text:
+            continue
+        # strip firewall noise so the silence-gap and signatures are not buried
+        clean_lines = sub_grep(t, text, "UFW BLOCK", ["-v"]) or text.splitlines()
+        clean = "\n".join(clean_lines)
+        for pat, kind, sev in SIGNATURES:
+            for ln in sub_grep(t, clean, pat, ["-i"]):
+                events.append(Event(kind, sev, s, ln))
+        # silence gap: the wedge that kills journald before it can flush. If the
+        # log ends shortly after "sched_ext enabled" with no further real kernel
+        # line, the box went dark and could not write the hung_task it suffered.
+        enabled = [i for i, ln in enumerate(clean_lines)
+                   if re.search(r"BPF scheduler .* enabled|sched_ext.* enabled", ln, re.I)]
+        if enabled:
+            tail = clean_lines[enabled[-1] + 1:]
+            real = [ln for ln in tail if ln.strip() and "kernel:" in ln]
+            if len(real) <= 2 and s.kind in ("journal-boot", "captured", "dmesg"):
+                events.append(Event("silence_gap", 6, s, clean_lines[enabled[-1]]))
+    info(f"candidate events: {len(events)}")
+    # coredumps are their own source of truth for USER-CRASH
+    if t.coredumpctl:
+        rc, out = run([t.coredumpctl, "list", "--no-pager", "--reverse"], timeout=15)
+        if rc == 0:
+            for ln in out.splitlines()[1:8]:
+                if re.search(r"SIGSEGV|SIGABRT|SIGBUS|SIGILL", ln):
+                    parts = ln.split()
+                    pid = parts[4] if len(parts) > 4 and parts[4].isdigit() else None
+                    exe = os.path.basename(parts[-2]) if len(parts) >= 2 else "?"
+                    ts = " ".join(parts[0:3])
+                    src = Source(f"coredump {exe} @ {ts}", "coredump", 850)
+                    if pid:
+                        src._fetch = (lambda pp=pid: run([t.coredumpctl, "info", pp, "--no-pager"], timeout=15)[1])
+                    ev = Event("coredump", 7, src, ln)
+                    ev.ts = ts
+                    events.append(ev)
+    return events
+
+
+def pick_event(events: list[Event], args) -> Event | None:
+    if not events:
+        return None
+    pool = events
+    if args.boot is not None:
+        pool = [e for e in events if e.source.name == f"journal boot {args.boot}"] or events
+    if args.at:
+        pool = sorted(pool, key=lambda e: (abs_time_dist(e.ts, args.at), -e.severity))
+        return pool[0]
+    # default: most severe, then most recent source
+    return sorted(pool, key=lambda e: (e.severity, e.source.recency), reverse=True)[0]
+
+
+def abs_time_dist(ts: str, target: str) -> int:
+    m = re.search(r"(\d\d):(\d\d)(?::(\d\d))?", ts)
+    n = re.search(r"(\d\d):(\d\d)(?::(\d\d))?", target)
+    if not (m and n):
+        return 10 ** 9
+    a = int(m[1]) * 3600 + int(m[2]) * 60 + int(m[3] or 0)
+    b = int(n[1]) * 3600 + int(n[2]) * 60 + int(n[3] or 0)
+    return abs(a - b)
+
+
+# SCRAPE --------------------------------------------------------------------
+def scrape_window(t: Tools, event: Event) -> str:
+    text = event.source.text()
+    if not text:
+        return event.line
+    lines = text.splitlines()
+    idx = next((i for i, ln in enumerate(lines) if event.line[:80] in ln), None)
+    if idx is None:
+        # coredump info / pstore: the line is not literally inside the fetched
+        # text, but the text IS the evidence (the backtrace) -- return its head.
+        head = [ln for ln in lines if ln.strip()][:32]
+        return "\n".join(head) if head else event.line
+    # a hung_task / oops has a Call Trace block below it; grab generously, then
+    # stop at </TASK> or the next unrelated timestamped line cluster.
+    start = max(0, idx - 2)
+    end = idx + 1
+    block = []
+    for j in range(idx, min(len(lines), idx + 60)):
+        block.append(lines[j])
+        if "</TASK>" in lines[j] or re.search(r"RSP:|R13:|R15:", lines[j]):
+            end = j + 1
+            break
+        end = j + 1
+    return "\n".join(lines[start:end])
+
+
+# ANALYZE -------------------------------------------------------------------
+def classify(window: str) -> tuple[str, str]:
+    w = window.lower()
+    if re.search(r"dmub|fams2|dc_dmub|\bdrr\b", w):
+        return ("GPU-DISPLAY", "amdgpu DMUB / Freesync DRR firmware hang -- a kworker is stuck in the display "
+                               "microcontroller mailbox holding the DRM lock. Disable VRR or amdgpu.dcdebugmask, "
+                               "update kernel+firmware.")
+    if re.search(r"testpresentation|drmoutput|setuplayers|compositor.*composite", w):
+        return ("USER-CRASH", "compositor blocked/crashed in its DRM frame-presentation path -- display stack, "
+                              "not the run-queue. Update the compositor/driver, file the coredump.")
+    if re.search(r"lru_add_drain|kcompactd|khugepaged.*flush|page.?reclaim", w):
+        return ("IO-WEDGE", "per-CPU mm-workqueue drain not completing (lru_add_drain_all -> flush_work) -- the "
+                            "khugepaged-hang livelock. DISCRIMINATOR: rerun the same load under EEVDF; survives = "
+                            "scheduler, also hangs = workload thrashing the kernel mm path.")
+    if re.search(r"fdatasync|folio_wait|btrfs.*wait|writeback|ordered_range", w):
+        return ("IO-WEDGE", "fsync/writeback waiter blocked behind a stranded per-CPU I/O-completion kworker. The "
+                           "nr_cpus_allowed==1 direct-dispatch fix is the remedy; confirm with montauk kstrand.")
+    if re.search(r"ops_error|sched_ext.*(error|exit)|scx.*exit", w):
+        return ("SCHED-WEDGE", "sched_ext scheduler reported an error/exit -- it ejected or faulted. Analyze the "
+                              "montauk trace and pull a live backtrace with --wedge.")
+    if re.search(r"nvrm.*xid|xid \(pci", w):
+        return ("GPU-DISPLAY", "NVIDIA Xid GPU fault -- update the driver, check explicit-sync.")
+    if re.search(r"soft lockup|hard lockup|rcu.*stall", w):
+        return ("SCHED-WEDGE", "lockup/stall detector fired -- a CPU spun without forward progress.")
+    if re.search(r"segfault|sigsegv", w):
+        return ("USER-CRASH", "a userspace process segfaulted -- the coredump backtrace names where.")
+    return ("UNKNOWN", "signature found but no specific class matched -- read the scraped window above.")
+
+
+def analyze_event(t: Tools, event: Event, window: str) -> None:
+    section("ANALYZE")
+    info(f"event: {event.kind}  severity {event.severity}  at {event.ts}  in [{event.source.name}]")
+    info("scraped window:")
+    for ln in window.splitlines()[:40]:
+        info(f"  {ln.strip()[:150]}")
+
+    # lock-ownership edges the kernel prints, plus the scx-frame liveness check
+    edges = sub_grep(t, window, r"is blocked on a (mutex|rwsem|lock) likely owned by")
+    for e in edges:
+        info(f"  EDGE: {e.strip()[:150]}")
+    scx = sub_grep(t, window, r"find_user_dsq|scx_|consume_dispatch")
+    if scx:
+        stale = all(s.strip().startswith("?") or "? " in s for s in scx)
+        info(f"  scheduler frames present ({len(scx)}); "
+             + ("all '?' stale-unwind -- scheduler not on the live path" if stale
+                else "on a LIVE path -- scheduler implicated"))
+
+    # if a montauk trace covers this window, let the instrument speak
+    traces = glob.glob("/tmp/pandemonium/*.events") + glob.glob("/tmp/pandemonium/**/*.prom", recursive=True)
+    if traces and t.montauk_analyze:
+        newest = max(traces, key=os.path.getmtime)
+        info(f"montauk artifact found: {newest} -- analyzing")
+        rc, out = run([t.montauk_analyze, newest, "--report", "kstrand,dispatch-stall,endstate"], timeout=45)
+        if rc == 0:
+            for ln in out.splitlines():
+                if ln.startswith("REPORT") or "VERDICT" in ln or "strand" in ln.lower():
+                    info(f"  {ln.strip()[:150]}")
+
+    klass, guidance = classify(window)
+    section("VERDICT")
+    info(f"CAUSE: {klass}")
+    info(f"WHAT:  {event.kind} at {event.ts} ({event.source.name})")
+    info(f"NEXT:  {guidance}")
+
+
+# LIVE SNAPSHOT (the old behaviour, demoted to a mode) ----------------------
+def live_snapshot(t: Tools) -> None:
+    section("LIVE SNAPSHOT  (current system state)")
+    base = "/sys/kernel/sched_ext"
+    if os.path.isdir(base):
+        info(f"scx state: {read(os.path.join(base, 'state')).strip() or '?'}   "
+             f"ops: {read(os.path.join(base, 'root', 'ops')).strip() or 'none'}")
+    la = read("/proc/loadavg").split()
+    ncpu = os.cpu_count() or 1
+    if len(la) >= 4:
+        info(f"load average: {la[0]} {la[1]} {la[2]}   runnable/total: {la[3]}")
+        try:
+            if float(la[0]) > 4 * ncpu:
+                warn(f"load {float(la[0]):.0f} = {float(la[0]) / ncpu:.0f}x cores -- run-queue pileup")
+        except ValueError:
+            pass
+    for res in ("io", "cpu", "memory"):
+        txt = read(f"/proc/pressure/{res}")
+        m = re.search(r"some avg10=([\d.]+)", txt)
+        if m:
+            info(f"PSI {res:<6} some avg10={m.group(1)}%")
+    # top CPU consumers (kworker-mm churn shows here)
+    def snap():
+        out = {}
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            st = read(f"/proc/{pid}/stat")
+            if not st:
+                continue
+            try:
+                comm = st[st.index("(") + 1:st.rindex(")")]
+                fld = st[st.rindex(")") + 2:].split()
+                out[pid] = (comm, int(fld[11]) + int(fld[12]))
+            except (ValueError, IndexError):
+                continue
+        return out
+    a = snap(); time.sleep(0.7); b = snap()
+    hz = os.sysconf("SC_CLK_TCK") or 100
+    rows = sorted(((100.0 * (b[p][1] - a[p][1]) / (0.7 * hz), p, b[p][0])
+                   for p in b if p in a and b[p][1] > a[p][1]), reverse=True)
+    info("top CPU consumers:")
+    mm = 0
+    for pct, p, comm in rows[:12]:
+        info(f"  {pct:6.1f}%  pid {p:>7}  {comm}")
+        if re.search(r"kworker.*-mm|kworker.*mm_p", comm):
+            mm += 1
+    if mm >= 4:
+        warn(f"{mm} mm-workqueue kworkers churning without completing -- the lru_add_drain livelock; "
+             f"rerun under EEVDF to split scheduler vs workload")
+    d = sum(1 for p in os.listdir("/proc") if p.isdigit()
+            and (read(f"/proc/{p}/stat").split(") ")[-1:] or [""])[0][:1] == "D")
+    info(f"D-state tasks: {d}")
+
+
+def wedge_capture(t: Tools) -> None:
+    section("LIVE WEDGE CAPTURE  (sysrq -> ring buffer, bypassing the wedged disk)")
+    if not t.is_root:
+        error("--wedge needs root (writes /proc/sysrq-trigger). Rerun over SSH as root.")
+        return
+    try:
+        with open("/proc/sys/kernel/sysrq", "w") as fp:
+            fp.write("1")
+    except OSError:
+        pass
+    for key, what in (("w", "blocked/D-state tasks"), ("l", "backtrace every CPU"), ("t", "all task states")):
+        info(f"sysrq {key}: {what}")
+        try:
+            with open("/proc/sysrq-trigger", "w") as fp:
+                fp.write(key)
+        except OSError as e:
+            warn(f"sysrq {key} failed: {e}")
+        time.sleep(0.5)
+
+
+# MAIN ----------------------------------------------------------------------
+def forensics_main() -> int:
+    ap = argparse.ArgumentParser(description="Find a past hang and explain it (montauk + sublimation).")
+    ap.add_argument("--list", action="store_true", help="discover sources + list candidate events, no deep dive")
+    ap.add_argument("--boot", type=int, default=None, help="restrict to journald boot N (0 current, -1 previous)")
+    ap.add_argument("--at", default=None, help="analyze the event nearest a time, e.g. 12:43")
+    ap.add_argument("--live", action="store_true", help="snapshot CURRENT state instead of hunting the past")
+    ap.add_argument("--wedge", action="store_true", help="live: sysrq dumps first, then hunt (run over SSH while frozen)")
+    ap.add_argument("--out", default=None, help="report path (default /tmp/pandemonium/)")
+    args = ap.parse_args()
+
+    t = Tools()
+    info(f"system-forensics on {os.uname().nodename}  kernel {os.uname().release}  "
+         f"root={'yes' if t.is_root else 'NO -- reduced coverage'}")
+    info(f"tools: montauk_analyze={'y' if t.montauk_analyze else 'n'} "
+         f"sublimation={'y' if t.sublimation else 'n'} journalctl={'y' if t.journalctl else 'n'} "
+         f"coredumpctl={'y' if t.coredumpctl else 'n'}")
+    if not t.sublimation:
+        warn("sublimation not on PATH -- stream/numeric analysis falls back to plain Python (install it)")
+
+    if args.wedge:
+        wedge_capture(t)
+
+    if args.live:
+        live_snapshot(t)
+    else:
+        sources = discover_sources(t)
+        events = find_events(t, sources)
+        if args.list or not events:
+            section("CANDIDATE EVENTS")
+            if not events:
+                info("no hang signature found in any source. If a freeze was real and left nothing,")
+                info("it was a non-crashing GUI stall that recovered -- rerun --wedge WHILE it is frozen.")
+            for e in sorted(events, key=lambda e: (e.severity, e.source.recency), reverse=True)[:25]:
+                info(f"  sev{e.severity}  {e.kind:<12} {e.ts:<22} [{e.source.name}]  {e.line[:80]}")
+        else:
+            event = pick_event(events, args)
+            window = scrape_window(t, event)
+            analyze_event(t, event, window)
+            others = [e for e in sorted(events, key=lambda e: (e.severity, e.source.recency), reverse=True)
+                      if e is not event][:8]
+            if others:
+                section("OTHER CANDIDATE EVENTS")
+                for e in others:
+                    info(f"  sev{e.severity}  {e.kind:<12} {e.ts:<22} [{e.source.name}]")
+
+    out = args.out or f"/tmp/pandemonium/forensics-{datetime.now():%Y%m%d-%H%M%S}.txt"
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    with open(out, "w") as fp:
+        fp.write("\n".join(REPORT_LINES) + "\n")
+    info(f"report written: {out}")
+    return 0
+
+

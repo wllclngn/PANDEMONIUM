@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""bench-plot: render a bench-scale .prom into a shareable PNG.
+"""prism-plot: render a prism-scale .prom into a shareable PNG.
 
 Two styles:
   --style bars  (default)  vertical grouped bars of ONE metric across core
@@ -8,9 +8,9 @@ Two styles:
                            format: workloads as rows at a fixed core count, one
                            bar per scheduler, value labels, light theme.
 
-  ./tests/bench-plot.py                                  # newest .prom, latency, bars
-  ./tests/bench-plot.py FILE --metric ipc_p99            # a specific metric
-  ./tests/bench-plot.py FILE --style cachyos --exclude scx_cosmos
+  ./tests/prism-plot.py                                  # newest .prom, latency, bars
+  ./tests/prism-plot.py FILE --metric ipc_p99            # a specific metric
+  ./tests/prism-plot.py FILE --style cachyos --exclude scx_cosmos
 """
 
 import argparse
@@ -215,7 +215,7 @@ def render_bars(path, args):
     ax.legend(facecolor="#181825", edgecolor="#313244", labelcolor="#cdd6f4",
               fontsize=9, ncol=2, loc="best")
     fig.tight_layout(rect=[0, 0.04, 1, 1])
-    out = args.out or (f"bench-{args.metric}-{meta['version']}.png")
+    out = args.out or (f"prism-{args.metric}-{meta['version']}.png")
     return fig, out, f"{len(scheds)} schedulers, cores={cores}"
 
 
@@ -266,12 +266,12 @@ def render_cachyos(path, args):
                  fontsize=12)
     ax.legend(loc="lower right", fontsize=9)
     fig.tight_layout()
-    out = args.out or (f"bench-cachyos-{cores}C-{meta['version']}.png")
+    out = args.out or (f"prism-cachyos-{cores}C-{meta['version']}.png")
     return fig, out, f"{nsched} schedulers at {cores}C, {nrows} workloads"
 
 
 def parse_cachyos_suite(path):
-    # bench-cachyos suite .prom: pandemonium_bench_cachyos_seconds{scheduler,
+    # prism-cachyos suite .prom: pandemonium_bench_cachyos_seconds{scheduler,
     # workload,stat="mean"|"stdev"}. Returns {scheduler: {workload: mean_s}}, meta.
     data, meta = {}, {"version": "?"}
     for raw in Path(path).read_text().splitlines():
@@ -295,12 +295,12 @@ def parse_cachyos_suite(path):
     return data, meta
 
 
-# STYLE: bench-cachyos suite total wall-time, one bar per scheduler, fastest on
+# STYLE: prism-cachyos suite total wall-time, one bar per scheduler, fastest on
 # top, PANDEMONIUM outlined. The full-field "dominance" chart -- lower is better.
 def render_cachyos_suite(path, args):
     data, meta = parse_cachyos_suite(path)
     if not data:
-        log_error("no bench-cachyos suite data (expected pandemonium_cachyos_seconds)")
+        log_error("no prism-cachyos suite data (expected pandemonium_cachyos_seconds)")
         return None
     exclude = {x.strip() for x in args.exclude.split(",") if x.strip()}
     nwl = max((len(w) for w in data.values()), default=0)
@@ -346,16 +346,16 @@ def render_cachyos_suite(path, args):
                  f"{cpu}  ·  {nwl} workloads  ·  {os.uname().release}  ·  {path.name}",
                  fontsize=12)
     fig.tight_layout()
-    out = args.out or f"bench-cachyos-suite-{meta['version']}.png"
+    out = args.out or f"prism-cachyos-suite-{meta['version']}.png"
     return fig, out, f"{n} schedulers, {nwl} workloads"
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Render a bench-scale .prom into a PNG.")
+    ap = argparse.ArgumentParser(description="Render a prism-scale .prom into a PNG.")
     ap.add_argument("file", nargs="?", help="explicit .prom (default: newest in cache)")
     ap.add_argument("--style", default="bars",
                     choices=["bars", "cachyos", "cachyos-suite"],
-                    help="cachyos-suite: bench-cachyos total wall-time per scheduler "
+                    help="cachyos-suite: prism-cachyos total wall-time per scheduler "
                          "(the full-field dominance chart)")
     ap.add_argument("--metric", default="latency_p99", choices=list(METRICS),
                     help="(bars style only)")
@@ -370,11 +370,11 @@ def main():
     if args.file:
         path = Path(args.file)
     elif args.style == "cachyos-suite":
-        # newest bench-cachyos suite .prom (not version-prefixed like bench-scale)
-        cands = sorted(Path(args.cache_dir).glob("bench-cachyos-*.prom"),
+        # newest prism-cachyos suite .prom (not version-prefixed like prism-scale)
+        cands = sorted(Path(args.cache_dir).glob("prism-cachyos-*.prom"),
                        key=lambda p: p.stat().st_mtime, reverse=True)
         if not cands:
-            log_error("no bench-cachyos .prom found")
+            log_error("no prism-cachyos .prom found")
             return 1
         path = cands[0]
     else:
@@ -383,7 +383,7 @@ def main():
                  if not p.name.startswith("analysis-")
                  and re.match(r"\d+\.\d+\.\d+-", p.name)]
         if not cands:
-            log_error("no bench-scale .prom found")
+            log_error("no prism-scale .prom found")
             return 1
         path = cands[0]
 

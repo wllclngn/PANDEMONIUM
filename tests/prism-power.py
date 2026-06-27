@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PANDEMONIUM bench-power: scheduler energy efficiency comparison.
+PANDEMONIUM prism-power: scheduler energy efficiency comparison.
 
 Compares EEVDF, PANDEMONIUM (BPF), PANDEMONIUM (ADAPTIVE), and any
 installed external scx schedulers on three workload classes:
@@ -27,17 +27,17 @@ installed the bench also samples Avg_MHz, %C6 residency, PkgWatt, and
 PkgTmp throughout the run.
 
 Output: human-readable column report at
-~/.cache/pandemonium/bench-power-<stamp>.log plus a sibling Prometheus
-.prom matching the bench-scale emission shape so the file folds into
+~/.cache/pandemonium/prism-power-<stamp>.log plus a sibling Prometheus
+.prom matching the prism-scale emission shape so the file folds into
 the existing reporting pipeline.
 
 Usage:
-    sudo ./tests/bench-power.py
-    sudo ./tests/bench-power.py --workload idle-floor
-    sudo ./tests/bench-power.py --runs 10 --cooldown 60
-    sudo ./tests/bench-power.py --schedulers scx_lavd,scx_bpfland
-    sudo ./tests/bench-power.py --pandemonium-only
-    sudo ./tests/bench-power.py --no-build
+    sudo ./tests/prism-power.py
+    sudo ./tests/prism-power.py --workload idle-floor
+    sudo ./tests/prism-power.py --iterations 10 --cooldown 60
+    sudo ./tests/prism-power.py --schedulers scx_lavd,scx_bpfland
+    sudo ./tests/prism-power.py --pandemonium-only
+    sudo ./tests/prism-power.py --no-build
 """
 
 import argparse
@@ -56,7 +56,7 @@ from pandemonium_common import (
     LOG_DIR, ARCHIVE_DIR, BINARY,
     get_version, get_git_info,
     log, log_info, log_warn, log_error,
-    mean_stdev,
+    mean_stdev, mean,
     is_scx_active, scx_scheduler_name,
     wait_for_deactivation,
     ensure_build, PrometheusBuilder,
@@ -356,7 +356,7 @@ def parse_turbostat_output(text: str) -> dict:
     for key in keys:
         vals = [row[key] for row in summaries if key in row]
         if vals:
-            out[key] = sum(vals) / len(vals)
+            out[key] = mean(vals)
     out["_samples"] = len(summaries)
     return out
 
@@ -573,7 +573,7 @@ def write_report(version: str, git: dict, stamp: str, ncpus: int,
     archive."""
     R: list[str] = []
     dirty = " (dirty)" if git["dirty"] else ""
-    R.append(f"PANDEMONIUM bench-power v{version} [{git['commit']}{dirty}]")
+    R.append(f"PANDEMONIUM prism-power v{version} [{git['commit']}{dirty}]")
     R.append(f"cpu:        {model} ({vendor})")
     R.append(f"ncpus:      {ncpus}")
     R.append(f"runs:       {runs} per (scheduler, workload)")
@@ -585,7 +585,7 @@ def write_report(version: str, git: dict, stamp: str, ncpus: int,
     workloads = sorted({wl for results in all_results.values() for wl in results})
     if not workloads:
         R.append("(no successful workload runs)")
-        path = LOG_DIR / f"bench-power-{stamp}.log"
+        path = LOG_DIR / f"prism-power-{stamp}.log"
         path.write_text("\n".join(R) + "\n")
         return path
 
@@ -697,7 +697,7 @@ def write_report(version: str, git: dict, stamp: str, ncpus: int,
             R.append("")
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    path = LOG_DIR / f"bench-power-{stamp}.log"
+    path = LOG_DIR / f"prism-power-{stamp}.log"
     path.write_text("\n".join(R) + "\n")
     return path
 
@@ -764,7 +764,7 @@ def write_prometheus(version: str, git: dict, stamp: str, ncpus: int,
                          help=f"turbostat {ts_key} averaged across run samples", labels=ls)
 
     ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
-    path = ARCHIVE_DIR / f"bench-power-{version}-{stamp}.prom"
+    path = ARCHIVE_DIR / f"prism-power-{version}-{stamp}.prom"
     path.write_text(pb.render())
     return path
 
@@ -826,7 +826,7 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--workload", choices=("all",) + WORKLOADS, default="all",
                     help="Which workload to run (default: all)")
-    ap.add_argument("--runs", type=int, default=DEFAULT_RUNS,
+    ap.add_argument("--iterations", type=int, default=DEFAULT_RUNS,
                     help=f"Iterations per (scheduler, workload) cell (default {DEFAULT_RUNS})")
     ap.add_argument("--cooldown", type=int, default=DEFAULT_COOLDOWN_SECS,
                     help=f"Seconds between runs (default {DEFAULT_COOLDOWN_SECS})")
@@ -858,7 +858,7 @@ def main() -> int:
     vendor = detect_cpu_vendor()
     model = detect_cpu_model()
 
-    log_info(f"bench-power v{ver} [{git['commit']}{' (dirty)' if git['dirty'] else ''}]")
+    log_info(f"prism-power v{ver} [{git['commit']}{' (dirty)' if git['dirty'] else ''}]")
     log_info(f"CPU: {model} ({vendor})  ncpus: {n_cpus}")
 
     power_events = detect_perf_power_events()
@@ -885,16 +885,15 @@ def main() -> int:
     if not workloads:
         log_error("No workloads to run")
         return 1
-    log_info(f"workloads: {', '.join(workloads)}  runs/cell: {args.runs}  "
+    log_info(f"workloads: {', '.join(workloads)}  runs/cell: {args.iterations}  "
              f"cooldown: {args.cooldown}s")
     print()
 
-    # Disengage any active sched_ext before starting (matches bench-fork-thread)
+    # Disengage any active sched_ext before starting (matches prism-fork-thread)
     if is_scx_active():
         active = scx_scheduler_name()
         log_warn(f"sched_ext active ({active}) -- stopping pandemonium service")
-        subprocess.run(["sudo", "systemctl", "stop", "pandemonium"],
-                       capture_output=True)
+        _tests.stop_systemd_scheduler()
         if not wait_for_deactivation(5.0):
             log_error("Could not deactivate sched_ext")
             return 1
@@ -925,10 +924,10 @@ def main() -> int:
 
             try:
                 for wl in workloads:
-                    log_info(f"  [{wl}] {args.runs} runs")
+                    log_info(f"  [{wl}] {args.iterations} runs")
                     runs: list[dict] = []
-                    for i in range(args.runs):
-                        log_info(f"    run {i+1}/{args.runs}...")
+                    for i in range(args.iterations):
+                        log_info(f"    run {i+1}/{args.iterations}...")
                         result = run_workload(wl, power_events, n_cpus,
                                               turbostat_path)
                         if result and "counters" in result:
@@ -938,7 +937,7 @@ def main() -> int:
                         else:
                             log_warn("      run failed")
                         runs.append(result)
-                        if i < args.runs - 1:
+                        if i < args.iterations - 1:
                             cooldown(args.cooldown)
 
                     agg = aggregate_runs(runs)
@@ -966,9 +965,9 @@ def main() -> int:
         print()
         report_path = write_report(ver, git, stamp, n_cpus, vendor, model,
                                    power_events, turbostat_path is not None,
-                                   args.runs, args.cooldown, all_results)
+                                   args.iterations, args.cooldown, all_results)
         prom_path = write_prometheus(ver, git, stamp, n_cpus, vendor, model,
-                                     power_events, args.runs, args.cooldown,
+                                     power_events, args.iterations, args.cooldown,
                                      all_results)
         log.report(report_path.read_text())
         log_info(f"REPORT: {report_path}")

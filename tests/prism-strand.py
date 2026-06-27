@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# bench-strand: per-CPU kthread dispatch-strand validation.
+# prism-strand: per-CPU kthread dispatch-strand validation.
 #
 # Induces the writeback-freeze condition -- every non-drain core saturated while
 # a fsync/writeback storm keeps the per-CPU block-I/O-completion and writeback
@@ -16,7 +16,7 @@
 # PANDEMONIUM's pinned-task work-conservation (the enqueue fast-path that routes a
 # 1-CPU task straight to its own per-CPU DSQ and KICK_PREEMPTs it).
 #
-# Standalone (run directly under sudo) and part of the bench-* family.
+# Standalone (run directly under sudo) and part of the prism-* family.
 
 import argparse
 import ctypes
@@ -282,7 +282,7 @@ def run_probe(mode: str, args, sched: str, online: int, drain: int,
 
     # REPORT
     print()
-    log_info(f"bench-strand [{mode}] {verdict}  (scheduler={sched or 'none'}, "
+    log_info(f"prism-strand [{mode}] {verdict}  (scheduler={sched or 'none'}, "
              f"cores={online}, duration={args.duration:.0f}s)")
     log_info(f"strands {parsed.get('strands', 0)} across {parsed.get('kthreads', 0)} "
              f"kthreads | worst HELD {held:.1f}ms DARK {darkw:.1f}ms | "
@@ -342,8 +342,11 @@ def main() -> int:
                     help="writeback scratch directory")
     ap.add_argument("--no-build", action="store_true",
                     help="skip the source-change rebuild check")
+    ap.add_argument("--pandemonium-only", action="store_true",
+                    help="accepted for `prism --dev` parity; this bench is "
+                         "PANDEMONIUM-only already (no EEVDF arm), so it is a no-op")
     ap.add_argument("--coldwake", action="store_true",
-                    help="also run bench-coldwake after the strand probe -- co-located "
+                    help="also run prism-coldwake after the strand probe -- co-located "
                          "suite (both exercise cold/idle-core dispatch + montauk capture)")
     args = ap.parse_args()
 
@@ -386,14 +389,14 @@ def main() -> int:
     for m in modes:
         rc = max(rc, run_probe(m, args, sched, online, drain, scratch, stamp))
 
-    # Co-located suite: bench-coldwake runs its own (unmodified) cold-core ramp
+    # Co-located suite: prism-coldwake runs its own (unmodified) cold-core ramp
     # after the strand probe -- one command, both behaviors, neither blended.
     if args.coldwake:
         print()
-        log_info("co-located suite: running bench-coldwake (cold-core ramp)...")
+        log_info("co-located suite: running prism-coldwake (cold-core ramp)...")
         cw = subprocess.run(
             [sys.executable, str(Path(__file__).parent / "pandemonium-tests.py"),
-             "bench-coldwake"],
+             "prism-coldwake"],
             cwd=Path(__file__).parent.parent)
         rc = max(rc, cw.returncode)
     return rc

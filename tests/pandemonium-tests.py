@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-PANDEMONIUM bench-scale orchestrator.
+PANDEMONIUM prism-scale orchestrator.
 
 Unified throughput + latency benchmark with Prometheus metrics output.
 
 Usage:
-    ./tests/pandemonium-tests.py bench-scale
-    ./tests/pandemonium-tests.py bench-scale --iterations 3
-    ./tests/pandemonium-tests.py bench-scale --schedulers scx_rusty,scx_bpfland
+    ./tests/pandemonium-tests.py prism-scale
+    ./tests/pandemonium-tests.py prism-scale --iterations 3
+    ./tests/pandemonium-tests.py prism-scale --schedulers scx_rusty,scx_bpfland
 """
 
 import argparse
@@ -34,17 +34,25 @@ from pandemonium_common import (
     wait_for_activation, wait_for_deactivation, wait_for_no_scheduler,
     set_cpu_online, restrict_cpus, restore_all_cpus, CpuGuard,
     get_possible_cpus, get_online_cpus, compute_core_counts,
-    mean_stdev, percentile,
-    montauk_trace, montauk_available,
-    measure_ipc_cell, IPC_DEFAULT_ROUNDS, IPC_RTT_PRIMS, IPC_COMM,
+    mean_stdev, percentile, mean as sub_mean, variance as sub_variance,
+    montauk_trace, montauk_available, MONTAUK,
     PrometheusBuilder, table_header, table_row,
     stall_susceptibility,
+    install_exit_guard, register_exit_cleanup,
+    cpu_release_deprecated,
+)
+from ipc_workload import (
+    measure_ipc_cell, IPC_DEFAULT_ROUNDS, IPC_RTT_PRIMS, IPC_COMM,
 )
 
 
 # CONFIGURATION
 
 DEFAULT_EXTERNALS = []
+
+# montauk comm for the latency probe (run_probe sets it via prctl) -- lets montauk
+# target JUST the probe in the longrun/mixed phases, not the 16 stress workers.
+PROBE_COMM = "pand-probe"
 
 
 # BUILD HELPERS
@@ -87,6 +95,43 @@ def find_scheduler(name: str) -> str | None:
     return shutil.which(name)
 
 
+# Active scheduler guards, force-ejected on interrupt or normal exit. sched_ext
+# schedulers run in their OWN process group (start_scheduler: preexec_fn=os.setpgrp),
+# so a Ctrl+C to prism's foreground group never reaches them, and __del__-based cleanup
+# does NOT reliably run on KeyboardInterrupt or interpreter exit -- without this an
+# interrupted run leaves the scheduler REGISTERED and the system stays on it. stop()
+# escalates SIGINT -> SIGKILL, and a SIGKILL'd loader makes the kernel auto-unregister,
+# so this ejects even a hung scheduler.
+_ACTIVE_GUARDS: set = set()
+
+
+def _eject_active_schedulers():
+    for g in list(_ACTIVE_GUARDS):
+        try:
+            g.stop()
+        except Exception:
+            pass
+
+
+# CANONICAL exit cleanup -- pandemonium_common.install_exit_guard is the suite's
+# ONE Ctrl+C / exit handler. Register this bench's scheduler-guard teardown as an
+# extra cleanup; the robust eject (systemctl + force-kill by comm) and the CPU
+# re-online are the module's job. The old hand-rolled _cleanup_on_exit /
+# _fatal_signal_eject ejected only the spawned guards via a process-group SIGINT --
+# which missed the systemd scheduler and left the box stuck on a CPU subset. Gone.
+register_exit_cleanup(_eject_active_schedulers)
+install_exit_guard()
+
+
+def stop_systemd_scheduler() -> None:
+    """Stop the systemd `pandemonium` service -- the canonical clear of a stale sched_ext
+    registration. Sudo-aware: prefixes sudo only when not already root. Use this instead of
+    open-coding `systemctl stop pandemonium` (it was duplicated a dozen ways across the
+    suite, half with the wrong sudo handling)."""
+    prefix = [] if os.geteuid() == 0 else ["sudo"]
+    subprocess.run(prefix + ["systemctl", "stop", "pandemonium"], capture_output=True)
+
+
 class SchedulerProcess:
     """RAII-style guard for a running sched_ext scheduler."""
 
@@ -98,8 +143,10 @@ class SchedulerProcess:
         self.pgid = os.getpgid(proc.pid)
         self.stdout_path = stdout_path
         self.stderr_path = stderr_path
+        _ACTIVE_GUARDS.add(self)
 
     def stop(self):
+        _ACTIVE_GUARDS.discard(self)
         if self.proc.poll() is not None:
             return
         try:
@@ -155,7 +202,7 @@ def start_scheduler(cmd: list[str], name: str) -> SchedulerProcess | None:
     if bin_path and not os.path.exists(bin_path) and not shutil.which(bin_path):
         log_error(f"Binary not found: {bin_path}")
         return None
-    # Refresh sudo credentials before spawning (bench-scale runs are long)
+    # Refresh sudo credentials before spawning (prism-scale runs are long)
     subprocess.run(["sudo", "-v"], capture_output=True)
     full_cmd = ["sudo"] + cmd
     log_info(f"Starting: {' '.join(full_cmd)}")
@@ -211,6 +258,27 @@ def start_and_wait(cmd: list[str], name: str,
     return guard
 
 
+def scheduler_active(expected: str = "pandemonium") -> bool:
+    """sched_ext is registered AND it is `expected` -- the REAL kernel state, not a live
+    userspace process. A watchdog ejection drops the BPF while the pandemonium process
+    lingers, so proc.poll() reads alive; this reads the scx registration directly, so the
+    harness can never report PANDEMONIUM while the kernel has actually fallen back to EEVDF."""
+    try:
+        return is_scx_active() and scx_scheduler_name() == expected
+    except Exception:
+        return False
+
+
+def sched_ejected(guard) -> bool:
+    """True when the scheduler is no longer the active scx scheduler: the process died OR the
+    BPF was ejected (watchdog) and the kernel fell back to EEVDF while the process lingers.
+    The proc-only `guard.proc.poll()` check missed the ejection -- that was the lie. Use this
+    for every 'did the scheduler survive this phase' check."""
+    if guard is None:
+        return False
+    return guard.proc.poll() is not None or not scheduler_active()
+
+
 def measure_struct_ops_cleanup():
     """Time how long the kernel takes to fully unregister struct_ops."""
     try:
@@ -250,7 +318,7 @@ def stop_and_wait(guard: SchedulerProcess | None) -> str:
     return stdout
 
 
-# GENERIC MONTAUK TRACE DRIVER -- the single body behind every `bench-* --trace`.
+# GENERIC MONTAUK TRACE DRIVER -- the single body behind every `prism-* --trace`.
 # Each bench supplies its comm `pattern`, a `label`, and a `body_fn(rec_dir)` that
 # runs its workload; this owns the activate -> montauk --trace -> deactivate
 # lifecycle so no bench re-implements it.
@@ -258,8 +326,22 @@ _XDOM_PATHS = ["sel_tight", "sel_sync", "sel_normal", "sel_dfl",
                "enq_t1", "enq_t2", "steal", "step5"]
 
 
+def parse_migration_line(stdout_text: str) -> dict:
+    """Parse the [MIGRATION] per-cause line -- ALL cross-CPU moves by XDOM_* path, not
+    just the cross-domain subset the [KNOBS] line carries. Names which decision drives a
+    within-L3 bounce (steal vs sel vs enq). {} when no [MIGRATION] line (EEVDF / external)."""
+    for line in stdout_text.splitlines():
+        if "[MIGRATION]" not in line:
+            continue
+        out = {}
+        for m in re.finditer(r"(\w+)=(\d+)", line.split("[MIGRATION]")[1]):
+            out[m.group(1)] = int(m.group(2))
+        return out
+    return {}
+
+
 def _write_cross_domain_marker(guard, rec_dir):
-    """Producer marker (mirrors bench-enduser's write_stability_markers): after a
+    """Producer marker (mirrors prism's write_stability_markers): after a
     traced PANDEMONIUM run stops, parse its shutdown [KNOBS] line for the per-path
     cross-CCX attribution and write it into the recording dir. montauk_analyze
     --digest surfaces it as a CROSS-CCX PLACEMENT block, so a multi-CCX user can
@@ -269,10 +351,23 @@ def _write_cross_domain_marker(guard, rec_dir):
     if guard is None or rec_dir is None:
         return
     try:
-        knobs = parse_knobs_line(guard.read_output())
+        output = guard.read_output()
     except Exception:
         return
-    if not any(f"cross_domain_{p}" in knobs for p in _XDOM_PATHS):
+    _write_cross_domain_marker_text(output, rec_dir)
+
+
+def _write_cross_domain_marker_text(output, rec_dir):
+    """Write the cross-domain + migration markers from already-captured scheduler
+    stdout. The IPC path drains the guard via stop_and_wait, so it cannot re-read the
+    guard and passes the drained text here instead."""
+    if rec_dir is None or not output:
+        return
+    knobs = parse_knobs_line(output)
+    mig = parse_migration_line(output)
+    have_xdom = any(f"cross_domain_{p}" in knobs for p in _XDOM_PATHS)
+    have_mig = any(p in mig for p in _XDOM_PATHS)
+    if not have_xdom and not have_mig:
         return
     lines = []
     if "cross_domain_scatter_pct" in knobs:
@@ -281,6 +376,12 @@ def _write_cross_domain_marker(guard, rec_dir):
         k = f"cross_domain_{p}"
         if k in knobs:
             lines.append(f'montauk_cross_domain_path{{path="{p}"}} {knobs[k]}')
+    # ALL-MOVES per-path attribution -- the within-L3 core-to-core bounce the
+    # cross-domain subset above cannot see. montauk_migration_path names the dominant
+    # cause of a migration storm (steal vs sel vs enq) instead of only its cross-CCX share.
+    for p in _XDOM_PATHS:
+        if p in mig:
+            lines.append(f'montauk_migration_path{{path="{p}"}} {mig[p]}')
     try:
         (Path(rec_dir) / "cross_domain.prom").write_text("\n".join(lines) + "\n")
     except OSError:
@@ -376,12 +477,22 @@ def histogram(values: list[float]) -> dict:
 
 def timed_run(cmd: str, clean_cmd: str | None = None) -> float | None:
     """Run a shell command, return wall-clock seconds or None on failure."""
+    # The harness self-elevates to root for sched_ext, but a build WORKLOAD (the default
+    # `cargo build`) must run as the INVOKING user: root has no rustup default toolchain
+    # (the user does), so a root build fails with "no default toolchain configured", and a
+    # root build would also root-own TARGET_DIR and collide with the user's own builds.
+    # Drop back to SUDO_USER when elevated; the active scheduler still schedules it.
+    def _asuser(c: str) -> list[str]:
+        u = os.environ.get("SUDO_USER")
+        if os.geteuid() == 0 and u and u != "root":
+            return ["sudo", "-u", u, "sh", "-c", c]
+        return ["sh", "-c", c]
     if clean_cmd:
-        subprocess.run(["sh", "-c", clean_cmd],
+        subprocess.run(_asuser(clean_cmd),
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     log_info(f"Running: {cmd}")
     start = time.monotonic()
-    result = subprocess.run(["sh", "-c", cmd],
+    result = subprocess.run(_asuser(cmd),
                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     elapsed = time.monotonic() - start
     if result.returncode != 0:
@@ -1117,6 +1228,37 @@ def measure_ipc(binary: Path, n_cpus: int,
     return result
 
 
+def analyze_ipc_trace(events_path: str) -> dict:
+    """Fold montauk's deep IPC analysis of an --ipc capture into the report:
+    wake2run dispatch latency (distinct from app RTT), cache locality / cross-CCX,
+    the holder under saturation, and dispatch self-similarity. montauk is the data
+    source -- we surface its own verdict lines, not a hand-rolled re-derivation.
+    Returns {} when the capture or analyzer is unavailable."""
+    res: dict = {}
+    try:
+        rep = subprocess.run(
+            [MONTAUK + "_analyze", events_path, "--report",
+             "sched,locality,dispatch-stall,fractal"],
+            capture_output=True, text=True, timeout=180)
+    except (OSError, subprocess.SubprocessError):
+        return res
+    cur = None
+    for raw in rep.stdout.splitlines():
+        s = raw.strip()
+        if s.startswith("REPORT "):
+            cur = s[len("REPORT "):].strip()
+        elif cur == "sched" and s.startswith("VERDICT:") and "wake2run" in s \
+                and "wake2run" not in res:
+            res["wake2run"] = s[len("VERDICT:"):].strip()
+        elif cur == "locality" and s.startswith("VERDICT:") and "locality" not in res:
+            res["locality"] = s[len("VERDICT:"):].strip()
+        elif cur == "dispatch-stall" and s.startswith("HELD by:"):
+            res["holder"] = s
+        elif cur == "fractal" and s.startswith("dispatch-rate"):
+            res["fractal"] = " ".join(s.split())
+    return res
+
+
 # APPLICATION LAUNCH MEASUREMENT
 
 def measure_launch(binary: Path, n_cpus: int,
@@ -1355,7 +1497,7 @@ def aggregate_ticks(ticks: list[dict]) -> dict:
         if not values:
             continue
         agg[key] = {
-            "mean": round(sum(values) / len(values), 1),
+            "mean": round(sub_mean(values), 1),
             "p99": round(percentile(values, 99), 1),
             "last": values[-1],
         }
@@ -1903,17 +2045,16 @@ def gauge_rr(per_sched_times):
     (sqrt of the within-scheduler variance fraction; AIAG: <10 good, <30
     acceptable, >=30 the gauge cannot distinguish parts), ICC, and within-CV.
     Returns None if fewer than 2 schedulers have >=2 iterations."""
-    import statistics
     series = [t for t in per_sched_times.values() if len(t) >= 2]
     if len(series) < 2:
         return None
-    var_within = sum(statistics.variance(t) for t in series) / len(series)
-    means = [statistics.mean(t) for t in series]
-    var_between = statistics.variance(means)
+    var_within = sum(sub_variance(t) for t in series) / len(series)
+    means = [sub_mean(t) for t in series]
+    var_between = sub_variance(means)
     total = var_within + var_between
     if total <= 0:
         return None
-    grand = statistics.mean(means)
+    grand = sub_mean(means)
     grr_pct = (var_within / total) ** 0.5 * 100.0
     if grr_pct < 10.0:
         verdict = "EXCELLENT"
@@ -2097,8 +2238,12 @@ def format_report(data: dict) -> str:
             for s in schedulers.values())
         if has_ipc:
             lines.append("")
-            lines.append(f"{'SCHEDULER':<28} {'STATUS':>8} {'PRIM':>8} "
-                        f"{'P50':>9} {'P99':>9} {'P99.9':>9} {'WORST':>9}")
+            _thru = bool(data.get("ipc_only"))
+            _hdr = (f"{'SCHEDULER':<28} {'STATUS':>8} {'PRIM':>8} "
+                    f"{'P50':>9} {'P99':>9} {'P99.9':>9} {'WORST':>9}")
+            if _thru:
+                _hdr += f" {'RT/s':>10}"
+            lines.append(_hdr)
             for sched_name, sched_data in schedulers.items():
                 ipc = sched_data.get("ipc", {})
                 if not ipc or ipc.get("total_ops", 0) == 0:
@@ -2114,9 +2259,21 @@ def format_report(data: dict) -> str:
                     nm = sched_name if first else ""
                     st = status if first else ""
                     first = False
-                    lines.append(f"{nm:<28} {st:>8} {prim:>8} "
-                                 f"{str(d['p50'])+'us':>9} {str(d['p99'])+'us':>9} "
-                                 f"{str(d['p999'])+'us':>9} {str(d['worst'])+'us':>9}")
+                    row = (f"{nm:<28} {st:>8} {prim:>8} "
+                           f"{str(d['p50'])+'us':>9} {str(d['p99'])+'us':>9} "
+                           f"{str(d['p999'])+'us':>9} {str(d['worst'])+'us':>9}")
+                    if _thru:
+                        # implied round-trips/sec from the median RTT (1 RT ~= p50)
+                        rts = int(1e6 / d['p50']) if d.get('p50') else 0
+                        row += f" {rts:>10}"
+                    lines.append(row)
+                # montauk deep analysis of this scheduler's capture (--ipc only)
+                if _thru:
+                    mon = ipc.get("montauk") or {}
+                    for mk in ("wake2run", "locality", "holder", "fractal"):
+                        mv = mon.get(mk)
+                        if mv:
+                            lines.append(f"{'':<20}{mk}: {mv}")
 
         # Launch table
         has_launch = any(
@@ -3005,7 +3162,7 @@ def measure_pcpu_starvation(binary: Path, n_cpus: int,
 
 
 # Every installed production scx scheduler, for the traced field sweep (mirrors
-# bench-fork-thread's --all-scx list). scx_chaos (fault injection) is excluded;
+# prism-fork-thread's --all-scx list). scx_chaos (fault injection) is excluded;
 # scx_layered self-skips without a layer spec.
 SCX_FIELD = [
     "scx_bpfland", "scx_rusty", "scx_lavd", "scx_flow", "scx_rustland",
@@ -3242,10 +3399,10 @@ def trace_coldwake_cycle(stamp, n_cpus, duration, dwell=2,
     # Build the ramp generator: a deterministic CPU quantum with a distinct comm.
     # Unique per-run path -- a fixed /tmp/coldwork left root-owned by a prior sudo
     # run is unwritable by a later non-root gcc ("cannot open output file").
-    src = Path(__file__).resolve().parent / "coldwork.c"
-    cwbin = f"/tmp/coldwork-{stamp}"
-    cc = subprocess.run(["gcc", "-O2", "-march=native", "-pthread",
-                         "-o", cwbin, str(src)],
+    src = Path(__file__).resolve().parent
+    cwbin = f"/tmp/coldwork-{stamp}"   # name kept so montauk's comm trace target is unchanged
+    cc = subprocess.run(["gcc", "-O2", "-march=native", "-pthread", "-o", cwbin,
+                         str(src / "loadgen.c"), str(src / "loadgen_common.c")],
                         capture_output=True, text=True)
     if cc.returncode != 0:
         log_error(f"[cold-wake] coldwork build failed: {cc.stderr.strip()}")
@@ -3270,7 +3427,7 @@ def trace_coldwake_cycle(stamp, n_cpus, duration, dwell=2,
     def body(rec_dir):
         # Run under sudo so coldwork can read /dev/cpu/N/msr for the aperf/mperf
         # ratio (sudo creds were cached by cmd_bench_coldwake's `sudo true`).
-        r = subprocess.run(["sudo", cwbin, str(wake_core), str(int(dwell * 1000)),
+        r = subprocess.run(["sudo", cwbin, "cache", str(wake_core), str(int(dwell * 1000)),
                             sizes, mem_sizes, str(duration)],
                            capture_output=True, text=True)
         # Persist the raw SIZE rows into the recording so the per-size ramp is
@@ -3329,8 +3486,8 @@ def trace_coldwake_cycle(stamp, n_cpus, duration, dwell=2,
             # the cold-cache sweep above structurally cannot induce. Its own
             # montauk capture so wake2run is analyzable apart from the cache wakes.
             def starve_body(rec_dir):
-                r = subprocess.run(["sudo", cwbin, str(wake_core), "0", "", "",
-                                    str(duration), "starve"],
+                r = subprocess.run(["sudo", cwbin, "starve", str(wake_core),
+                                    str(duration)],
                                    capture_output=True, text=True)
                 try:
                     (Path(rec_dir) / "coldwork-starve.txt").write_text(r.stdout)
@@ -3383,13 +3540,13 @@ def cmd_bench_coldwake(args) -> int:
     """Cold-wake latency vs frequency-at-wake. Trace-only: cycles a pinned core
     idle->bare-wake under powersave so montauk's COLD-WAKE block can tell a
     governor / architecture frequency-ramp apart from a scheduler dispatch delay.
-    Mirrors bench-power's idle framing; the montauk trace is the artifact."""
+    Mirrors prism-power's idle framing; the montauk trace is the artifact."""
     if os.geteuid() != 0:
         # SELF-ELEVATE: cold-wake needs root end-to-end -- montauk eBPF attach,
         # sched_ext activation, governor write, /dev/cpu/N/msr -- and the trace
         # dir under /tmp/pandemonium is root-owned from prior runs, so a non-root
-        # mkdir there fails. Re-exec under sudo so `./pandemonium.py bench-coldwake`
-        # works without a sudo prefix, matching bench-enduser's main().
+        # mkdir there fails. Re-exec under sudo so `./pandemonium.py prism-coldwake`
+        # works without a sudo prefix, matching prism's main().
         os.execvp("sudo", ["sudo", sys.executable, *sys.argv])
     subprocess.run(["sudo", "true"])
     # The aperf/mperf frequency read needs /dev/cpu/N/msr (the msr module). Load
@@ -3401,12 +3558,11 @@ def cmd_bench_coldwake(args) -> int:
     # Clear any registered scheduler before the arms run -- above all the systemd
     # pandemonium service (back after a reboot). Without this the EEVDF arm traces
     # under whatever is loaded and the PANDEMONIUM arm wedges on "stale scheduler
-    # ... still registered". Same pre-flight stop bench-scale uses.
+    # ... still registered". Same pre-flight stop prism-scale uses.
     if is_scx_active():
         log_warn(f"sched_ext active ({scx_scheduler_name()}) -- stopping "
                  f"pandemonium service")
-        subprocess.run(["sudo", "systemctl", "stop", "pandemonium"],
-                       capture_output=True)
+        stop_systemd_scheduler()
         if not wait_for_deactivation(5.0):
             log_error("could not deactivate sched_ext -- clear it "
                       "(sudo systemctl stop pandemonium)")
@@ -3423,6 +3579,31 @@ def cmd_bench_coldwake(args) -> int:
                                 schedulers=args.schedulers, all_scx=args.all_scx)
 
 
+def _parse_storm_report(text: str) -> dict:
+    """Parse `montauk_analyze --report storm` output into a verdict dict. montauk --
+    not a scheduler-tick scrape -- is the storm observer: the StormReport VERDICT line
+    carries the fraction, the REAL-IPI-vs-IDLE-churn kind and the kick/reenqueue rates."""
+    d = {"kind": None, "pct": 0.0, "storm": 0, "intervals": 0,
+         "p50": 0, "peak": 0, "kick_s": 0, "preempt_s": 0, "reenq_s": 0}
+    m = re.search(r"VERDICT:\s*(.+)", text)
+    if not m or "no sched_ext kick activity" in text:
+        d["error"] = "no kick activity captured (scheduler idle, or trace empty)"
+        return d
+    v = m.group(1)
+    km = re.match(r"([^;]+)", v)
+    d["kind"] = km.group(1).strip() if km else v.strip()
+    si = re.search(r"storm (\d+)/(\d+) intervals \(([\d.]+)%\)", v)
+    if si:
+        d["storm"], d["intervals"], d["pct"] = int(si.group(1)), int(si.group(2)), float(si.group(3))
+    for key, pat in (("p50", r"p50=(\d+)"), ("peak", r"peak=(\d+)"),
+                     ("kick_s", r"kick/s=(\d+)"), ("preempt_s", r"preempt (\d+)"),
+                     ("reenq_s", r"reenq/s=(\d+)")):
+        mm = re.search(pat, v)
+        if mm:
+            d[key] = int(mm.group(1))
+    return d
+
+
 def trace_storm_cycle(stamp, n_cpus, duration, busy_per_cpu=4,
                       sleep_us=100, spin_us=10,
                       schedulers="", all_scx=False) -> int:
@@ -3430,15 +3611,26 @@ def trace_storm_cycle(stamp, n_cpus, duration, busy_per_cpu=4,
     reboot live-lock (cold-wake measures cold caches, a different cost). Under
     powersave, stormwork drives the boot condition: a busy sched_ext population
     plus one SCHED_FIFO thread per CPU whose every wake yanks its CPU from scx
-    (cpu_release -> reenqueue_local). The scheduler's own --verbose tick stdout is
-    captured and scored for storm fraction and -- via the truthful kick H counting
-    -- REAL IPI storm vs IDLE re-enqueue churn. EEVDF cannot storm (no Tier-0 kick
-    loop), so the scored arms are the PANDEMONIUM variants; default is BPF."""
-    import storm_score
-    src = Path(__file__).resolve().parent / "stormwork.c"
-    swbin = f"/tmp/stormwork-{stamp}"
-    cc = subprocess.run(["gcc", "-O2", "-march=native", "-o", swbin, str(src),
-                         "-lpthread"], capture_output=True, text=True)
+    (cpu_release -> reenqueue_local). montauk traces the flood and its StormReport
+    (`montauk_analyze --report storm`) names the storm fraction and -- via fentry
+    counters on scx_bpf_kick_cpu/reenqueue_local -- REAL IPI storm vs IDLE re-enqueue
+    churn. EEVDF cannot storm (no Tier-0 kick loop), so the scored arms are the
+    PANDEMONIUM variants; default is BPF."""
+    # cpu_release is DEPRECATED on kernel 7.1+ (sched_ext for-6.19 rework) and
+    # reworked into a deferred async reenqueue. This bench FLOODS cpu_release by
+    # design -- one SCHED_FIFO thread per CPU yanks its CPU from scx every wake --
+    # which hard-locks the box on 7.1+. The storm% it scores is a pre-7.1 failure
+    # mode. Skip rather than freeze.
+    if cpu_release_deprecated():
+        log_warn(f"[storm] skipped on kernel {os.uname().release}: the cpu_release "
+                 "kick-storm reproducer floods an op deprecated in 7.1+ and hard-locks "
+                 "the box. Pre-7.1 only.")
+        return 0
+    src = Path(__file__).resolve().parent
+    swbin = f"/tmp/stormwork-{stamp}"   # name kept so montauk's comm trace target is unchanged
+    cc = subprocess.run(["gcc", "-O2", "-march=native", "-pthread", "-o", swbin,
+                         str(src / "loadgen.c"), str(src / "loadgen_common.c")],
+                        capture_output=True, text=True)
     if cc.returncode != 0:
         log_error(f"[storm] stormwork build failed: {cc.stderr.strip()}")
         return 1
@@ -3446,7 +3638,8 @@ def trace_storm_cycle(stamp, n_cpus, duration, busy_per_cpu=4,
     if schedulers:
         arms = [a for a in field_arms(n_cpus, schedulers, all_scx) if a[1] is not None]
     else:
-        arms = [("PANDEMONIUM (BPF)", [str(BINARY), "--no-adaptive"])]
+        arms = [("PANDEMONIUM (BPF)", [str(BINARY), "--no-adaptive"]),
+                ("PANDEMONIUM (ADAPTIVE)", [str(BINARY)])]
     if not arms:
         log_error("[storm] no scx arm to score (EEVDF cannot storm)")
         subprocess.run(["sudo", "rm", "-f", swbin], capture_output=True)
@@ -3466,23 +3659,49 @@ def trace_storm_cycle(stamp, n_cpus, duration, busy_per_cpu=4,
             if guard is None:
                 log_error(f"[storm] {sched_name} failed to activate -- skipped")
                 continue
-            log_info(f"[storm] {sched_name}: flooding {duration}s")
-            subprocess.run(["sudo", swbin, str(duration), str(busy_per_cpu),
-                            str(sleep_us), str(spin_us)],
-                           capture_output=True, text=True)
+            tag = sched_name.replace(" ", "_").replace("(", "").replace(")", "")
+            # montauk -- not a tick-log scrape -- observes the storm: capture a trace
+            # while loadgen floods, then read it back through `--report storm` (the
+            # StormReport: fentry counters on scx_bpf_kick_cpu / reenqueue_local).
+            trace = f"/tmp/storm-{tag}-{stamp}.bin"
+            log_info(f"[storm] {sched_name}: flooding {duration}s under montauk")
+            with open(trace + ".err", "w") as ef:
+                # MONTAUK_SCX_STORM=1: this is the ONE capture that wants the scx
+                # kick/reenqueue counters, so it opts the fentry/fexit storm probes
+                # in. They are off in every other montauk --trace (they trampoline
+                # sched_ext's hot kfuncs and freeze 7.1+ under load). montauk comes
+                # up before the flood, so the patch lands while scx is quiescent.
+                mon = subprocess.Popen([MONTAUK, "--trace", "stormwork",
+                                        "--trace-out", trace],
+                                       stdout=subprocess.DEVNULL, stderr=ef,
+                                       env={**os.environ, "MONTAUK_SCX_STORM": "1"})
+                time.sleep(2.0)
+                if mon.poll() is None:
+                    subprocess.run(["sudo", swbin, "storm", str(duration),
+                                    str(busy_per_cpu), str(sleep_us), str(spin_us)],
+                                   capture_output=True, text=True)
+                    mon.send_signal(signal.SIGINT)
+                    try:
+                        mon.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        mon.kill()
+                        mon.wait()
+                else:
+                    log_warn(f"[storm] {sched_name}: montauk trace did not attach")
             guard.stop()
             wait_for_deactivation(5.0)
-            # stdout carries the tick lines; stderr carries the [WATCHDOG] abort
-            # (eprintln!). Score BOTH so a monitor-starvation self-eject -- the
-            # storm's terminal outcome -- is detected, not silently dropped.
-            ticks = guard.drain_stdout() + "\n" + guard.read_stderr(limit=65536)
-            tag = sched_name.replace(" ", "_").replace("(", "").replace(")", "")
-            out = LOG_DIR / f"storm-{tag}-{stamp}.tick"
+            rep = subprocess.run([MONTAUK + "_analyze", trace, "--report", "storm"],
+                                 capture_output=True, text=True)
+            out = LOG_DIR / f"storm-{tag}-{stamp}.storm"
             try:
-                out.write_text(ticks)
+                out.write_text(rep.stdout)
             except OSError:
                 out = None
-            results.append((sched_name, storm_score.score(ticks, is_text=True), out))
+            try:
+                os.unlink(trace)  # the full storm trace is huge; the verdict is the artifact
+            except OSError:
+                pass
+            results.append((sched_name, _parse_storm_report(rep.stdout), out))
             guard.cleanup()
 
         for sched_name, d, out in results:
@@ -3490,15 +3709,13 @@ def trace_storm_cycle(stamp, n_cpus, duration, busy_per_cpu=4,
                 log_warn(f"[storm] {sched_name}: {d['error']}")
                 continue
             log_info(f"[storm] {sched_name}: {d['pct']:.1f}% storm "
-                     f"({d['storm']}/{d['ticks']} ticks), d/s p50={d['p50']} max={d['dmax']}")
-            if d["sample"]:
-                log_info(f"[storm] {sched_name}: {d['real']} real-IPI / {d['churn']} "
-                         f"idle-churn -- {d['kind']} "
-                         f"(kickH/enqR={d['sample']['ratio']:.2f})")
-            else:
-                log_info(f"[storm] {sched_name}: no storm ticks -- clean")
+                     f"({d['storm']}/{d['intervals']} intervals), reenq/s "
+                     f"p50={d['p50']} peak={d['peak']}")
+            log_info(f"[storm] {sched_name}: {d['kind']} "
+                     f"(kick/s={d['kick_s']} preempt={d['preempt_s']} "
+                     f"reenq/s={d['reenq_s']})")
             if out:
-                log_info(f"TICKLOG: {out}")
+                log_info(f"STORMLOG: {out}")
         return 0 if results else 1
     finally:
         _restore_governor(saved_gov)
@@ -3721,7 +3938,7 @@ def cmd_bench_pcpu(args) -> int:
 
     # PROMETHEUS OUTPUT (unified schema via the shared builder; metadata is now a
     # real _info/_timestamp gauge pair, not file comments)
-    prom_path = LOG_DIR / f"bench-pcpu-{stamp}.prom"
+    prom_path = LOG_DIR / f"prism-pcpu-{stamp}.prom"
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     pb = PrometheusBuilder("pcpu")
     git = get_git_info()
@@ -3792,8 +4009,7 @@ def cmd_bench_scale(args) -> int:
     if is_scx_active():
         name = scx_scheduler_name()
         log_warn(f"sched_ext is active ({name}) -- stopping pandemonium service")
-        subprocess.run(["sudo", "systemctl", "stop", "pandemonium"],
-                       capture_output=True)
+        stop_systemd_scheduler()
         if not wait_for_deactivation(5.0):
             log_error("Could not deactivate sched_ext -- is another scheduler running?")
             return 1
@@ -3809,7 +4025,7 @@ def cmd_bench_scale(args) -> int:
     preflight = start_and_wait([str(BINARY)], "PANDEMONIUM")
     if preflight is None:
         log_error("Pre-flight FAILED -- PANDEMONIUM cannot activate")
-        log_error("Fix the error above before running bench-scale")
+        log_error("Fix the error above before running prism-scale")
         dmesg.save()
         return 1
     stop_and_wait(preflight)
@@ -3826,7 +4042,7 @@ def cmd_bench_scale(args) -> int:
         log_info("PANDEMONIUM-ONLY MODE: skipping EEVDF and external schedulers")
     else:
         # A named --schedulers field is EEVDF vs EXACTLY those (PANDEMONIUM only if
-        # named) -- consistent with field_arms / bench-cachyos. Default keeps
+        # named) -- consistent with field_arms / prism-cachyos. Default keeps
         # PANDEMONIUM. schedulers may arrive as a list or a comma string.
         _sl = args.schedulers or []
         if isinstance(_sl, str):
@@ -3991,32 +4207,56 @@ def cmd_bench_scale(args) -> int:
                     if burst_size < 8:
                         burst_size = 8
                     burst_result = measure_burst(BINARY, n, burst_size)
-                    if guard is not None and guard.proc.poll() is not None:
+                    if sched_ejected(guard):
                         burst_result["survived"] = False
                         log_error(f"{sched_name} CRASHED during burst "
                                   f"(exit {guard.proc.returncode})")
                     sched_result["burst"] = burst_result
 
                 if run_full or args.longrun:
-                    # Long-running process test
+                    # Long-running process test. Capture the probe's wake-to-run
+                    # with montauk (pand-probe comm) so the interactive-stall tail
+                    # lands in .events for montauk_analyze, not just p99/worst.
                     longrun_count = max(4, n // 2)
-                    longrun_result = measure_longrun(BINARY, n,
-                                                     longrun_count=longrun_count)
-                    if guard is not None and guard.proc.poll() is not None:
+                    _safe = (sched_name.replace(" ", "-")
+                             .replace("(", "").replace(")", ""))
+                    if getattr(args, "trace", False) and montauk_available():
+                        with montauk_trace(PROBE_COMM, f"longrun-{_safe}-{n}c",
+                                           stamp, events=True) as _rec:
+                            longrun_result = measure_longrun(
+                                BINARY, n, longrun_count=longrun_count)
+                        log_info(f"[{sched_name}] {n}C longrun montauk -> "
+                                 f"{_rec.dir}")
+                    else:
+                        longrun_result = measure_longrun(
+                            BINARY, n, longrun_count=longrun_count)
+                    if sched_ejected(guard):
                         longrun_result["survived"] = False
                         log_error(f"{sched_name} CRASHED during long-run "
                                   f"(exit {guard.proc.returncode})")
                     sched_result["longrun"] = longrun_result
 
                 if run_full or args.mixed:
-                    # Mixed workload test (burst + longrun combined)
+                    # Mixed workload test (burst + longrun combined). Same montauk
+                    # capture of the probe -- this phase shows the 195ms stall tail.
                     mixed_burst_size = n * 4
                     if mixed_burst_size < 8:
                         mixed_burst_size = 8
-                    mixed_result = measure_mixed(BINARY, n,
-                                                 longrun_count=max(4, n // 2),
-                                                 burst_size=mixed_burst_size)
-                    if guard is not None and guard.proc.poll() is not None:
+                    _safe = (sched_name.replace(" ", "-")
+                             .replace("(", "").replace(")", ""))
+                    if getattr(args, "trace", False) and montauk_available():
+                        with montauk_trace(PROBE_COMM, f"mixed-{_safe}-{n}c",
+                                           stamp, events=True) as _rec:
+                            mixed_result = measure_mixed(
+                                BINARY, n, longrun_count=max(4, n // 2),
+                                burst_size=mixed_burst_size)
+                        log_info(f"[{sched_name}] {n}C mixed montauk -> "
+                                 f"{_rec.dir}")
+                    else:
+                        mixed_result = measure_mixed(
+                            BINARY, n, longrun_count=max(4, n // 2),
+                            burst_size=mixed_burst_size)
+                    if sched_ejected(guard):
                         mixed_result["survived"] = False
                         log_error(f"{sched_name} CRASHED during mixed test "
                                   f"(exit {guard.proc.returncode})")
@@ -4025,12 +4265,13 @@ def cmd_bench_scale(args) -> int:
                 if run_full or args.deadline:
                     # Periodic deadline (frame scheduling jitter)
                     deadline_result = measure_deadline(BINARY, n)
-                    if guard is not None and guard.proc.poll() is not None:
+                    if sched_ejected(guard):
                         deadline_result["survived"] = False
                         log_error(f"{sched_name} CRASHED during deadline test "
                                   f"(exit {guard.proc.returncode})")
                     sched_result["deadline"] = deadline_result
 
+                _ipc_rec = None
                 if run_full or args.ipc:
                     # IPC round-trip (pipe ping-pong). Under --trace, wrap the
                     # measurement in a montauk pand-ipc recording with the raw
@@ -4044,11 +4285,14 @@ def cmd_bench_scale(args) -> int:
                         with montauk_trace(IPC_COMM, f"ipc-{safe}-{n}c", stamp,
                                            events=True) as _rec:
                             ipc_result = measure_ipc(BINARY, n)
+                        _ipc_rec = _rec
+                        ipc_result["events"] = (str(_rec.events_path)
+                                                if _rec.events_path else None)
                         log_info(f"[{sched_name}] {n}C IPC montauk trace -> "
                                  f"{_rec.dir}")
                     else:
                         ipc_result = measure_ipc(BINARY, n)
-                    if guard is not None and guard.proc.poll() is not None:
+                    if sched_ejected(guard):
                         ipc_result["survived"] = False
                         log_error(f"{sched_name} CRASHED during IPC test "
                                   f"(exit {guard.proc.returncode})")
@@ -4057,7 +4301,7 @@ def cmd_bench_scale(args) -> int:
                 if run_full or args.launch:
                     # Application launch under load
                     launch_result = measure_launch(BINARY, n)
-                    if guard is not None and guard.proc.poll() is not None:
+                    if sched_ejected(guard):
                         launch_result["survived"] = False
                         log_error(f"{sched_name} CRASHED during launch test "
                                   f"(exit {guard.proc.returncode})")
@@ -4068,6 +4312,11 @@ def cmd_bench_scale(args) -> int:
                 if stdout and "PANDEMONIUM" in sched_name:
                     ticks = parse_tick_lines(stdout)
                     knobs = parse_knobs_line(stdout)
+                    # The IPC capture uses montauk_trace (not trace_workload), so the
+                    # generic marker never ran -- write the cross-domain + migration
+                    # marker into its recording dir from the drained shutdown stdout.
+                    if _ipc_rec is not None:
+                        _write_cross_domain_marker_text(stdout, _ipc_rec.dir)
 
                     # LONGRUN ACTIVATION VERIFICATION
                     longrun_ticks = [t for t in ticks if t.get("longrun_active")]
@@ -4081,6 +4330,14 @@ def cmd_bench_scale(args) -> int:
                         "tick_aggregate": aggregate_ticks(ticks),
                         "knobs": knobs,
                     }
+
+                # COMPREHENSIVE IPC: fold montauk's deep analysis of the capture
+                # (wake2run, cross-CCX locality, holder, fractal) into the result.
+                # --ipc only; every other scale path leaves the capture untouched.
+                if getattr(args, "ipc", False):
+                    _ev = sched_result.get("ipc", {}).get("events")
+                    if _ev and Path(_ev).exists():
+                        sched_result["ipc"]["montauk"] = analyze_ipc_trace(_ev)
 
                 data["results"][cores_str][sched_name] = sched_result
                 print()
@@ -4097,7 +4354,7 @@ def cmd_bench_scale(args) -> int:
 
     # Save log
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    report_path = LOG_DIR / f"bench-scale-{stamp}.log"
+    report_path = LOG_DIR / f"prism-scale-{stamp}.log"
     report_path.write_text(report)
     log_info(f"REPORT: {report_path}")
 
@@ -4167,8 +4424,7 @@ def cmd_bench_sys(args) -> int:
     if is_scx_active():
         name = scx_scheduler_name()
         log_warn(f"sched_ext is active ({name}) -- stopping")
-        subprocess.run(["sudo", "systemctl", "stop", "pandemonium"],
-                       capture_output=True)
+        stop_systemd_scheduler()
         subprocess.run(["sudo", "killall", "-INT", "pandemonium"],
                        capture_output=True)
         if not wait_for_deactivation(5.0):
@@ -4240,7 +4496,7 @@ def cmd_bench_sys(args) -> int:
     ticks_written = 0
     try:
         while True:
-            if guard is not None and guard.proc.poll() is not None:
+            if sched_ejected(guard):
                 log_warn(f"{sched_display} exited unexpectedly")
                 break
             time.sleep(1)
@@ -4456,83 +4712,22 @@ def _burst_processes(count):
 
 
 
-# SCHEDULER LIFECYCLE HELPERS (shared by bench-contention)
+# SCHEDULER LIFECYCLE HELPERS (shared by prism-contention)
 
 def _trace_start_scheduler(nr_cpus=None):
-    """Start PANDEMONIUM with stale detection and settle verification."""
-    try:
-        stale = SCX_OPS.read_text().strip()
-        if stale:
-            log_warn(f"Stale scheduler detected: '{stale}', waiting for cleanup...")
-            if not wait_for_no_scheduler(timeout=15):
-                log_error("stale scheduler did not unregister")
-                return None
-            log_info("Stale scheduler cleared")
-    except (FileNotFoundError, PermissionError):
-        pass
-
-    cmd = ["sudo", str(BINARY), "--verbose"]
+    """Start PANDEMONIUM for a trace through the ONE canonical activation path
+    (start_and_wait): stdout/stderr to FILES, never a PIPE -- a PIPE deadlocks the
+    --verbose scheduler the instant its output fills the 64KB buffer (the trace-path
+    hang) -- plus the SchedulerProcess guard, stale-registration detection,
+    wait_for_activation, and the _ACTIVE_GUARDS eject-on-interrupt. Returns the guard
+    (a SchedulerProcess, .proc for the Popen) or None. No hand-rolled start."""
+    cmd = [str(BINARY), "--verbose"]
     if nr_cpus is not None:
         cmd.extend(["--nr-cpus", str(nr_cpus)])
-    log_info(f"Starting: {' '.join(cmd)}")
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        preexec_fn=os.setpgrp,
-        text=True,
-    )
-    deadline = time.monotonic() + 10.0
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            err = proc.stderr.read() if proc.stderr else ""
-            log_error(f"scheduler exited early (code {proc.returncode})")
-            for line in err.strip().splitlines()[-5:]:
-                log_error(f"  stderr: {line.rstrip()}")
-            return None
-        try:
-            name = SCX_OPS.read_text().strip()
-            if name == "pandemonium":
-                log_info("Scheduler activated")
-                time.sleep(3.0)
-                if proc.poll() is not None:
-                    err = proc.stderr.read() if proc.stderr else ""
-                    log_error(f"scheduler died during settle (code {proc.returncode})")
-                    for line in err.strip().splitlines()[-5:]:
-                        log_error(f"  stderr: {line.rstrip()}")
-                    return None
-                return proc
-        except (FileNotFoundError, PermissionError):
-            pass
-        time.sleep(0.1)
-    log_error("scheduler did not activate within 10s")
-    return None
+    return start_and_wait(cmd, "PANDEMONIUM", settle_secs=3.0)
 
 
-def _trace_stop_scheduler(proc):
-    if proc is None:
-        return
-    if proc.poll() is not None:
-        log_warn(f"Scheduler already exited (code {proc.returncode})")
-        measure_struct_ops_cleanup()
-        return
-    try:
-        pgid = os.getpgid(proc.pid)
-        os.killpg(pgid, signal.SIGINT)
-    except (ProcessLookupError, PermissionError):
-        return
-    deadline = time.monotonic() + 5.0
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            measure_struct_ops_cleanup()
-            return
-        time.sleep(0.1)
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
-    proc.wait()
-    measure_struct_ops_cleanup()
+# (trace stop folded into the canonical stop_and_wait)
 
 
 
@@ -4919,7 +5114,8 @@ def _contention_run_iteration(iteration, total, nr_cpus):
     dmesg = DmesgMonitor()
 
     def sched_alive():
-        return sched_proc is not None and sched_proc.poll() is None
+        return (sched_proc is not None and sched_proc.proc.poll() is None
+                and scheduler_active())
 
     log_info(f"{label}Starting contention sequence at {nr_cpus}C")
 
@@ -4947,7 +5143,7 @@ def _contention_run_iteration(iteration, total, nr_cpus):
     else:
         log_info(f"{label}ALL PHASES COMPLETE -- scheduler survived")
 
-    _trace_stop_scheduler(sched_proc)
+    stop_and_wait(sched_proc)
     dmesg.save()
 
     return not crashed, phase_results
@@ -4955,7 +5151,7 @@ def _contention_run_iteration(iteration, total, nr_cpus):
 
 def _write_contention_prometheus(version, git, stamp, max_cpus, iterations,
                                   core_counts, results, all_phase_data) -> Path:
-    """Write Prometheus exposition format (.prom) for bench-contention."""
+    """Write Prometheus exposition format (.prom) for prism-contention."""
     pb = PrometheusBuilder("contention")
 
     def gauge(name, help_text, value, labels=None):
@@ -5114,7 +5310,7 @@ def cmd_bench_contention(args) -> int:
     if getattr(args, "trace", False):
         trace_phase = phase_filter or "deficit-storm"
         if not log.child:
-            log_info(f"bench-contention v{get_version()} --trace {trace_phase}  "
+            log_info(f"prism-contention v{get_version()} --trace {trace_phase}  "
                      f"core counts: {core_counts}")
         rc = 0
         try:
@@ -5137,7 +5333,7 @@ def cmd_bench_contention(args) -> int:
     ver = get_version()
     git = get_git_info()
     dirty = " (dirty)" if git["dirty"] else ""
-    log_info(f"bench-contention v{ver} [{git['commit']}{dirty}], "
+    log_info(f"prism-contention v{ver} [{git['commit']}{dirty}], "
              f"core_counts={core_counts}, iterations={args.iterations}, "
              f"host_cpus={max_cpus}")
     if phase_filter:
@@ -5210,8 +5406,8 @@ def cmd_bench_contention(args) -> int:
         log_info(f"METRICS: {prom_path}")
 
         # WRITE HUMAN-READABLE .log
-        report_path = LOG_DIR / f"bench-contention-{stamp}.log"
-        report_lines = [f"bench-contention v{ver} [{git['commit']}]",
+        report_path = LOG_DIR / f"prism-contention-{stamp}.log"
+        report_lines = [f"prism-contention v{ver} [{git['commit']}]",
                         f"cores: {core_counts}  iterations: {args.iterations}  host: {max_cpus}C",
                         ""]
         for nr_cpus in sorted(results.keys()):
@@ -5443,7 +5639,7 @@ def cmd_bench_scx(args) -> int:
                 time.sleep(func_duration)
 
                 crashed = dmesg.check()
-                alive = guard.proc.poll() is None
+                alive = guard.proc.poll() is None and scheduler_active()
 
                 stdout = guard.drain_stdout()
                 stderr = guard.read_stderr(limit=64000)
@@ -5519,7 +5715,7 @@ def cmd_bench_scx(args) -> int:
                     stress_exit = 143  # SIGTERM equivalent
 
                 crashed = dmesg2.check()
-                alive = guard.proc.poll() is None
+                alive = guard.proc.poll() is None and scheduler_active()
 
                 # scx CI: exit 0 or 143 (SIGTERM from timeout) = pass
                 stress_ok = stress_exit in (0, 143)
@@ -5592,7 +5788,7 @@ def cmd_bench_scx(args) -> int:
         log_info("OVERALL: FAIL")
 
     # PROMETHEUS OUTPUT (unified schema; metadata as real gauges, not comments)
-    prom_path = LOG_DIR / f"bench-scx-{stamp}.prom"
+    prom_path = LOG_DIR / f"prism-scx-{stamp}.prom"
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     pb = PrometheusBuilder("scx")
     git = get_git_info()
@@ -5729,7 +5925,7 @@ def main() -> int:
     )
     sub = parser.add_subparsers(dest="command")
 
-    bench = sub.add_parser("bench-scale",
+    bench = sub.add_parser("prism-scale",
                            help="Unified throughput + latency benchmark")
     bench.add_argument("--cmd", type=str, default=None,
                        help="Custom workload command (default: self-build)")
@@ -5770,10 +5966,10 @@ def main() -> int:
                             "pand-ipc recording (raw per-event log) to "
                             "/tmp/pandemonium -- resolves individual RTTs at the "
                             "tick floor. Diagnostic; latency numbers are "
-                            "contaminated. Pairs with --ipc (also via bench-ipc).")
+                            "contaminated. Pairs with --ipc (also via prism-ipc).")
 
 
-    contention_bench = sub.add_parser("bench-contention",
+    contention_bench = sub.add_parser("prism-contention",
                                       help="Contention stress test for v5.4.x adaptive features")
     contention_bench.add_argument("--iterations", type=int, default=1,
                                   help="Full workload iterations per core count (default: 1)")
@@ -5799,7 +5995,7 @@ def main() -> int:
                                   help="With --trace: loop the full installed scx "
                                        "field (EEVDF + PANDEMONIUM + every external)")
 
-    sys_bench = sub.add_parser("bench-sys",
+    sys_bench = sub.add_parser("prism-sys",
                                help="Live system telemetry capture")
     sys_bench.add_argument("--scheduler", type=str, default="adaptive",
                            help="Scheduler to run: adaptive (default), "
@@ -5811,7 +6007,7 @@ def main() -> int:
                            help="Additional compositor process names "
                                 "(PANDEMONIUM modes only)")
 
-    pcpu_bench = sub.add_parser("bench-pcpu",
+    pcpu_bench = sub.add_parser("prism-pcpu",
                                 help="Per-CPU DSQ visibility stress test (v5.4.8)")
     pcpu_bench.add_argument("--iterations", type=int, default=1,
                             help="Iterations per core count (default: 1)")
@@ -5831,7 +6027,7 @@ def main() -> int:
                             help="With --trace: loop the full installed scx field "
                                  "(EEVDF + PANDEMONIUM + every external)")
 
-    coldwake_bench = sub.add_parser("bench-coldwake",
+    coldwake_bench = sub.add_parser("prism-coldwake",
         help="Cold-wake latency vs frequency-at-wake (idle->bare-wake, powersave)")
     coldwake_bench.add_argument("--trace", action="store_true",
         help="Capture montauk recordings of the cold-wake cycle (the only mode)")
@@ -5865,7 +6061,7 @@ def main() -> int:
     coldwake_bench.add_argument("--rt-spin-us", dest="rt_spin_us", type=int,
         default=10, help="storm mode: SCHED_FIFO spin us per wake (RT duty)")
 
-    scx_bench = sub.add_parser("bench-scx",
+    scx_bench = sub.add_parser("prism-scx",
                                 help="scx CI compatibility test")
     scx_bench.add_argument("--duration", type=int, default=30,
                            help="Functional test duration in seconds (default: 30)")
@@ -5895,17 +6091,17 @@ def main() -> int:
         args.schedulers = [s.strip() for s in args.schedulers.split(",")
                            if s.strip()]
 
-    if args.command == "bench-scale":
+    if args.command == "prism-scale":
         return cmd_bench_scale(args)
-    if args.command == "bench-contention":
+    if args.command == "prism-contention":
         return cmd_bench_contention(args)
-    if args.command == "bench-sys":
+    if args.command == "prism-sys":
         return cmd_bench_sys(args)
-    if args.command == "bench-pcpu":
+    if args.command == "prism-pcpu":
         return cmd_bench_pcpu(args)
-    if args.command == "bench-coldwake":
+    if args.command == "prism-coldwake":
         return cmd_bench_coldwake(args)
-    if args.command == "bench-scx":
+    if args.command == "prism-scx":
         return cmd_bench_scx(args)
     if args.command == "low-cpu-deadline":
         return cmd_low_cpu_deadline(args)
