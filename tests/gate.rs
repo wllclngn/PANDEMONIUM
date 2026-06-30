@@ -240,7 +240,7 @@ fn layer3_latency_gate() {
     let mut child = start_pandemonium(&[]);
     assert!(wait_for_activation(), "DID NOT ACTIVATE WITHIN 10S");
 
-    // WARMUP: LET SCHEDULER STABILIZE (EWMA COLD-START, TASK MIGRATION)
+    // WARMUP: LET SCHEDULER STABILIZE (TASK MIGRATION, KNOB CONVERGENCE)
     thread::sleep(Duration::from_secs(2));
 
     // RUN CYCLICTEST (10 SECONDS, ALL CPUS)

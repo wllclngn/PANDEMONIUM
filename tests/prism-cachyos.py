@@ -7,8 +7,8 @@ cross-kernel scheduler comparisons. Each workload runs N iterations under
 each scheduler, captures wall-clock time, and reports mean + stddev
 alongside per-row winners.
 
-Workloads (12 total, 8 runnable from standard packages, 4 require manual
-asset setup):
+Workloads (12, all auto-acquiring -- nothing needs manual setup; each fetches
+and caches its asset on first run):
 
     stress-ng-cpu-cache-mem   stress-ng cache stressor, fixed ops.
     perf-sched-msg-fork-thread perf bench sched messaging, fixed loops.
@@ -18,9 +18,10 @@ asset setup):
     primes                    stress-ng cpu prime method, fixed ops.
     x265-encoding             ffmpeg encode of lavfi testsrc clip.
     ffmpeg-compilation        git clone (once) then make -j$(nproc).
-
-    blender-render            requires blender + scene file (skip)
-    kernel-defconfig          requires kernel source clone (skip)
+    namd-apoa1                NAMD 3.0b6 apoa1 (92K atoms), all cores.
+    y-cruncher-pi-1b          y-cruncher pi to 1 billion digits.
+    blender-render            blender render of the bmw_cpu_mod scene.
+    kernel-defconfig          linux-6.14.7 defconfig, build vmlinux.
 
 Usage:
     ./tests/prism-cachyos.py
@@ -83,6 +84,36 @@ ASSET_DIR = LOG_DIR / "prism-cachyos-assets"
 XZ_CORPUS = ASSET_DIR / "xz-corpus.bin"
 FFMPEG_SRC = ASSET_DIR / "ffmpeg-src"
 X265_OUTPUT = ASSET_DIR / "x265-output.hevc"
+
+# KERNEL-DEFCONFIG ASSET. linux-6.14.7 matches the CachyOS Mini-Benchmarker's
+# KERNVER, so the kernel-compile number is apples-to-apples with their chart.
+# Auto-acquired (download + extract + defconfig) on first run, then cached.
+KERNEL_VER = "6.14.7"
+KERNEL_URL = (f"https://cdn.kernel.org/pub/linux/kernel/v6.x/"
+              f"linux-{KERNEL_VER}.tar.xz")
+KERNEL_TARBALL = ASSET_DIR / f"linux-{KERNEL_VER}.tar.xz"
+KERNEL_SRC = ASSET_DIR / f"linux-{KERNEL_VER}"
+
+# NAMD 92K-atom (apoa1) -- precompiled multicore binary + example, matches the
+# benchmarker's NAMD 3.0b6 + apoa1.
+NAMD_URL = ("http://www.ks.uiuc.edu/Research/namd/3.0b6/download/120834/"
+            "NAMD_3.0b6_Linux-x86_64-multicore.tar.gz")
+NAMD_APOA1_URL = "https://www.ks.uiuc.edu/Research/namd/utilities/apoa1.tar.gz"
+NAMD_DIR = ASSET_DIR / "namd"
+NAMD_BIN_DIR = NAMD_DIR / "NAMD_3.0b6_Linux-x86_64-multicore"
+
+# y-cruncher pi 1b -- static binary, matches the benchmarker's version. The
+# extracted directory name carries a space, exactly as upstream ships it.
+YCRUNCHER_VER = "0.8.6.9545"
+YCRUNCHER_URL = (f"https://github.com/Mysticial/y-cruncher/releases/download/"
+                 f"v{YCRUNCHER_VER}/y-cruncher.v{YCRUNCHER_VER}-static.tar.xz")
+YCRUNCHER_TARBALL = ASSET_DIR / f"y-cruncher.v{YCRUNCHER_VER}-static.tar.xz"
+YCRUNCHER_DIR = ASSET_DIR / f"y-cruncher v{YCRUNCHER_VER}-static"
+
+# blender render -- the benchmarker's bmw_cpu_mod.blend scene.
+BLENDER_SCENE_URL = ("https://gitlab.com/torvic9/mini-benchmarker/-/raw/master/"
+                     "bmw_cpu_mod.blend")
+BLENDER_SCENE = ASSET_DIR / "bmw_cpu_mod.blend"
 
 # DEFAULTS
 DEFAULT_RUNS = 3
@@ -320,29 +351,167 @@ def run_ffmpeg_compile(ncpus: int) -> Optional[float]:
     return _run_timed(cmd, cwd=FFMPEG_SRC, timeout=1800)
 
 
-# SKIPPED WORKLOADS: SHIPPED AS PROBES THAT EXPLAIN WHAT'S MISSING.
+def _download(url: str, dest: Path, min_bytes: int = 0) -> bool:
+    """Stream a URL to dest (cached). urllib, stdlib -- no wget/curl dep. Writes a
+    .part sidecar then renames, so a half download never looks complete."""
+    if dest.is_file() and dest.stat().st_size > min_bytes:
+        return True
+    ASSET_DIR.mkdir(parents=True, exist_ok=True)
+    import urllib.request
+    part = dest.parent / (dest.name + ".part")
+    log_info(f"downloading {dest.name} (one-time)...")
+    try:
+        urllib.request.urlretrieve(url, part)
+        part.replace(dest)
+    except Exception as e:
+        log_error(f"  download failed ({dest.name}): {e}")
+        part.unlink(missing_ok=True)
+        return False
+    return True
+
+
+def _ensure_namd() -> bool:
+    if not ((NAMD_BIN_DIR / "namd3").is_file()
+            and (NAMD_DIR / "apoa1" / "apoa1.namd").is_file()):
+        NAMD_DIR.mkdir(parents=True, exist_ok=True)
+        tgz = ASSET_DIR / "namd.tar.gz"
+        apoa1 = ASSET_DIR / "apoa1.tar.gz"
+        if not _download(NAMD_URL, tgz, 50 * 1024 * 1024):
+            return False
+        if not _download(NAMD_APOA1_URL, apoa1, 1024 * 1024):
+            return False
+        for src in (tgz, apoa1):
+            r = subprocess.run(["tar", "-C", str(NAMD_DIR), "-xf", str(src)],
+                               capture_output=True, text=True, timeout=300)
+            if r.returncode != 0:
+                log_error(f"  namd extract failed: {r.stderr.strip()[:200]}")
+                return False
+    # Upstream apoa1.namd writes outputName to /usr/tmp, which does not exist on
+    # modern systems -- NAMD dies with FATAL ERROR opening apoa1-out.xsc. Redirect
+    # all /usr/tmp paths into the writable apoa1 asset dir. Idempotent, so it also
+    # repairs an already-extracted (unpatched) cache on the next run.
+    namd_cfg = NAMD_DIR / "apoa1" / "apoa1.namd"
+    try:
+        text = namd_cfg.read_text()
+        patched = text.replace("/usr/tmp", str(NAMD_DIR / "apoa1"))
+        if patched != text:
+            namd_cfg.write_text(patched)
+    except OSError as e:
+        log_error(f"  namd config patch failed: {e}")
+        return False
+    return True
+
+
+def run_namd(ncpus: int) -> Optional[float]:
+    if not _ensure_namd():
+        return None
+    # NAMD apoa1 (92K atoms), all cores, matching the benchmarker invocation.
+    return _run_timed(
+        ["./namd3", f"+p{ncpus}", "+setcpuaffinity",
+         str(NAMD_DIR / "apoa1" / "apoa1.namd")],
+        cwd=NAMD_BIN_DIR, timeout=DEFAULT_TIMEOUT_S)
+
+
+def _ensure_ycruncher() -> bool:
+    if (YCRUNCHER_DIR / "y-cruncher").is_file():
+        return True
+    if not _download(YCRUNCHER_URL, YCRUNCHER_TARBALL, 1024 * 1024):
+        return False
+    r = subprocess.run(["tar", "-xf", str(YCRUNCHER_TARBALL)], cwd=ASSET_DIR,
+                       capture_output=True, text=True, timeout=300)
+    if r.returncode != 0:
+        log_error(f"  y-cruncher extract failed: {r.stderr.strip()[:200]}")
+        return False
+    return True
+
+
+def run_ycruncher(_ncpus: int) -> Optional[float]:
+    if not _ensure_ycruncher():
+        return None
+    # bench 1b = pi to 1 billion digits; -od:0 keeps it in RAM (no disk output).
+    return _run_timed(
+        ["./y-cruncher", "bench", "1b", "-od:0", "-o", str(ASSET_DIR)],
+        cwd=YCRUNCHER_DIR, timeout=DEFAULT_TIMEOUT_S)
+
+
+# AUTO-ACQUIRED ASSET WORKLOADS: blender scene + kernel source fetched on demand.
 
 def _probe_blender() -> bool:
-    return (shutil.which("blender") is not None
-            and Path.home().joinpath("blender-bench/scene.blend").is_file())
+    # Scene auto-acquired (bmw_cpu_mod.blend); just needs blender installed.
+    return shutil.which("blender") is not None
 
 
 def _probe_kernel_defconfig() -> bool:
-    return Path.home().joinpath("linux-bench/Makefile").is_file()
+    # Source is auto-acquired (download + extract + defconfig) on first run, like
+    # ffmpeg-src -- no manual clone. Needs the full kernel-build toolchain: bc
+    # (timeconst.h in prepare0), flex and bison (kconfig) are not all shipped by
+    # default on CachyOS, so a missing one must skip cleanly, not die at Error 2.
+    return all(shutil.which(t) for t in ("make", "gcc", "tar", "bc", "flex", "bison"))
 
 
-def run_blender(_ncpus: int) -> Optional[float]:
-    scene = str(Path.home() / "blender-bench" / "scene.blend")
-    return _run_timed(["blender", "-b", scene, "-f", "1"], timeout=900)
+def run_blender(ncpus: int) -> Optional[float]:
+    if not _download(BLENDER_SCENE_URL, BLENDER_SCENE, 1024):
+        return None
+    out = str(ASSET_DIR / "blenderbmw.jpg")
+    return _run_timed(
+        ["blender", "-b", str(BLENDER_SCENE), "-o", out, "-f", "1",
+         "--verbose", "0", "-t", str(ncpus)], timeout=900)
+
+
+def _ensure_kernel_src() -> bool:
+    """Download + extract + defconfig linux-6.14.7 once (cached in ASSET_DIR),
+    matching the CachyOS Mini-Benchmarker. urllib download (stdlib, no wget dep),
+    then a one-time `make defconfig` so each timed build is config-stable."""
+    if (KERNEL_SRC / "Makefile").is_file() and (KERNEL_SRC / ".config").is_file():
+        return True
+    ASSET_DIR.mkdir(parents=True, exist_ok=True)
+    if (not KERNEL_TARBALL.is_file()
+            or KERNEL_TARBALL.stat().st_size < 100 * 1024 * 1024):
+        log_info(f"downloading linux-{KERNEL_VER} (~140MB, one-time)...")
+        import urllib.request
+        part = KERNEL_TARBALL.with_suffix(".part")
+        try:
+            urllib.request.urlretrieve(KERNEL_URL, part)
+            part.replace(KERNEL_TARBALL)
+        except Exception as e:
+            log_error(f"  kernel download failed: {e}")
+            part.unlink(missing_ok=True)
+            return False
+    if not (KERNEL_SRC / "Makefile").is_file():
+        log_info(f"extracting linux-{KERNEL_VER} (one-time)...")
+        r = subprocess.run(["tar", "-xf", str(KERNEL_TARBALL)], cwd=ASSET_DIR,
+                           capture_output=True, text=True, timeout=600)
+        if r.returncode != 0:
+            log_error(f"  kernel extract failed: {r.stderr.strip()[:200]}")
+            return False
+    # ONE-TIME defconfig (not timed), distclean first -- matches the benchmarker.
+    log_info("  make defconfig (one-time prep)...")
+    subprocess.run(["make", "-s", "distclean"], cwd=KERNEL_SRC,
+                   capture_output=True, timeout=120)
+    d = subprocess.run(["make", "-s", "defconfig"], cwd=KERNEL_SRC,
+                       capture_output=True, text=True, timeout=120)
+    if d.returncode != 0:
+        log_error(f"  make defconfig failed (need flex/bison/libelf/bc?): "
+                  f"{d.stderr.strip()[:200]}")
+        return False
+    return True
 
 
 def run_kernel_defconfig(ncpus: int) -> Optional[float]:
-    src = Path.home() / "linux-bench"
-    subprocess.run(["make", "clean", "-s"], cwd=src,
-                   capture_output=True, timeout=60)
-    subprocess.run(["make", "defconfig", "-s"], cwd=src,
-                   capture_output=True, timeout=60)
-    return _run_timed(["make", f"-j{ncpus}", "-s"], cwd=src, timeout=1800)
+    if not _ensure_kernel_src():
+        return None
+    # distclean + defconfig before each iteration -- matches the OFFICIAL CachyOS
+    # benchmarker (make -s distclean && make -s defconfig), so every timed build is
+    # a full from-scratch compile INCLUDING the config-prepare stage (syncconfig,
+    # timeconst.h via bc) -- not a `make clean` that keeps .config and skips prepare,
+    # which under-reports vs their chart. TIMED build matches the official:
+    # make KCFLAGS='-Wno-error' -sj$N vmlinux.
+    subprocess.run(["make", "-s", "distclean"], cwd=KERNEL_SRC,
+                   capture_output=True, timeout=120)
+    subprocess.run(["make", "-s", "defconfig"], cwd=KERNEL_SRC,
+                   capture_output=True, timeout=120)
+    return _run_timed(["make", "KCFLAGS=-Wno-error", f"-j{ncpus}", "-s", "vmlinux"],
+                      cwd=KERNEL_SRC, timeout=3600)
 
 
 # WORKLOAD REGISTRY
@@ -384,14 +553,21 @@ WORKLOADS = [
              lambda: _have("git") and _have("make") and _have("gcc"),
              "install git, make, gcc",
              run_ffmpeg_compile),
+    Workload("namd-apoa1", "namd 92K atoms",
+             lambda: _have("tar"),
+             "auto-downloads NAMD 3.0b6 + apoa1 (needs tar)",
+             run_namd),
+    Workload("y-cruncher-pi-1b", "y-cruncher pi 1b",
+             lambda: _have("tar"),
+             "auto-downloads y-cruncher static (needs tar)",
+             run_ycruncher),
     Workload("blender-render", "blender render",
              _probe_blender,
              "install blender; place scene at ~/blender-bench/scene.blend",
              run_blender),
     Workload("kernel-defconfig", "kernel defconfig",
              _probe_kernel_defconfig,
-             "git clone --depth 1 https://git.kernel.org/.../linux.git "
-             "~/linux-bench",
+             "install make, gcc, tar (+ flex bison libelf bc for the kernel build)",
              run_kernel_defconfig),
 ]
 
@@ -564,6 +740,8 @@ WORKLOAD_TRACE_COMM = {
     "primes": "stress-ng",
     "x265-encoding": "ffmpeg",
     "ffmpeg-compilation": "make",
+    "namd-apoa1": "namd3",
+    "y-cruncher-pi-1b": "y-cruncher",
     "blender-render": "blender",
     "kernel-defconfig": "make",
 }
@@ -663,13 +841,19 @@ def main() -> int:
     # WORKLOAD SELECTION + AVAILABILITY PROBE.
     wl_filter = set(w.strip() for w in args.workloads.split(",") if w.strip())
     active: list[Workload] = []
+    unavailable: list[Workload] = []
     for wl in WORKLOADS:
         if wl_filter and wl.name not in wl_filter:
             continue
-        if not wl.probe():
-            log_warn(f"  skipping {wl.label}: {wl.probe_hint}")
-            continue
-        active.append(wl)
+        (active if wl.probe() else unavailable).append(wl)
+    # PREFLIGHT: surface every missing dependency UP FRONT with its fix, before the
+    # (long) suite runs -- a missing tool should be a clear heads-up here, not a
+    # cryptic mid-run failure three benchmarks deep.
+    if unavailable and not log.child:
+        log_warn(f"PREFLIGHT: {len(unavailable)} workload(s) will be SKIPPED -- "
+                 "missing dependencies:")
+        for wl in unavailable:
+            log_warn(f"    {wl.label} -- {wl.probe_hint}")
     if not active:
         log_error("No workloads available; exiting.")
         return 1
