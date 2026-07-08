@@ -1,0 +1,37 @@
+# Dockerfile.runner -- the container every qemu run for the 7.1-bug
+# reproducer executes inside. PANDEMONIUM boots stock CachyOS-shipped
+# kernels running its own userspace BPF scheduler on top, so this image
+# carries no kernel-build toolchain -- only qemu itself, the filesystem
+# tools run-in-container.py needs for the scratch/results virtio-blk
+# images, and the CachyOS package repo so kernel packages can be resolved
+# and extracted without ever touching the host's pacman configuration.
+
+FROM archlinux:base
+
+# The v3 (x86_64-v3-optimized) CachyOS channel tags its packages with a
+# non-standard Arch field; pacman rejects any package whose arch isn't in
+# its configured Architecture list ("package architecture is not valid").
+RUN sed -i 's/^Architecture = auto/Architecture = x86_64 x86_64_v3/' \
+      /etc/pacman.conf
+
+# CachyOS package repos + signing key, so fetch-kernels.py can pacman -Sy /
+# resolve / download linux-cachyos package files inside this container.
+# Entirely contained to the image's own pacman.conf and keyring -- the
+# host's pacman trust store is never touched. The v3 (x86_64-v3-optimized)
+# channel carries newer kernel builds than the base x86_64 channel.
+RUN printf '[cachyos]\nServer = https://mirror.cachyos.org/repo/x86_64/$repo\n' \
+      >> /etc/pacman.conf \
+ && printf '[cachyos-v3]\nServer = https://mirror.cachyos.org/repo/x86_64_v3/$repo\n' \
+      >> /etc/pacman.conf \
+ && pacman-key --init \
+ && pacman-key --recv-keys F3B607488DB35A47 --keyserver keyserver.ubuntu.com \
+ && pacman-key --lsign-key F3B607488DB35A47
+
+RUN pacman -Syu --noconfirm --needed \
+      qemu-base qemu-system-x86 \
+      e2fsprogs xfsprogs \
+      libarchive zstd \
+      python \
+ && pacman -Scc --noconfirm
+
+WORKDIR /run

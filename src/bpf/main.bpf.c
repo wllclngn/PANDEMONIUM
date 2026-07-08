@@ -2277,5 +2277,9 @@ SCX_OPS_DEFINE(pandemonium_ops,
 	       .exit         = (void *)pandemonium_exit,
 	       .flags        = SCX_OPS_BUILTIN_IDLE_PER_NODE |
 			       SCX_OPS_KEEP_BUILTIN_IDLE,
-	       .timeout_ms   = 10000,
+	       .timeout_ms   = 1500, // TEST-ONLY: shortened from 10000 to force the kernel's
+	                             // own sched_ext watchdog to fire on far more of the
+	                             // chronic sub-second stalls already observed, for a
+	                             // deliberate freeze-mechanism induction run. Revert to
+	                             // 10000 once that capture is complete.
 	       .name         = "pandemonium");
