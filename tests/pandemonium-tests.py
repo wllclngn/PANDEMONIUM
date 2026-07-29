@@ -12,6 +12,7 @@ Usage:
 
 import argparse
 import bisect
+import json
 import os
 import threading
 import traceback
@@ -40,6 +41,7 @@ from pandemonium_common import (
     stall_susceptibility,
     install_exit_guard, register_exit_cleanup,
     cpu_release_deprecated,
+ warm_sudo, refresh_sudo,
 )
 from ipc_workload import (
     measure_ipc_cell, IPC_DEFAULT_ROUNDS, IPC_RTT_PRIMS, IPC_COMM,
@@ -2986,7 +2988,7 @@ def measure_sojourn_ceiling(binary: Path, n_cpus: int,
     All CPUs saturated with stress workers. Repeated waves of short-lived
     tasks (10ms work each) are fired into the system. The depth gate and
     work stealing handle most tasks. The sojourn rescue in tick() catches
-    any that slip through -- stale pcpu_enqueue_ns triggers a kick within
+    any that slip through -- stale sojourn_stamp_pcpu triggers a kick within
     the sojourn threshold (5ms default).
 
     PASS: no task waits > 1s
@@ -3171,7 +3173,8 @@ SCX_FIELD = [
 ]
 
 
-def field_arms(n_cpus: int, schedulers: str = "", all_scx: bool = False):
+def field_arms(n_cpus: int, schedulers: str = "", all_scx: bool = False,
+               pandemonium_only: bool = False):
     """Build the (sched_name, activate_cmd) arms for a traced field run.
 
     EEVDF is always the neutral baseline arm. The default and --all-scx keep
@@ -3180,6 +3183,9 @@ def field_arms(n_cpus: int, schedulers: str = "", all_scx: bool = False):
       no flag        -> EEVDF + PANDEMONIUM
       --all-scx      -> EEVDF + PANDEMONIUM + every installed external
       --schedulers L -> EEVDF + each named (PANDEMONIUM only if in L)
+    pandemonium_only wins over all of the above: PANDEMONIUM alone, no EEVDF
+    arm, no externals. This is the ONE implementation of the flag; every
+    subparser that accepts it threads it here.
     Uninstalled externals are warned and skipped, never fatal.
     """
     # Accept either a comma string ("scx_rusty,scx_lavd") or an already-split
@@ -3188,6 +3194,8 @@ def field_arms(n_cpus: int, schedulers: str = "", all_scx: bool = False):
     if isinstance(schedulers, (list, tuple)):
         schedulers = ",".join(str(s) for s in schedulers)
     pand = ("PANDEMONIUM", [str(BINARY), "--nr-cpus", str(n_cpus)])
+    if pandemonium_only:
+        return [pand]
     arms = [("EEVDF", None)]
     if all_scx:
         arms.append(pand)
@@ -3216,7 +3224,8 @@ def field_arms(n_cpus: int, schedulers: str = "", all_scx: bool = False):
 
 
 def trace_pcpu_burst(stamp: str, n_cpus: int, duration: int,
-                     schedulers: str = "", all_scx: bool = False) -> int:
+                     schedulers: str = "", all_scx: bool = False,
+                     pandemonium_only: bool = False) -> int:
     """One montauk-traced burst-starvation capture, hard-capped at `duration`s.
     Saturates every CPU, then detonates fork/exec bursts for the window while
     montauk records the per-event wake-to-run -- so the worst burst wakeup is in
@@ -3261,7 +3270,7 @@ def trace_pcpu_burst(stamp: str, n_cpus: int, duration: int,
     # field (default EEVDF+PANDEMONIUM; widened by --schedulers/--all-scx) runs
     # the same body. The stress-worker/burst tasks are the `pandemonium` binary
     # under every scheduler, so montauk targets comm `pandemonium` for all arms.
-    arms = field_arms(n_cpus, schedulers, all_scx)
+    arms = field_arms(n_cpus, schedulers, all_scx, pandemonium_only)
     traced = 0
     for sched_name, activate_cmd in arms:
         rec_dir, _ = trace_workload(sched_name, activate_cmd,
@@ -3379,7 +3388,7 @@ def _parse_coldwork_starve(text):
 def trace_coldwake_cycle(stamp, n_cpus, duration, dwell=2,
                          sizes="100000,500000,1000000,4000000,16000000,50000000",
                          mem_sizes="32768,262144,2097152,8388608,33554432,134217728",
-                         schedulers="", all_scx=False) -> int:
+                         schedulers="", all_scx=False, pandemonium_only=False) -> int:
     """montauk-traced cold-core ramp capture with VARIED burst sizes. A single
     fixed quantum averages a fast frequency ramp away -- if the core ramps in the
     first few ms, a 50ms burst runs mostly warm and the cold start is invisible.
@@ -3439,7 +3448,7 @@ def trace_coldwake_cycle(stamp, n_cpus, duration, dwell=2,
         return _parse_coldwork_sizes(r.stdout)
 
     try:
-        arms = field_arms(n_cpus, schedulers, all_scx)
+        arms = field_arms(n_cpus, schedulers, all_scx, pandemonium_only)
         traced = 0
         worst = []   # (sched_name, max_penalty_pct, size_ms) for the cross-arm verdict
         starve_worst = []   # (sched_name, worst_dispatch_ns) -- the stall verdict
@@ -3548,7 +3557,7 @@ def cmd_bench_coldwake(args) -> int:
         # mkdir there fails. Re-exec under sudo so `./pandemonium.py prism-coldwake`
         # works without a sudo prefix, matching prism's main().
         os.execvp("sudo", ["sudo", sys.executable, *sys.argv])
-    subprocess.run(["sudo", "true"])
+    warm_sudo()
     # The aperf/mperf frequency read needs /dev/cpu/N/msr (the msr module). Load
     # it best-effort; coldwork reports freq 0 and the bench notes n/a if absent.
     subprocess.run(["sudo", "modprobe", "msr"], capture_output=True)
@@ -3573,10 +3582,28 @@ def cmd_bench_coldwake(args) -> int:
         return trace_storm_cycle(stamp, n_cpus, args.duration,
                                  busy_per_cpu=args.busy_per_cpu,
                                  sleep_us=args.rt_sleep_us, spin_us=args.rt_spin_us,
-                                 schedulers=args.schedulers, all_scx=args.all_scx)
+                                 schedulers=args.schedulers, all_scx=args.all_scx,
+                                 pandemonium_only=getattr(args, "pandemonium_only", False))
     return trace_coldwake_cycle(stamp, n_cpus, args.duration, dwell=args.dwell,
                                 sizes=args.sizes, mem_sizes=args.mem_sizes,
-                                schedulers=args.schedulers, all_scx=args.all_scx)
+                                schedulers=args.schedulers, all_scx=args.all_scx,
+                                pandemonium_only=getattr(args, "pandemonium_only", False))
+
+
+def _storm_captured(json_text: str):
+    """montauk v7.17.0+: the --json envelope carries an explicit
+    montauk_analysis_storm_captured gauge (0 = storm probes unattached, the
+    surface was never measured). Returns True/False, or None when the envelope
+    is unreadable (older analyzer) so the caller falls back to the text verdict."""
+    try:
+        env = json.loads(json_text)
+        for r in env.get("reports", []):
+            for g in r.get("gauges", []):
+                if g.get("name") == "montauk_analysis_storm_captured":
+                    return bool(g.get("value"))
+    except (ValueError, AttributeError):
+        pass
+    return None
 
 
 def _parse_storm_report(text: str) -> dict:
@@ -3585,10 +3612,19 @@ def _parse_storm_report(text: str) -> dict:
     carries the fraction, the REAL-IPI-vs-IDLE-churn kind and the kick/reenqueue rates."""
     d = {"kind": None, "pct": 0.0, "storm": 0, "intervals": 0,
          "p50": 0, "peak": 0, "kick_s": 0, "preempt_s": 0, "reenq_s": 0}
-    m = re.search(r"VERDICT:\s*(.+)", text)
-    if not m or "no sched_ext kick activity" in text:
-        d["error"] = "no kick activity captured (scheduler idle, or trace empty)"
+    # Not-captured is ABSENCE, never a zero: the captured: 0 header is stamped
+    # by trace_storm_cycle from the analyzer's montauk_analysis_storm_captured
+    # gauge, and the text verdict is the analyzer's own not-captured wording.
+    if text.startswith("captured: 0") or "no sched_ext kick activity captured" in text:
+        d["captured"] = False
+        d["error"] = ("storm surface not measured (storm probes off -- "
+                      "MONTAUK_SCX_STORM); absence, not a zero")
         return d
+    m = re.search(r"VERDICT:\s*(.+)", text)
+    if not m:
+        d["error"] = "no storm verdict in analyzer output (trace empty or analyzer error)"
+        return d
+    d["captured"] = True
     v = m.group(1)
     km = re.match(r"([^;]+)", v)
     d["kind"] = km.group(1).strip() if km else v.strip()
@@ -3606,7 +3642,7 @@ def _parse_storm_report(text: str) -> dict:
 
 def trace_storm_cycle(stamp, n_cpus, duration, busy_per_cpu=4,
                       sleep_us=100, spin_us=10,
-                      schedulers="", all_scx=False) -> int:
+                      schedulers="", all_scx=False, pandemonium_only=False) -> int:
     """cpu_release kick-storm reproducer -- the test that actually recreates the
     reboot live-lock (cold-wake measures cold caches, a different cost). Under
     powersave, stormwork drives the boot condition: a busy sched_ext population
@@ -3636,7 +3672,8 @@ def trace_storm_cycle(stamp, n_cpus, duration, busy_per_cpu=4,
         return 1
 
     if schedulers:
-        arms = [a for a in field_arms(n_cpus, schedulers, all_scx) if a[1] is not None]
+        arms = [a for a in field_arms(n_cpus, schedulers, all_scx,
+                                      pandemonium_only) if a[1] is not None]
     else:
         arms = [("PANDEMONIUM (BPF)", [str(BINARY), "--no-adaptive"]),
                 ("PANDEMONIUM (ADAPTIVE)", [str(BINARY)])]
@@ -3666,15 +3703,27 @@ def trace_storm_cycle(stamp, n_cpus, duration, busy_per_cpu=4,
             trace = f"/tmp/storm-{tag}-{stamp}.bin"
             log_info(f"[storm] {sched_name}: flooding {duration}s under montauk")
             with open(trace + ".err", "w") as ef:
-                # MONTAUK_SCX_STORM=1: this is the ONE capture that wants the scx
-                # kick/reenqueue counters, so it opts the fentry/fexit storm probes
-                # in. They are off in every other montauk --trace (they trampoline
-                # sched_ext's hot kfuncs and freeze 7.1+ under load). montauk comes
-                # up before the flood, so the patch lands while scx is quiescent.
+                # MONTAUK_SCX_STORM DISABLED -- v7.1 HARD-LOCK.
+                # Setting it opts in the fentry/fexit trampolines on sched_ext's
+                # hot kfuncs (scx_bpf_kick_cpu / scx_bpf_reenqueue_local). On the
+                # 7.1 kernel this box runs, arming them under a live scx load
+                # HARD-LOCKS the machine -- a full manual power-cycle, reproduced
+                # 2026-07-14. montauk's "attach while scx is quiescent" protocol
+                # did NOT prevent it: the probes stay live across the sweep and
+                # the box froze anyway. Until a freeze-safe kick observer exists
+                # (a tracepoint on the reschedule IPI path, not a live-text
+                # trampoline on the kfunc), this capture runs with the probes
+                # OFF. The var is scrubbed from the child env, not merely unset,
+                # so an ambient `export MONTAUK_SCX_STORM=1` in the caller's shell
+                # (the exact route that froze the box) cannot re-arm it here. With
+                # the probes off the storm report honestly reads "not captured"
+                # (montauk v7.17.0), never a fabricated kick/s=0.
+                storm_env = {k: v for k, v in os.environ.items()
+                             if k != "MONTAUK_SCX_STORM"}
                 mon = subprocess.Popen([MONTAUK, "--trace", "stormwork",
                                         "--trace-out", trace],
                                        stdout=subprocess.DEVNULL, stderr=ef,
-                                       env={**os.environ, "MONTAUK_SCX_STORM": "1"})
+                                       env=storm_env)
                 time.sleep(2.0)
                 if mon.poll() is None:
                     subprocess.run(["sudo", swbin, "storm", str(duration),
@@ -3692,16 +3741,30 @@ def trace_storm_cycle(stamp, n_cpus, duration, busy_per_cpu=4,
             wait_for_deactivation(5.0)
             rep = subprocess.run([MONTAUK + "_analyze", trace, "--report", "storm"],
                                  capture_output=True, text=True)
+            # v7.17.0: query the captured bit as structured data and stamp it
+            # into the artifact NOW -- the trace is deleted below, so this is
+            # the only moment absence-vs-zero can be recorded. An unmeasured
+            # storm surface must never fossilize as an empty .storm file.
+            jrep = subprocess.run([MONTAUK + "_analyze", trace, "--report", "storm", "--json"],
+                                  capture_output=True, text=True)
+            cap = _storm_captured(jrep.stdout)
+            body = rep.stdout
+            if cap is False:
+                body = ("captured: 0\n"
+                        "STORM: not captured -- storm probes off (MONTAUK_SCX_STORM "
+                        "gated); montauk_analysis_storm_captured=0\n") + body
+            elif cap is True:
+                body = "captured: 1\n" + body
             out = LOG_DIR / f"storm-{tag}-{stamp}.storm"
             try:
-                out.write_text(rep.stdout)
+                out.write_text(body)
             except OSError:
                 out = None
             try:
                 os.unlink(trace)  # the full storm trace is huge; the verdict is the artifact
             except OSError:
                 pass
-            results.append((sched_name, _parse_storm_report(rep.stdout), out))
+            results.append((sched_name, _parse_storm_report(body), out))
             guard.cleanup()
 
         for sched_name, d, out in results:
@@ -3736,7 +3799,7 @@ def cmd_bench_pcpu(args) -> int:
 
     Requires sudo. Runs at current online CPU count by default.
     """
-    subprocess.run(["sudo", "true"])
+    warm_sudo()
     nuke_stale_build()
     if not build():
         return 1
@@ -3774,7 +3837,8 @@ def cmd_bench_pcpu(args) -> int:
                     continue
                 rc |= trace_pcpu_burst(stamp, nr, args.duration,
                                        getattr(args, "schedulers", "") or "",
-                                       getattr(args, "all_scx", False))
+                                       getattr(args, "all_scx", False),
+                                       getattr(args, "pandemonium_only", False))
         finally:
             restore_all_cpus(max_cpus)
         return rc
@@ -3995,7 +4059,7 @@ def entries_for_cores(
 def cmd_bench_scale(args) -> int:
     """Unified benchmark: throughput + latency at each core count."""
 
-    subprocess.run(["sudo", "true"])
+    warm_sudo()
 
     dmesg = DmesgMonitor()
 
@@ -4283,7 +4347,7 @@ def cmd_bench_scale(args) -> int:
                         safe = (sched_name.replace(" ", "-")
                                 .replace("(", "").replace(")", ""))
                         with montauk_trace(IPC_COMM, f"ipc-{safe}-{n}c", stamp,
-                                           events=True) as _rec:
+                                           events=True, sched_detail=True) as _rec:
                             ipc_result = measure_ipc(BINARY, n)
                         _ipc_rec = _rec
                         ipc_result["events"] = (str(_rec.events_path)
@@ -4402,7 +4466,7 @@ def cmd_bench_sys(args) -> int:
     is_eevdf = scheduler == "eevdf"
     is_external = not is_pandemonium and not is_eevdf
 
-    subprocess.run(["sudo", "true"])
+    warm_sudo()
 
     dmesg = DmesgMonitor()
 
@@ -5225,6 +5289,7 @@ def _write_contention_prometheus(version, git, stamp, max_cpus, iterations,
 
 def trace_contention_storm(stamp: str, n_cpus: int, duration: int,
                            schedulers: str = "", all_scx: bool = False,
+                           pandemonium_only: bool = False,
                            phase: str = "deficit-storm") -> int:
     """One montauk-traced contention phase, hard-capped at `duration`s. Runs the
     requested phase -- deficit-storm (ncpu interactive + ncpu*2 batch) or
@@ -5253,7 +5318,7 @@ def trace_contention_storm(stamp: str, n_cpus: int, duration: int,
     # --schedulers/--all-scx). The probe renames its comm to pand-cont under
     # every scheduler, so montauk targets it for all arms. The recording label is
     # the phase, so per-phase per-width captures stay distinct in the digest.
-    arms = field_arms(n_cpus, schedulers, all_scx)
+    arms = field_arms(n_cpus, schedulers, all_scx, pandemonium_only)
     traced = 0
     for sched_name, activate_cmd in arms:
         rec_dir, _ = trace_workload(sched_name, activate_cmd,
@@ -5275,7 +5340,7 @@ def cmd_bench_contention(args) -> int:
     a specific adaptive mechanism.
     """
 
-    subprocess.run(["sudo", "true"])
+    warm_sudo()
 
     nuke_stale_build()
 
@@ -5325,6 +5390,7 @@ def cmd_bench_contention(args) -> int:
                 rc |= trace_contention_storm(stamp, nr, args.duration,
                                              getattr(args, "schedulers", "") or "",
                                              getattr(args, "all_scx", False),
+                                             getattr(args, "pandemonium_only", False),
                                              phase=trace_phase)
         finally:
             restore_all_cpus(max_cpus)
@@ -5576,7 +5642,7 @@ def cmd_bench_scx(args) -> int:
     Pass criteria match .github/include/scripts/test_sched and
     .github/include/scripts/run_stress_tests from sched-ext/scx.
     """
-    subprocess.run(["sudo", "true"])
+    warm_sudo()
     nuke_stale_build()
     if not build():
         return 1
@@ -5829,7 +5895,7 @@ def cmd_low_cpu_deadline(args) -> int:
     asserts periodic deadline miss ratio < threshold. Before the v5.7.0
     fix: 87% misses at 4C, 39% at 2C. After: single digits expected.
     """
-    subprocess.run(["sudo", "true"])
+    warm_sudo()
     nuke_stale_build()
     if not build():
         return 1
@@ -5994,6 +6060,8 @@ def main() -> int:
     contention_bench.add_argument("--all-scx", action="store_true",
                                   help="With --trace: loop the full installed scx "
                                        "field (EEVDF + PANDEMONIUM + every external)")
+    contention_bench.add_argument("--pandemonium-only", action="store_true",
+        help="With --trace: PANDEMONIUM arm only (skip the EEVDF baseline and externals)")
 
     sys_bench = sub.add_parser("prism-sys",
                                help="Live system telemetry capture")
@@ -6026,6 +6094,9 @@ def main() -> int:
     pcpu_bench.add_argument("--all-scx", action="store_true",
                             help="With --trace: loop the full installed scx field "
                                  "(EEVDF + PANDEMONIUM + every external)")
+    pcpu_bench.add_argument("--pandemonium-only", action="store_true",
+                            help="With --trace: PANDEMONIUM arm only (skip the "
+                                 "EEVDF baseline and externals)")
 
     coldwake_bench = sub.add_parser("prism-coldwake",
         help="Cold-wake latency vs frequency-at-wake (idle->bare-wake, powersave)")
@@ -6060,6 +6131,10 @@ def main() -> int:
         default=100, help="storm mode: SCHED_FIFO sleep period us (release rate)")
     coldwake_bench.add_argument("--rt-spin-us", dest="rt_spin_us", type=int,
         default=10, help="storm mode: SCHED_FIFO spin us per wake (RT duty)")
+    coldwake_bench.add_argument("--pandemonium-only", action="store_true",
+        help="PANDEMONIUM arm only (skip the EEVDF baseline and externals)")
+    coldwake_bench.add_argument("--iterations", type=int, default=1,
+        help="Accepted for suite uniformity; cold-wake samples over time, not trials")
 
     scx_bench = sub.add_parser("prism-scx",
                                 help="scx CI compatibility test")
@@ -6070,6 +6145,12 @@ def main() -> int:
     scx_bench.add_argument("--core-counts", type=str, default=None,
                            help="Comma-separated core counts "
                                 "(default: auto 2,4,8,...,max)")
+    scx_bench.add_argument("--pandemonium-only", action="store_true",
+        help="Accepted for suite uniformity; prism-scx exercises PANDEMONIUM only already")
+    scx_bench.add_argument("--trace", action="store_true",
+        help="Accepted for suite uniformity; prism-scx has no capture mode")
+    scx_bench.add_argument("--iterations", type=int, default=1,
+        help="Accepted for suite uniformity; the scx CI matrix is single-pass")
 
     lcd = sub.add_parser("low-cpu-deadline",
                          help="v5.7.0 regression guard: ADAPTIVE deadline "

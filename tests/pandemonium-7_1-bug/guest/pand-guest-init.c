@@ -146,12 +146,15 @@ int main(void) {
     cmdline_get("hogs", hogs, sizeof(hogs), hogs_default);
     // io-flood workload params (pand.workload=ioflood)
     char workload[16], iomode[16], issuers[16], block_kb[16];
+    char burst_s[16], quiesce_s[16];
     cmdline_get("workload", workload, sizeof(workload), "strand");
     cmdline_get("iomode", iomode, sizeof(iomode), "all");
     char issuers_default[16];
     snprintf(issuers_default, sizeof(issuers_default), "%d", online_cpus() * 8);
     cmdline_get("issuers", issuers, sizeof(issuers), issuers_default);
     cmdline_get("block_kb", block_kb, sizeof(block_kb), "4");
+    cmdline_get("burst_s", burst_s, sizeof(burst_s), "0");
+    cmdline_get("quiesce_s", quiesce_s, sizeof(quiesce_s), "0");
     // filesystem + Wayland compositor-proxy params
     char fs[16], wayland[8], frame_us[16];
     cmdline_get("fs", fs, sizeof(fs), "ext4");
@@ -333,7 +336,7 @@ int main(void) {
         }
         say("running io-flood");
         char *fl_argv[] = {(char *)IOFLOOD, iomode, issuers, duration, block_kb,
-                           (char *)SCRATCH, NULL};
+                           (char *)SCRATCH, burst_s, quiesce_s, NULL};
         spawn_wait(fl_argv);
         if (kwin_pid)
             stop(kwin_pid);

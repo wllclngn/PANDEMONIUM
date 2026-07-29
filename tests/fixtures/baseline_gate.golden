@@ -1,0 +1,5 @@
+[gate] PANDEMONIUM cells: 4   CORRECTED geomean vs baseline: 1.32x (BEHIND baseline)
+[gate] raw geomean 1.40x   EEVDF drift 1.06x over 3 control cells (divided out per cell before judgment)
+[gate] 1 PANDEMONIUM cell(s) regressed past 15% vs the baseline, drift-corrected (worst first):
+     1.40x  ipc_p99_us    cores=8 primitive=socket scheduler=PANDEMONIUM: baseline 1000 -> cand 1400 us (drift 1.00x)
+[gate] FAIL: 1 PANDEMONIUM cell(s) below the baseline

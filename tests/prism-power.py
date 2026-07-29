@@ -60,23 +60,7 @@ from pandemonium_common import (
     is_scx_active, scx_scheduler_name,
     wait_for_deactivation,
     ensure_build, PrometheusBuilder,
-)
-
-
-def _warm_sudo() -> None:
-    """Prompt for sudo password if not cached. Subsequent sudo calls in
-    this script will use the cached credentials. Mirrors the pattern
-    used in tests/pandemonium-tests.py."""
-    r = subprocess.run(["sudo", "true"])
-    if r.returncode != 0:
-        log_error("sudo authentication failed")
-        sys.exit(1)
-
-
-def _refresh_sudo() -> None:
-    """Refresh cached sudo credentials. Called between long workloads to
-    avoid timeout in the middle of a measurement."""
-    subprocess.run(["sudo", "-v"], capture_output=True)
+ warm_sudo, refresh_sudo,)
 
 sys.path.insert(0, str(Path(__file__).parent.resolve()))
 from importlib import import_module
@@ -832,6 +816,9 @@ def main() -> int:
                     help=f"Seconds between runs (default {DEFAULT_COOLDOWN_SECS})")
     ap.add_argument("--schedulers", default=",".join(DEFAULT_EXTERNALS),
                     help="Comma-separated external scx schedulers")
+    ap.add_argument("--trace", action="store_true",
+                    help="Accepted for suite uniformity; prism-power has no "
+                         "capture mode (RAPL counters, not traces)")
     ap.add_argument("--pandemonium-only", action="store_true",
                     help="Only test PANDEMONIUM (BPF + ADAPTIVE), no EEVDF or external scx")
     ap.add_argument("--no-eevdf", action="store_true",
@@ -843,7 +830,7 @@ def main() -> int:
     args = ap.parse_args()
     args.schedulers = [s.strip() for s in args.schedulers.split(",") if s.strip()]
 
-    _warm_sudo()
+    warm_sudo()
     if not shutil.which("perf"):
         log_error("perf not found. Install with: sudo pacman -S perf")
         return 1
@@ -912,7 +899,7 @@ def main() -> int:
         for sched_name, cmd in entries:
             all_results[sched_name] = {}
             log_info(f"[{sched_name}] starting...")
-            _refresh_sudo()
+            refresh_sudo()
 
             guard = None
             if cmd is not None:

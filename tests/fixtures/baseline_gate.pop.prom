@@ -1,0 +1,39 @@
+# Synthetic montauk_pop_mean gauges for baseline_gate --self-test.
+# Hand-authored, not captured: every value is chosen to exercise one branch of
+# the drift correction, so the golden fails loudly if that arithmetic changes.
+# Groups are the baseline (5.14.0) and the candidate (5.17.0).
+#
+#   cores=12 pipe    -- the correction RESCUES this cell. Raw 1.15x looks like a
+#                       regression at the tolerance edge; the EEVDF twin shows
+#                       the box itself ran 1.20x slower, so corrected is 0.96x.
+#                       This is the exact reading error that once named the
+#                       wrong release as the peak.
+#   cores=8 socket   -- a GENUINE regression. Drift is 1.00x, so 1.40x stands,
+#                       and the 400us absolute gap clears the noise floor.
+#   cores=4 eventfd  -- NOISE. Raw 2.00x is past tolerance, but the absolute gap
+#                       is 20us, under ABS_FLOOR_US, so it must not trip.
+#   cores=2 sem      -- NO EEVDF TWIN. Falls back to the global drift geomean.
+#   cores=12 fanout  -- ZERO BASELINE. Must be skipped, never divided by.
+#
+# montauk_pop_mean{metric,cell,group} value
+
+montauk_pop_mean{metric="ipc_p99_us",cell="cores=12 primitive=pipe scheduler=EEVDF",group="5.14.0"} 100.0
+montauk_pop_mean{metric="ipc_p99_us",cell="cores=12 primitive=pipe scheduler=EEVDF",group="5.17.0"} 120.0
+montauk_pop_mean{metric="ipc_p99_us",cell="cores=12 primitive=pipe scheduler=PANDEMONIUM",group="5.14.0"} 1000.0
+montauk_pop_mean{metric="ipc_p99_us",cell="cores=12 primitive=pipe scheduler=PANDEMONIUM",group="5.17.0"} 1150.0
+
+montauk_pop_mean{metric="ipc_p99_us",cell="cores=8 primitive=socket scheduler=EEVDF",group="5.14.0"} 100.0
+montauk_pop_mean{metric="ipc_p99_us",cell="cores=8 primitive=socket scheduler=EEVDF",group="5.17.0"} 100.0
+montauk_pop_mean{metric="ipc_p99_us",cell="cores=8 primitive=socket scheduler=PANDEMONIUM",group="5.14.0"} 1000.0
+montauk_pop_mean{metric="ipc_p99_us",cell="cores=8 primitive=socket scheduler=PANDEMONIUM",group="5.17.0"} 1400.0
+
+montauk_pop_mean{metric="ipc_p99_us",cell="cores=4 primitive=eventfd scheduler=EEVDF",group="5.14.0"} 10.0
+montauk_pop_mean{metric="ipc_p99_us",cell="cores=4 primitive=eventfd scheduler=EEVDF",group="5.17.0"} 10.0
+montauk_pop_mean{metric="ipc_p99_us",cell="cores=4 primitive=eventfd scheduler=PANDEMONIUM",group="5.14.0"} 20.0
+montauk_pop_mean{metric="ipc_p99_us",cell="cores=4 primitive=eventfd scheduler=PANDEMONIUM",group="5.17.0"} 40.0
+
+montauk_pop_mean{metric="ipc_p99_us",cell="cores=2 primitive=sem scheduler=PANDEMONIUM",group="5.14.0"} 500.0
+montauk_pop_mean{metric="ipc_p99_us",cell="cores=2 primitive=sem scheduler=PANDEMONIUM",group="5.17.0"} 600.0
+
+montauk_pop_mean{metric="ipc_p99_us",cell="cores=12 primitive=fanout scheduler=PANDEMONIUM",group="5.14.0"} 0.0
+montauk_pop_mean{metric="ipc_p99_us",cell="cores=12 primitive=fanout scheduler=PANDEMONIUM",group="5.17.0"} 500.0

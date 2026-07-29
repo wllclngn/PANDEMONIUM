@@ -28,10 +28,9 @@ from pandemonium_common import (
     check_sources_changed, build,
     is_scx_active, scx_scheduler_name, get_online_cpus,
     montauk_trace, montauk_available,
+    montauk_report, envelope_report, envelope_gauges,
     PrometheusBuilder, table_header, table_row,
 )
-
-MONTAUK_ANALYZE = "/usr/local/bin/montauk_analyze"
 MSG_COMM = "sched-messaging"   # perf bench sched messaging names its workers this
 
 
@@ -67,7 +66,41 @@ def stop_messaging_load(p: subprocess.Popen) -> None:
 #   "decay (tier_{k+1}/tier_k): a b c"
 #   "VERDICT: migration density <decays monotonically|does NOT decay ...> ..."
 
-def parse_locality(report: str) -> dict:
+def _locality_from_envelope(rep: dict) -> dict | None:
+    """The machine dict from montauk's structured locality report, or None
+    unless the envelope carries the COMPLETE essential set (migrations plus at
+    least one tier) -- a partial envelope falls back to the text parse rather
+    than shipping half a verdict. Field names are verified against the live
+    envelope on the first traced run; until then this returns None harmlessly."""
+    g = envelope_gauges(rep)
+    if "montauk_analysis_locality_migrations" not in g:
+        return None
+    out = {"migrations": int(g["montauk_analysis_locality_migrations"]),
+           "unmapped": int(g.get("montauk_analysis_locality_unmapped", 0)),
+           "tiers": {}, "decay": [], "monotonic": None,
+           "no_topo": False, "no_migrations": False}
+    for gauge in rep.get("gauges", []):
+        labels = str(gauge.get("labels", ""))
+        if "tier=" in labels and gauge.get("name", "").endswith("_pct"):
+            tier = labels.split("tier=")[1].strip('"').split('"')[0]
+            out["tiers"][tier] = (0, float(gauge["value"]))
+    if not out["tiers"]:
+        return None
+    verdict = str(rep.get("verdict", "")).lower()
+    if "monotonic" in verdict:
+        out["monotonic"] = "not" not in verdict
+    return out
+
+
+def parse_locality(report: str, envelope=None) -> dict:
+    """Envelope-first: read montauk_analyze's structured --json when complete;
+    the regex text parse below survives ONLY as the fallback for a montauk
+    whose locality envelope lacks these fields."""
+    rep = envelope_report(envelope, "locality")
+    if rep:
+        parsed = _locality_from_envelope(rep)
+        if parsed is not None:
+            return parsed
     out = {"migrations": 0, "unmapped": 0, "tiers": {}, "decay": [],
            "monotonic": None, "no_topo": False, "no_migrations": False}
     if "no cache_topology snapshot" in report:
@@ -95,11 +128,10 @@ def parse_locality(report: str) -> dict:
 
 
 def analyze(events: Path) -> tuple[str, dict]:
-    rc, so, se = run_cmd_capture([MONTAUK_ANALYZE, str(events), "--report", "locality"])
-    if rc != 0:
-        log_error(f"montauk_analyze failed (rc={rc}): {se.strip()[:200]}")
-        return so + se, {}
-    return so, parse_locality(so)
+    text, envelope = montauk_report(events, "locality")
+    if envelope is None and not text.strip():
+        return text, {}
+    return text, parse_locality(text, envelope)
 
 
 def main() -> int:
@@ -113,6 +145,12 @@ def main() -> int:
                     help="perf bench sched messaging -l (messages/loop, default 1000)")
     ap.add_argument("--no-build", action="store_true",
                     help="skip the source-change rebuild check")
+    ap.add_argument("--trace", action="store_true",
+                    help="Accepted for suite uniformity; prism-locality traces "
+                         "unconditionally (capture is the bench)")
+    ap.add_argument("--iterations", type=int, default=1,
+                    help="Accepted for suite uniformity; locality samples over a "
+                         "duration window, not trials")
     ap.add_argument("--pandemonium-only", action="store_true",
                     help="accepted for `prism --dev` parity; this bench is "
                          "PANDEMONIUM-only already (no EEVDF arm), so it is a no-op")

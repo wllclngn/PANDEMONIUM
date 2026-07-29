@@ -55,7 +55,7 @@ from pandemonium_common import (
     is_scx_active, log, log_error, log_info, log_warn,
     mean_stdev, montauk_available, montauk_trace, scx_scheduler_name,
     wait_for_deactivation, PrometheusBuilder,
-)
+ warm_sudo, refresh_sudo,)
 
 sys.path.insert(0, str(Path(__file__).parent.resolve()))
 from importlib import import_module
@@ -63,20 +63,6 @@ _tests = import_module("pandemonium-tests")
 start_and_wait = _tests.start_and_wait
 stop_and_wait = _tests.stop_and_wait
 find_scheduler = _tests.find_scheduler
-
-
-def _warm_sudo() -> None:
-    """Prompt for sudo password if not cached. Subsequent sudo calls in
-    this script will use the cached credentials. Mirrors prism-power.py."""
-    r = subprocess.run(["sudo", "true"])
-    if r.returncode != 0:
-        log_error("sudo authentication failed")
-        sys.exit(1)
-
-
-def _refresh_sudo() -> None:
-    """Refresh cached sudo credentials between long workloads."""
-    subprocess.run(["sudo", "-v"], capture_output=True)
 
 # ASSET DIRECTORY. PERSISTENT TEST CORPUS, GENERATED FFMPEG CLONE,
 # AND GENERATED XZ INPUT FILE LIVE HERE BETWEEN INVOCATIONS.
@@ -774,7 +760,7 @@ def run_trace(entries, active, stamp, ncpus) -> int:
             try:
                 for wl in active:
                     comm = WORKLOAD_TRACE_COMM.get(wl.name, wl.name)
-                    _refresh_sudo()
+                    refresh_sudo()
                     log_info(f"  [{sched_name}] tracing {wl.label} (comm='{comm}')")
                     with montauk_trace(comm, f"cachyos-{safe}-{wl.name}",
                                        stamp) as rec:
@@ -826,7 +812,7 @@ def main() -> int:
                          "to /tmp/pandemonium. Wall-times are contaminated; ignored.")
     args = ap.parse_args()
 
-    _warm_sudo()
+    warm_sudo()
 
     ncpus = multiprocessing.cpu_count()
     ver = get_version()
@@ -944,7 +930,7 @@ def main() -> int:
                                  args=(guard, expected_ops, sched_name,
                                        stop_evt, watch)).start()
             for wl in active:
-                _refresh_sudo()
+                refresh_sudo()
                 log_info(f"  [{sched_name}] {wl.label}")
                 samples = run_workload_n_times(wl, args.iterations, ncpus)
                 reason = watch.get("reason") or _sched_crashed(guard, expected_ops)

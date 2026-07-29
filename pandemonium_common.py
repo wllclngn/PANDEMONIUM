@@ -425,6 +425,79 @@ def _sub_numeric(values: list[float], args: list[str]):
     return int(s) if not any(c in s for c in ".eEnN") else float(s)
 
 
+# MONTAUK REPORT -- the one invocation for "run montauk_analyze --report over a
+# capture." Returns BOTH faces of the result: the TEXT report (montauk's own
+# human verdict -- callers print it verbatim, montauk is the instrument) and
+# the STRUCTURED envelope from --json (the machine-read side; None when the
+# installed montauk predates --json for this mode or the envelope fails to
+# parse). Callers parse the ENVELOPE, never the text -- text-scraping montauk
+# output is the exact anti-pattern this helper retires; the per-bench regex
+# parsers survive only as the explicit fallback for a None envelope.
+
+def montauk_report(events, report: str):
+    """(text, envelope|None) for one montauk_analyze report over a capture."""
+    import json as _json
+    rc, so, se = run_cmd_capture(
+        [MONTAUK_ANALYZE, str(events), "--report", report])
+    if rc != 0:
+        log_error(f"montauk_analyze failed (rc={rc}): {se.strip()[:200]}")
+        return so + se, None
+    rj, sj, _ej = run_cmd_capture(
+        [MONTAUK_ANALYZE, str(events), "--report", report, "--json"])
+    envelope = None
+    if rj == 0 and sj.strip():
+        try:
+            envelope = _json.loads(sj)
+        except ValueError:
+            log_warn(f"montauk_analyze --json emitted an unparseable envelope "
+                     f"for {report} -- falling back to the text parser")
+    return so, envelope
+
+
+def envelope_report(envelope, name: str) -> dict:
+    """The named report dict out of a montauk envelope ({} when absent).
+    Accepts both the digest-style {'reports': [...]} wrapper and a bare
+    single-report envelope."""
+    if not isinstance(envelope, dict):
+        return {}
+    for rep in envelope.get("reports", []):
+        if rep.get("name") == name:
+            return rep
+    return envelope if envelope.get("name") == name else {}
+
+
+def envelope_gauges(report_dict: dict) -> dict:
+    """{gauge_name: value} from one envelope report's gauges list."""
+    out = {}
+    for g in report_dict.get("gauges", []):
+        n = g.get("name")
+        if n is not None and "value" in g:
+            out.setdefault(n, g["value"])
+    return out
+
+
+# SUDO CREDENTIAL LIFECYCLE -- the one implementation. Every bench that runs
+# privileged steps warms the cache once up front (one clean password prompt on
+# the tty) and refreshes it between long workloads so a timestamp never expires
+# mid-measurement. Replaces the per-file _warm_sudo/_refresh_sudo copies and
+# the inline `sudo true` warmups.
+
+def warm_sudo() -> None:
+    """Prompt for sudo credentials if not cached; exit on auth failure."""
+    if os.geteuid() == 0:
+        return
+    r = subprocess.run(["sudo", "true"])
+    if r.returncode != 0:
+        log_error("sudo authentication failed")
+        sys.exit(1)
+
+
+def refresh_sudo() -> None:
+    """Refresh cached sudo credentials between long workloads."""
+    if os.geteuid() != 0:
+        subprocess.run(["sudo", "-v"], capture_output=True)
+
+
 def mean_stdev(values: list[float]) -> tuple[float, float]:
     # mean + sample (n-1) stdev, both from sublimation (hard dependency, no fallback).
     if not values:
@@ -592,8 +665,27 @@ def get_online_cpus() -> int:
     return _parse_cpu_range("/sys/devices/system/cpu/online")
 
 
-def set_cpu_online(cpu: int, online: bool) -> bool:
+def cpu_is_online(cpu: int) -> bool:
+    """Read (unprivileged) whether a CPU is online. cpu0 has no online file
+    (never offlinable); a missing file otherwise reads as offline."""
     if cpu == 0:
+        return True
+    try:
+        return Path(f"/sys/devices/system/cpu/cpu{cpu}/online") \
+            .read_text().strip() == "1"
+    except OSError:
+        return False
+
+
+def set_cpu_online(cpu: int, online: bool) -> bool:
+    # IDEMPOTENT AND READ-FIRST: the state read is unprivileged, so a CPU
+    # already in the requested state costs no subprocess and -- critically --
+    # no sudo. Before this check, the module-level exit guard's cleanup ran
+    # `sudo tee` for EVERY cpu on EVERY exit, so any unprivileged invocation
+    # (even --help) blocked on a password prompt at interpreter exit.
+    if cpu == 0:
+        return True
+    if cpu_is_online(cpu) == online:
         return True
     path = f"/sys/devices/system/cpu/cpu{cpu}/online"
     value = "1" if online else "0"
@@ -707,7 +799,15 @@ def eject_scheduler(trace_mode: bool = False) -> None:
         return
     name = scx_scheduler_name()
     log_warn(f"interrupted -- ejecting active scheduler ({name})")
-    subprocess.run(["systemctl", "stop", "pandemonium"], capture_output=True)
+    # sudo, never bare systemctl: unprivileged systemctl escalates to polkit,
+    # whose TTY agent prints its red AUTHENTICATING banner mid-log and times out
+    # if unanswered. sudo gives one plain password prompt on the tty (or none,
+    # if the timestamp is still warm) and its output stays uncaptured so the
+    # prompt is actually visible.
+    prefix = [] if os.geteuid() == 0 else ["sudo"]
+    if prefix:
+        log_info("stopping pandemonium.service (sudo may prompt)")
+    subprocess.run(prefix + ["systemctl", "stop", "pandemonium"])
     if wait_for_deactivation(8.0):
         log_info("scheduler ejected -- back on stock EEVDF")
         return
@@ -746,7 +846,15 @@ def install_exit_guard(eject: bool = True, trace_mode: bool = False) -> None:
         return
     _GUARD_INSTALLED[0] = True
 
+    ran = [False]
+
     def _cleanup() -> None:
+        # Once. The SIGINT path runs _cleanup then re-raises, which exits the
+        # interpreter and fires the atexit registration a second time -- the
+        # doubled eject was two password prompts in a row on interrupt.
+        if ran[0]:
+            return
+        ran[0] = True
         for fn in list(_EXIT_CLEANUPS):
             try:
                 fn()
@@ -784,6 +892,7 @@ def install_exit_guard(eject: bool = True, trace_mode: bool = False) -> None:
 # MONTAUK IS THE ONLY TRACER -- NO ftrace/trace_pipe ANYWHERE IN THE SUITE.
 
 MONTAUK = "/usr/local/bin/montauk"
+MONTAUK_ANALYZE = "/usr/local/bin/montauk_analyze"
 MONTAUK_ATTACH_TIMEOUT = 10.0
 MONTAUK_LOG_INTERVAL_MS = 100
 
@@ -918,7 +1027,14 @@ class MontaukTrace:
     def __init__(self, pattern, label, stamp, log_dir=TRACE_DIR,
                  interval_ms=MONTAUK_LOG_INTERVAL_MS, baseline_s=0.0,
                  attach_timeout=MONTAUK_ATTACH_TIMEOUT, events=False,
-                 pin_cpu=None):
+                 pin_cpu=None, sched_detail=False):
+        # sched_detail: stream CPU_IDLE alongside the decision events, so
+        # dispatch-stall can split a PREEMPT-STARVED floored wake into DARK
+        # (CPU sat idle, no rescue) vs HELD (CPU busy the whole time) instead
+        # of reporting "cannot separate, recapture with a montauk that
+        # streams CPU_IDLE." Off by default -- extra event volume, opt in
+        # where that split is the actual question.
+        self.sched_detail = sched_detail
         # pin_cpu: taskset montauk to a dedicated CPU so it always drains its
         # ring buffer -- under a saturated workload an unpinned montauk gets
         # starved and DROPS events (400ms+ capture holes), making a per-event
@@ -945,6 +1061,8 @@ class MontaukTrace:
                "--log-interval-ms", str(self.interval_ms)]
         if self.events_path is not None:
             cmd += ["--trace-out", str(self.events_path)]
+        if self.sched_detail:
+            cmd += ["--sched-detail"]
         if self.pin_cpu is not None:
             cmd = ["taskset", "-c", str(self.pin_cpu)] + cmd
         self.proc = subprocess.Popen(cmd, stdout=self._out,

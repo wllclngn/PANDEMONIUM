@@ -35,10 +35,9 @@ from pandemonium_common import (
     run_cmd_capture, check_sources_changed, build,
     is_scx_active, scx_scheduler_name, get_online_cpus,
     montauk_trace, montauk_available,
+    montauk_report, envelope_report, envelope_gauges,
     PrometheusBuilder, table_header, table_row,
 )
-
-MONTAUK_ANALYZE = "/usr/local/bin/montauk_analyze"
 WORKER_COMM = "pand-strand"          # montauk --trace anchor (kstrand is system-wide)
 FREEZE_SIGNATURE_MS = 100.0          # HELD strand at/above this = the writeback freeze
 
@@ -159,9 +158,22 @@ def stop_load(procs: list, scratch: Path) -> None:
 # the machine-readable source if a future --prom path is wired; the text report
 # is the guaranteed surface today.
 
-def parse_kstrand(report: str) -> dict:
+def parse_kstrand(report: str, envelope=None) -> dict:
+    """Envelope-first for the summary fields (the kstrand gauge names are
+    live-verified: montauk_analysis_kstrand_events_total / _worst_held_ms);
+    the offender TABLE still comes from the text parse below until montauk's
+    envelope is confirmed to carry the full per-kthread rows -- a montauk
+    envelope gap to verify, not silently assume, on the next traced run."""
     out = {"strands": 0, "kthreads": 0, "worst_held_ms": 0.0,
            "total_dark": 0, "total_held": 0, "offenders": [], "clean": False}
+    rep = envelope_report(envelope, "kstrand")
+    if rep:
+        g = envelope_gauges(rep)
+        if "montauk_analysis_kstrand_events_total" in g:
+            out["strands"] = int(g["montauk_analysis_kstrand_events_total"])
+            out["worst_held_ms"] = float(
+                g.get("montauk_analysis_kstrand_worst_held_ms", 0.0))
+            out["clean"] = out["strands"] == 0
     if "no per-CPU kthread strands over threshold" in report:
         out["clean"] = True
         return out
@@ -203,12 +215,10 @@ def parse_kstrand(report: str) -> dict:
 
 
 def analyze(events: Path) -> tuple[str, dict]:
-    rc, so, se = run_cmd_capture(
-        [MONTAUK_ANALYZE, str(events), "--report", "kstrand"])
-    if rc != 0:
-        log_error(f"montauk_analyze failed (rc={rc}): {se.strip()[:200]}")
-        return so + se, {}
-    return so, parse_kstrand(so)
+    text, envelope = montauk_report(events, "kstrand")
+    if envelope is None and not text.strip():
+        return text, {}
+    return text, parse_kstrand(text, envelope)
 
 
 # PROBE: one mode = one load shape + one montauk capture + one verdict.
@@ -342,6 +352,12 @@ def main() -> int:
                     help="writeback scratch directory")
     ap.add_argument("--no-build", action="store_true",
                     help="skip the source-change rebuild check")
+    ap.add_argument("--trace", action="store_true",
+                    help="Accepted for suite uniformity; prism-strand traces "
+                         "unconditionally (capture is the bench)")
+    ap.add_argument("--iterations", type=int, default=1,
+                    help="Accepted for suite uniformity; strand samples over a "
+                         "duration window, not trials")
     ap.add_argument("--pandemonium-only", action="store_true",
                     help="accepted for `prism --dev` parity; this bench is "
                          "PANDEMONIUM-only already (no EEVDF arm), so it is a no-op")

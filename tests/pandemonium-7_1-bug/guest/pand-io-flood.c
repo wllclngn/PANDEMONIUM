@@ -26,6 +26,9 @@
 
 static int g_block;
 static long g_deadline_ms;
+static long g_start_ms;
+static long g_burst_ms;     // 0 = continuous (the historical behavior)
+static long g_quiesce_ms;
 static const char *g_scratch;
 
 static long now_ms(void)
@@ -33,6 +36,28 @@ static long now_ms(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
+// Burst mode: issue for burst_s, then every issuer idles quiesce_s, repeat
+// until the deadline. The quiesce EDGE is the point: load draining off a CPU
+// is the transition where a stopped tick can strand whatever is still queued,
+// and a bursting run crosses that edge once per cycle instead of once per
+// boot. All issuers share the same wall-clock phase, so the drains are
+// system-wide, like a desktop going quiet.
+static void wait_if_quiesce(void)
+{
+    if (g_burst_ms <= 0)
+        return;
+    for (;;) {
+        long now = now_ms();
+        if (now >= g_deadline_ms)
+            return;
+        long phase = (now - g_start_ms) % (g_burst_ms + g_quiesce_ms);
+        if (phase < g_burst_ms)
+            return;
+        struct timespec ts = {0, 100 * 1000 * 1000};
+        nanosleep(&ts, NULL);
+    }
 }
 
 // O_DIRECT: aligned buffer, aligned 4K-multiple ops -- forces real block I/O.
@@ -53,6 +78,7 @@ static void issuer_direct(int id)
     memset(buf, id & 0xff, g_block);
     off_t off = 0;
     while (now_ms() < g_deadline_ms) {
+        wait_if_quiesce();
         pwrite(fd, buf, g_block, off);
         pread(fd, buf, g_block, off);
         off += g_block;
@@ -76,6 +102,7 @@ static void issuer_fsync(int id)
     memset(buf, id & 0xff, g_block);
     off_t off = 0;
     while (now_ms() < g_deadline_ms) {
+        wait_if_quiesce();
         pwrite(fd, buf, g_block, off);
         fsync(fd);
         off += g_block;
@@ -91,6 +118,7 @@ static void issuer_fsync(int id)
 static void issuer_fork(int id)
 {
     while (now_ms() < g_deadline_ms) {
+        wait_if_quiesce();
         pid_t c = fork();
         if (c == 0) {
             char path[256];
@@ -120,7 +148,7 @@ int main(int argc, char **argv)
     prctl(PR_SET_NAME, "pand-ioflood", 0, 0, 0);
     if (argc < 6) {
         fprintf(stderr,
-                "usage: %s MODE ISSUERS DURATION_S BLOCK_KB SCRATCH\n", argv[0]);
+                "usage: %s MODE ISSUERS DURATION_S BLOCK_KB SCRATCH [BURST_S QUIESCE_S]\n", argv[0]);
         return 1;
     }
     const char *mode = argv[1];
@@ -130,7 +158,12 @@ int main(int argc, char **argv)
     g_scratch = argv[5];
     if (g_block < 4096)
         g_block = 4096;
-    g_deadline_ms = now_ms() + (long)duration * 1000L;
+    if (argc >= 8) {
+        g_burst_ms = atol(argv[6]) * 1000L;
+        g_quiesce_ms = atol(argv[7]) * 1000L;
+    }
+    g_start_ms = now_ms();
+    g_deadline_ms = g_start_ms + (long)duration * 1000L;
 
     void (*base)(int) = issuer_fsync;
     if (!strcmp(mode, "direct"))

@@ -669,19 +669,19 @@ def main():
     os.makedirs(dst_root, exist_ok=True)
 
     # STEP 1: COPY
-    print("\n[1] COPY SOURCE FILES")
+    print("\n#1: COPY SOURCE FILES")
     copied = copy_tree(pand_root, dst_root)
 
     # STEP 2: RENAME CRATE
-    print("\n[2] RENAME CRATE")
+    print("\n#2: RENAME CRATE")
     renamed = rename_crate(dst_root)
 
     # STEP 3: STRIP PROFILE
-    print("\n[3] STRIP RELEASE PROFILE")
+    print("\n#3: STRIP RELEASE PROFILE")
     stripped = strip_profile_release(dst_root)
 
     # STEP 4: BUILD SYSTEM (MATCH scx CONVENTION)
-    print("\n[4] BUILD SYSTEM")
+    print("\n#4: BUILD SYSTEM")
     replace_build_rs(dst_root)
     swap_build_deps(dst_root, scx_root)
     fix_libbpf_vendoring(dst_root)
@@ -694,11 +694,11 @@ def main():
     patch_ops_version_suffix(dst_root)
 
     # STEP 5: WORKSPACE REGISTRATION
-    print("\n[5] WORKSPACE REGISTRATION")
+    print("\n#5: WORKSPACE REGISTRATION")
     registered = add_workspace_member(scx_root)
 
     # STEP 6: CARGO FMT
-    print("\n[6] FORMAT")
+    print("\n#6: FORMAT")
     result = subprocess.run(
         ["cargo", "fmt", "--manifest-path", os.path.join(dst_root, "Cargo.toml")],
         capture_output=True, text=True,
@@ -710,7 +710,7 @@ def main():
         print("  FMT: run manually: cargo fmt --manifest-path", os.path.join(dst_root, "Cargo.toml"))
 
     # STEP 7: UPDATE CARGO.LOCK (CI BUILDS WITH --locked)
-    print("\n[7] UPDATE CARGO.LOCK")
+    print("\n#7: UPDATE CARGO.LOCK")
     result = subprocess.run(
         ["cargo", "update", "-p", CRATE_NEW],
         capture_output=True, text=True, cwd=scx_root,

@@ -56,6 +56,13 @@ struct Cli {
     /// Run BPF scheduler only, disable Rust adaptive control loop
     #[arg(long)]
     no_adaptive: bool,
+
+    /// Override the topology-derived Phi distance scale (phi_dist_scale_q16).
+    /// 0 disables the Phi steal-resist (flat CoDel target); omit for the
+    /// topology value. Test/bench use -- the override holds across both the
+    /// adaptive and --no-adaptive paths.
+    #[arg(long)]
+    phi_scale: Option<u64>,
 }
 
 #[derive(Subcommand)]
@@ -83,9 +90,10 @@ fn main() -> Result<()> {
     let dump_log = cli.dump_log;
     let nr_cpus = cli.nr_cpus;
     let no_adaptive = cli.no_adaptive;
+    let phi_scale = cli.phi_scale;
 
     match cli.command {
-        None => run_scheduler(verbose, dump_log, nr_cpus, no_adaptive),
+        None => run_scheduler(verbose, dump_log, nr_cpus, no_adaptive, phi_scale),
         Some(SubCmd::Probe) => {
             cli::probe::run_probe();
             Ok(())
@@ -102,6 +110,7 @@ fn run_scheduler(
     dump_log: bool,
     nr_cpus: Option<u64>,
     no_adaptive: bool,
+    phi_scale: Option<u64>,
 ) -> Result<()> {
     ctrlc::set_handler(move || {
         SHUTDOWN.store(true, Ordering::Relaxed);
@@ -153,38 +162,16 @@ fn run_scheduler(
         let mut open_object = MaybeUninit::uninit();
         let mut sched = Scheduler::init(&mut open_object, nr_cpus)?;
 
-        // POPULATE CACHE TOPOLOGY MAP AT STARTUP
-        match topology::CpuTopology::detect(nr_cpus_display as usize) {
-            Ok(topo) => {
-                topo.log_summary();
-                if let Err(e) = topo.populate_bpf_map(&sched) {
-                    log_warn!("CACHE TOPOLOGY MAP WRITE FAILED: {}", e);
-                }
-                if let Err(e) = topo.populate_l2_siblings_map(&sched) {
-                    log_warn!("L2 SIBLINGS MAP WRITE FAILED: {}", e);
-                }
-                // RESISTANCE AFFINITY: COMPUTE R_EFF VIA LAPLACIAN PSEUDOINVERSE
-                // AND POPULATE BPF AFFINITY RANK MAP. SPECTRUM CARRIES lambda_2
-                // AND tau_ns FOR UNIVERSAL TOPOLOGY-DERIVED SCALING.
-                let (reff, rank, spectrum) = topo.compute_resistance_affinity();
-                let phi_dist_scale_q16 = spectrum.phi_dist_scale_q16;
-                topo.log_resistance_affinity(&reff, &rank, spectrum);
-                if let Err(e) =
-                    topo.populate_affinity_rank_map(&sched, &reff, &rank, phi_dist_scale_q16)
-                {
-                    log_warn!("AFFINITY RANK MAP WRITE FAILED: {}", e);
-                }
-                // WRITE tau_ns + codel_eq_ns INTO tuning_knobs. BPF'S tick() ON
-                // CPU 0 PICKS THESE UP AND DERIVES THE TAU-SCALED TIMING STATICS
-                // AND THE R_eff-DERIVED CODEL EQUILIBRIUM TARGET.
-                if let Err(e) = sched.write_topology_fields(
-                    spectrum.tau_ns,
-                    spectrum.codel_eq_ns,
-                ) {
-                    log_warn!("TOPOLOGY KNOB WRITE FAILED: {}", e);
-                }
-            }
-            Err(e) => log_warn!("CACHE TOPOLOGY DETECT FAILED: {}", e),
+        // POPULATE CACHE TOPOLOGY AT STARTUP -- the one detect-and-populate
+        // sequence (topology.rs owns it: all computes before any map write,
+        // tuning knobs written last as the "go" signal). The SAME sequence
+        // re-runs on hotplug via CpuTopology::poll_hotplug from both control
+        // loops, so a CPU broken at boot self-corrects and the R_eff/phi/
+        // domain tables track the live width.
+        let mut last_online = topology::CpuTopology::online_cpu_count();
+        if let Err(e) = topology::CpuTopology::detect_and_populate(
+            &mut sched, nr_cpus_display as usize, phi_scale) {
+            log_warn!("CACHE TOPOLOGY DETECT FAILED: {}", e);
         }
 
         let should_restart = if no_adaptive {
@@ -212,6 +199,12 @@ fn run_scheduler(
                 watchdog::LOOP_HEARTBEAT.fetch_add(1, Ordering::Relaxed);
                 std::thread::sleep(Duration::from_secs(1));
 
+                // HOTPLUG: re-derive topology when the online set changes
+                // (BPF-only mode has no adaptive loop to carry the poll).
+                topology::CpuTopology::poll_hotplug(
+                    &mut sched, nr_cpus_display as usize, phi_scale,
+                    &mut last_online);
+
                 let stats = sched.read_stats();
 
                 let delta_d = stats.nr_dispatches.wrapping_sub(prev.nr_dispatches);
@@ -219,6 +212,7 @@ fn run_scheduler(
                 let delta_shared = stats.nr_shared.wrapping_sub(prev.nr_shared);
                 let delta_preempt = stats.nr_preempt.wrapping_sub(prev.nr_preempt);
                 let delta_keep = stats.nr_keep_running.wrapping_sub(prev.nr_keep_running);
+                let delta_parks = stats.nr_osc_park.wrapping_sub(prev.nr_osc_park);
                 let delta_wake_sum = stats.wake_lat_sum.wrapping_sub(prev.wake_lat_sum);
                 let delta_wake_samples = stats.wake_lat_samples.wrapping_sub(prev.wake_lat_samples);
                 let delta_hard = stats.nr_hard_kicks.wrapping_sub(prev.nr_hard_kicks);
@@ -304,6 +298,7 @@ fn run_scheduler(
                     delta_shared,
                     delta_preempt,
                     delta_keep,
+                    delta_parks,
                     wake_avg_us,
                     delta_hard,
                     delta_soft,
@@ -335,18 +330,30 @@ fn run_scheduler(
             } else {
                 0
             };
+            // CROSS-DOMAIN SCATTER ATTRIBUTION (PER XDOM_* PATH), ON THE [KNOBS]
+            // LINE SO THE BENCH SUITE CAPTURES IT UNIFORMLY ACROSS BPF/ADAPTIVE
+            // (LETS THE SUITE COMPARE SCATTER BETWEEN MODES). scatter_pct IS THE
+            // PLACEMENT-SIDE FRACTION (idx 0..6).
+            let x = &final_stats.nr_cross_domain;
+            let x_scatter: u64 = x[0..6].iter().sum();
+            let x_scatter_pct = if final_stats.nr_dispatches > 0 {
+                x_scatter * 100 / final_stats.nr_dispatches
+            } else {
+                0
+            };
             println!(
-                "[KNOBS] regime=BPF slice_ns={} batch_ns={} preempt_ns={} l2_hit=B:{}%/I:{}%/L:{}%",
+                "[KNOBS] regime=BPF slice_ns={} batch_ns={} preempt_ns={} l2_hit=B:{}%/I:{}%/L:{}% cross_domain_scatter_pct={} cross_domain_sel_tight={} cross_domain_sel_sync={} cross_domain_sel_normal={} cross_domain_sel_dfl={} cross_domain_enq_t1={} cross_domain_enq_t2={} cross_domain_steal={} cross_domain_step5={}",
                 knobs.slice_ns, knobs.batch_slice_ns,
                 knobs.preempt_thresh_ns,
                 l2_cum_b, l2_cum_i, l2_cum_l,
+                x_scatter_pct, x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7],
             );
 
             sched.read_exit_info()
         } else {
             // ADAPTIVE MODE: BPF + SINGLE-THREAD MONITOR LOOP
             log_info!("PANDEMONIUM IS ACTIVE (CTRL+C TO EXIT)");
-            adaptive::monitor_loop(&mut sched, &SHUTDOWN, verbose, nr_cpus_display)?
+            adaptive::monitor_loop(&mut sched, &SHUTDOWN, verbose, nr_cpus_display, phi_scale)?
         };
 
         log_info!("PANDEMONIUM IS SHUTTING DOWN");

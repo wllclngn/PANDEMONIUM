@@ -19,6 +19,7 @@ use anyhow::Result;
 use crate::chaos::{self, RawWindow};
 use crate::procdb::ProcessDb;
 use crate::scheduler::{PandemoniumStats, Scheduler};
+use crate::topology::CpuTopology;
 use crate::tuning::{
     self, detect_regime, scaled_regime_knobs, MwuController, MwuSignals, Regime, HIST_BUCKETS,
 };
@@ -47,7 +48,14 @@ pub fn monitor_loop(
     shutdown: &'static AtomicBool,
     verbose: bool,
     nr_cpus: u64,
+    phi_scale: Option<u64>,
 ) -> Result<bool> {
+    // HOTPLUG POLL STATE: the online count as last observed. The poll below
+    // re-derives topology on change AND refreshes the Rust-local tau_ns --
+    // without that refresh, a hotplug that changes tau without flipping the
+    // regime left MWU computing every knob off pre-hotplug tau until a regime
+    // change happened to land (the stale-MWU-tau gap).
+    let mut last_online = CpuTopology::online_cpu_count();
     let mut prev = PandemoniumStats::default();
     let mut prev_hist = [[0u64; HIST_BUCKETS]; 3];
     let mut prev_sleep = [0u64; SLEEP_BUCKETS];
@@ -71,8 +79,8 @@ pub fn monitor_loop(
     let mut light_ticks: u64 = 0;
     let mut mixed_ticks: u64 = 0;
     let mut heavy_ticks: u64 = 0;
-    // STABILITY SCORE IS A WEAK PRE-CHAOS STEADY-STATE PROXY. v5.11.0
-    // KEEPS IT FOR TELEMETRY GATING ONLY -- THE REAL STEADY-STATE GATE
+    // STABILITY SCORE IS A WEAK PRE-CHAOS STEADY-STATE PROXY, KEPT FOR
+    // TELEMETRY GATING ONLY -- THE REAL STEADY-STATE GATE
     // IS `quiesce.frozen` BELOW. DO NOT WIRE stability_score INTO THE
     // FREEZE DECISION (TWO COMPETING "AM I STEADY" SIGNALS = A BUG).
     let mut stability_score: u32 = 0;
@@ -103,6 +111,13 @@ pub fn monitor_loop(
     rk.topology_tau_ns = tau_ns;
     rk.codel_eq_ns = live.codel_eq_ns;
     sched.write_tuning_knobs(&rk)?;
+    // SEED THE MWU BASELINE WITH THE LIVE PHI EQUILIBRIUM AT TICK 0. new()
+    // BUILT mwu FROM scaled_regime_knobs (codel_eq_ns=0); set_baseline IS
+    // OTHERWISE ONLY CALLED ON A REGIME CHANGE. WITHOUT THIS SEED THE SOJOURN
+    // FLOOR (tuning.rs) FALLS BACK TO THE DEAD 4ms CONSTANT FOR ANY RUN WHOSE
+    // REGIME NEVER CHANGES (E.G. A STEADY MIXED BENCH), SO THE PHI-COHERENT
+    // FLOOR WOULD NEVER ENGAGE.
+    mwu.set_baseline(rk);
     // COMMIT-ON-CHANGE BASELINE: the last knob set actually written to
     // the BPF map. Updated here at init, on every regime-change write,
     // and on every conditional write. MWU-owned fields drive the diff.
@@ -111,6 +126,11 @@ pub fn monitor_loop(
     while !shutdown.load(Ordering::Relaxed) && !sched.exited() {
         crate::watchdog::LOOP_HEARTBEAT.fetch_add(1, Ordering::Relaxed);
         std::thread::sleep(Duration::from_secs(1));
+
+        if CpuTopology::poll_hotplug(sched, nr_cpus as usize, phi_scale,
+                                     &mut last_online) {
+            tau_ns = sched.read_tuning_knobs().topology_tau_ns;
+        }
 
         let stats = sched.read_stats();
         let cur_hist = sched.read_wake_lat_hist();
@@ -153,6 +173,7 @@ pub fn monitor_loop(
         let delta_shared = stats.nr_shared.wrapping_sub(prev.nr_shared);
         let delta_preempt = stats.nr_preempt.wrapping_sub(prev.nr_preempt);
         let delta_keep = stats.nr_keep_running.wrapping_sub(prev.nr_keep_running);
+        let delta_parks = stats.nr_osc_park.wrapping_sub(prev.nr_osc_park);
         let delta_wake_sum = stats.wake_lat_sum.wrapping_sub(prev.wake_lat_sum);
         let delta_wake_samples = stats.wake_lat_samples.wrapping_sub(prev.wake_lat_samples);
         let delta_hard = stats.nr_hard_kicks.wrapping_sub(prev.nr_hard_kicks);
@@ -160,7 +181,15 @@ pub fn monitor_loop(
         let delta_enq_wake = stats.nr_enq_wakeup.wrapping_sub(prev.nr_enq_wakeup);
         let delta_enq_requeue = stats.nr_enq_requeue.wrapping_sub(prev.nr_enq_requeue);
         let delta_rescue = stats.nr_overflow_rescue.wrapping_sub(prev.nr_overflow_rescue);
-        let delta_parks = stats.nr_osc_park.wrapping_sub(prev.nr_osc_park);
+        // CROSS-DOMAIN SCATTER (PATHWAY 6 INPUT). PLACEMENT-SIDE PATHS ONLY:
+        // XDOM_SEL_* + XDOM_ENQ_T1/T2 (INDICES 0..6). THE PHI-CORRECT WORK-
+        // CONSERVATION PATHS XDOM_STEAL (6) AND XDOM_STEP5 (7) ARE EXCLUDED --
+        // PENALIZING THEM WOULD MAKE MWU FIGHT THE BPF'S DELIBERATE REBALANCING.
+        // saturating_sub ABSORBS A COUNTER RESET (BPF RELOAD) AS 0, NO GARBAGE.
+        let scatter_now: u64 = stats.nr_cross_domain[0..6].iter().sum();
+        let scatter_prev: u64 = prev.nr_cross_domain[0..6].iter().sum();
+        let delta_scatter = scatter_now.saturating_sub(scatter_prev);
+        let scatter_pct = if delta_d > 0 { delta_scatter * 100 / delta_d } else { 0 };
         let wake_avg_us = if delta_wake_samples > 0 {
             delta_wake_sum / delta_wake_samples / 1000
         } else {
@@ -267,6 +296,9 @@ pub fn monitor_loop(
         // None UNTIL THE WINDOW HAS RQA_MIN_SAMPLES FILLED.
         let (idle_lambda, _idle_hvg_s) = chaos::hvg_stats(&idle_win);
         let wake_bp_h = chaos::bandt_pompe_d3(&wake_win);
+        // SPILL-Phi CHAOS->TEMPERATURE BRIDGE: OVERLAID ONTO EVERY KNOB
+        // WRITE BELOW LIKE topology_tau_ns; INERT IN BPF UNTIL THE SPILL
+        // PRICE CONSUMES IT.
         let spill_temp_q16 = tuning::spill_temp_q16(wake_bp_h);
         let bp_delta = wake_bp_h - prev_bp_h;
         let mean_idle = chaos::mean(&idle_win);
@@ -353,6 +385,7 @@ pub fn monitor_loop(
                     // Per-CPU normalization here re-introduced an nr_cpus^2 effective
                     // threshold and latched on quiet 2-4C systems.
                     wakeup_rate: delta_enq_wake,
+                    scatter_pct,
                     hvg_lambda: idle_lambda,
                     bp_h_delta: bp_delta,
                     // Same window HVG sees -- feeds compute_damp() for
@@ -435,7 +468,7 @@ pub fn monitor_loop(
             let rqa_disp = rqa.unwrap_or(-1.0);
             let frozen_disp = if frozen { 1 } else { 0 };
             println!(
-                "d/s: {:<8} idle: {}% shared: {:<6} preempt: {:<4} keep: {:<4} kick: H={:<4} S={:<4} enq: W={:<4} R={:<4} wake: {}us p99: {}us [B:{} I:{} L:{}] lat_idle: {}us lat_kick: {}us procdb: {}/{} sleep: io={}% slice: {}us batch: {}us reenq: {} sjrn: {}ms/{}ms rescue: {} park: {} l2: B={}% I={}% L={}% chaos: lam={:.2} H={:.2} det={:.2} x={} frozen: {} (n={}) retune_iv: {} [{}{}]",
+                "d/s: {:<8} idle: {}% shared: {:<6} preempt: {:<4} keep: {:<4} kick: H={:<4} S={:<4} enq: W={:<4} R={:<4} wake: {}us p99: {}us [B:{} I:{} L:{}] lat_idle: {}us lat_kick: {}us procdb: {}/{} sleep: io={}% slice: {}us batch: {}us reenq: {} sjrn: {}ms/{}ms rescue: {} l2: B={}% I={}% L={}% chaos: lam={:.2} H={:.2} det={:.2} x={} frozen: {} (n={}) retune_iv: {} [{}{}]",
                 delta_d, idle_pct, delta_shared, delta_preempt, delta_keep,
                 delta_hard, delta_soft, delta_enq_wake, delta_enq_requeue,
                 wake_avg_us, p99_us, tp99_b, tp99_i, tp99_l,
@@ -443,7 +476,7 @@ pub fn monitor_loop(
                 db_total, db_confident,
                 io_pct, knobs.slice_ns / 1000, knobs.batch_slice_ns / 1000,
                 delta_reenq, sojourn_ms, sojourn_thresh_ms,
-                delta_rescue, delta_parks,
+                delta_rescue,
                 l2_pct_b, l2_pct_i, l2_pct_l,
                 idle_lambda, wake_bp_h, rqa_disp, chaos_count.load(),
                 frozen_disp, frozen_ticks, retune_interval,
@@ -457,6 +490,7 @@ pub fn monitor_loop(
             delta_shared,
             delta_preempt,
             delta_keep,
+            delta_parks,
             wake_avg_us,
             delta_hard,
             delta_soft,
@@ -515,13 +549,24 @@ pub fn monitor_loop(
     } else {
         0
     };
+    // CROSS-DOMAIN SCATTER ATTRIBUTION (PER XDOM_* PATH). scatter_pct IS THE
+    // PLACEMENT-SIDE FRACTION (idx 0..6) PATHWAY 6 ACTS ON; THE PER-PATH COUNTS
+    // ARE THE PERMANENT ATTRIBUTION SURFACED TO THE BENCH SUITE EVERY RUN.
+    let x = &final_stats.nr_cross_domain;
+    let x_scatter: u64 = x[0..6].iter().sum();
+    let x_scatter_pct = if final_stats.nr_dispatches > 0 {
+        x_scatter * 100 / final_stats.nr_dispatches
+    } else {
+        0
+    };
     println!(
-        "[KNOBS] regime={} slice_ns={} batch_ns={} preempt_ns={} mwu={:.3} ticks=L:{}/M:{}/H:{} frozen={} l2_hit=B:{}%/I:{}%/L:{}%",
+        "[KNOBS] regime={} slice_ns={} batch_ns={} preempt_ns={} mwu={:.3} ticks=L:{}/M:{}/H:{} frozen={} l2_hit=B:{}%/I:{}%/L:{}% cross_domain_scatter_pct={} cross_domain_sel_tight={} cross_domain_sel_sync={} cross_domain_sel_normal={} cross_domain_sel_dfl={} cross_domain_enq_t1={} cross_domain_enq_t2={} cross_domain_steal={} cross_domain_step5={}",
         regime.label(), final_knobs.slice_ns, final_knobs.batch_slice_ns,
         final_knobs.preempt_thresh_ns,
         mwu.scale(regime),
         light_ticks, mixed_ticks, heavy_ticks, frozen_ticks,
         l2_cum_b, l2_cum_i, l2_cum_l,
+        x_scatter_pct, x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7],
     );
 
     // READ UEI EXIT REASON

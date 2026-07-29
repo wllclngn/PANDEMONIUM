@@ -771,6 +771,14 @@ def _storm_section() -> str:
         text = reps[-1].read_text()
     except OSError:
         return ""
+    # Absence is reported, never swallowed (montauk v7.17.0 captured-bit): an
+    # empty artifact (pre-7.17.0 fossil) or a captured: 0 header means the storm
+    # surface was NOT measured -- say so instead of dropping the section, or a
+    # reader concludes storm-clean from what was never observed.
+    if not text.strip() or text.startswith("captured: 0"):
+        return ("STORM  (cpu_release flood, powersave)\n"
+                "  not measured: storm probes off (MONTAUK_SCX_STORM gated) -- "
+                "absence, not a zero")
     verdict = next((ln.strip() for ln in text.splitlines()
                     if ln.strip().startswith("VERDICT")), "")
     if not verdict:
@@ -926,11 +934,23 @@ def main() -> int:
         "cachyos":     [str(TESTS_DIR / "prism-cachyos.py")],
         "scx":         [_pt, "prism-scx"],
     }
-    # Iteration-based dev workloads: each runs N trials and pools samples, so
-    # --iterations N beats down their per-run p99 noise. The duration-based benches
-    # (cold-wake, power, locality, ...) sample over time, not trials, so PRISM does
-    # not pass --iterations to them (they would reject the flag).
-    PRISM_DEV_ITER = {"fork-thread", "ipc", "scale", "cachyos"}
+    # THE UNIFIED --dev CONTRACT (v5.17.0): every implementer accepts the
+    # standard flag set -- --pandemonium-only, --trace, --iterations -- as a
+    # REAL behavior where it has one and a documented accepted-for-uniformity
+    # no-op where it does not (each child's own --help states which). The
+    # dispatcher therefore passes the flags through UNCONDITIONALLY; the
+    # membership tables that used to gate them (and whose gaps killed pcpu and
+    # locality mid-list) are gone. Two sets remain because they encode real
+    # SEMANTIC differences, not argument-surface differences:
+    # Children that need root REGARDLESS of --trace: the unconditional tracers
+    # (capture is what they are, and montauk's eBPF attach needs it).
+    PRISM_DEV_ROOT = {"strand", "locality"}
+    # PROBE children measure whatever scheduler is LIVE -- they load nothing
+    # themselves. The pre-flight _stop_running_scheduler before every child
+    # guaranteed a probe always measured EEVDF/none (its target stopped moments
+    # before the window opened). A probe instead gets the pandemonium service
+    # ENSURED running, matching how pandemonium-tests starts arms.
+    PRISM_DEV_PROBE = {"locality"}
     if args.list or args.dev == []:
         log_info("PRISM -- shine the system through it, read the spectrum:")
         log_info("  (no flag)         the end-user pass: short profile + forensics scrape, one report")
@@ -944,10 +964,14 @@ def main() -> int:
         if unknown:
             log_error(f"unknown --dev workload: {', '.join(unknown)} (try --list)")
             return 2
-        # SELF-ELEVATE only when --trace is explicitly passed: the montauk capture needs
-        # root (eBPF attach + a writable /tmp/pandemonium), so re-exec under sudo rather
-        # than make the user type it. Without --trace, --dev stays pre-elevation, no re-exec.
-        if os.geteuid() != 0 and args.trace:
+        # SELF-ELEVATE when the run will capture: --trace explicitly passed, OR any
+        # selected workload is an unconditional tracer (PRISM_DEV_ROOT). The montauk
+        # capture needs root (eBPF attach + a writable /tmp/pandemonium), so re-exec
+        # under sudo rather than make the user type it -- ONE standard across every
+        # --dev name, no child left to error out with its own "re-run under sudo".
+        # A captureless --dev run stays pre-elevation, no re-exec.
+        if os.geteuid() != 0 and (args.trace
+                                  or any(n in PRISM_DEV_ROOT for n in names)):
             os.execvp("sudo", ["sudo", sys.executable, *sys.argv])
         # Canonical exit guard for the --dev path (the profile path ejects in main's
         # except/finally). On Ctrl+C: eject the benched scheduler and re-online every
@@ -963,13 +987,30 @@ def main() -> int:
             # loop would otherwise offline cores under a stale scheduler (hotplug) and
             # wedge on its bpffs-pin teardown (libbpf statfs -ENOENT). --dev is
             # pre-elevation; _stop_running_scheduler sudo's as needed.
-            _stop_running_scheduler()
+            # EXCEPT probes: they measure the live scheduler, so stopping it first
+            # inverts their meaning -- ensure it instead.
+            if n in PRISM_DEV_PROBE:
+                sudo = [] if os.geteuid() == 0 else ["sudo"]
+                if not is_scx_active():
+                    log_info(f"  ({n} probes the LIVE scheduler -- starting the "
+                             "pandemonium service for the window)")
+                    subprocess.run(sudo + ["systemctl", "start", "pandemonium"],
+                                   capture_output=True)
+                    time.sleep(2.0)
+                if not is_scx_active():
+                    log_warn(f"  (pandemonium did not come up -- {n} will reflect "
+                             "the stock scheduler)")
+            else:
+                _stop_running_scheduler()
             dev_cmd = list(PRISM_DEV[n])
+            # Unified contract: pass the standard flags straight through. Every
+            # implementer accepts them (real or documented no-op); no dispatcher
+            # membership table to fall out of date.
             if args.pandemonium_only:
                 dev_cmd.append("--pandemonium-only")
             elif args.schedulers or args.all_scx:
                 dev_cmd += _sched_flags(n, args.schedulers, args.all_scx)
-            if args.iterations > 1 and n in PRISM_DEV_ITER:
+            if args.iterations > 1:
                 dev_cmd += ["--iterations", str(args.iterations)]
             if args.trace:
                 dev_cmd.append("--trace")

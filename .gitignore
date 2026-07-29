@@ -17,3 +17,7 @@ COMMIT_MESSAGE.txt
 
 # Benchmark archive (local only, dated subfolders)
 benchmark-results/
+
+# Kernel v7.1 freeze reproducer suite (local only; harness and captures
+# available on request)
+tests/pandemonium-7_1-bug/
