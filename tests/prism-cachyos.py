@@ -54,7 +54,7 @@ from pandemonium_common import (
     get_git_info, get_version,
     is_scx_active, log, log_error, log_info, log_warn,
     mean_stdev, montauk_available, montauk_trace, scx_scheduler_name,
-    wait_for_deactivation, PrometheusBuilder,
+    wait_for_deactivation, PrometheusBuilder, get_online_cpus,
  warm_sudo, refresh_sudo,)
 
 sys.path.insert(0, str(Path(__file__).parent.resolve()))
@@ -740,13 +740,22 @@ def run_trace(entries, active, stamp, ncpus) -> int:
 
     Not a benchmark: montauk trace overhead makes the wall-times unusable, and
     each scheduler is activated ONCE around its whole workload run. The recordings
-    (preempt_*, migrations_cross_ccx, per-thread state) are the point; they land in
-    /tmp/pandemonium and can be sizable on the long workloads (ffmpeg, kernel)."""
+    are the point -- the .prom scrapes (preempt_*, migrations_cross_ccx, per-thread
+    state) plus the per-event stream the analyzer needs for a wake2run verdict.
+    They land in /tmp/pandemonium and the .events sibling dominates the size on the
+    long workloads (ffmpeg, kernel): budget hundreds of MB per recording."""
     if not montauk_available():
         log_error("montauk not found -- cannot --trace")
         return 1
 
     recs: dict[str, Path] = {}
+    # events=True is what makes these recordings ANALYZABLE. Without the
+    # per-event stream a recording carries the .prom scrapes only, so montauk's
+    # digest degrades to "KEY METRICS: not analyzed (no per-event trace)" and the
+    # workload contributes one l2_miss_share row to the report -- no wake2run
+    # verdict, no dispatch-stall attribution, no offenders. pin_cpu keeps montauk
+    # off the saturated set so it drains its ring instead of shedding events.
+    drain = max(0, get_online_cpus() - 1)
     try:
         for sched_name, cmd in entries:
             guard = None
@@ -761,9 +770,11 @@ def run_trace(entries, active, stamp, ncpus) -> int:
                 for wl in active:
                     comm = WORKLOAD_TRACE_COMM.get(wl.name, wl.name)
                     refresh_sudo()
-                    log_info(f"  [{sched_name}] tracing {wl.label} (comm='{comm}')")
+                    log_info(f"  [{sched_name}] tracing {wl.label} "
+                             f"(comm='{comm}', montauk on cpu{drain})")
                     with montauk_trace(comm, f"cachyos-{safe}-{wl.name}",
-                                       stamp) as rec:
+                                       stamp, events=True,
+                                       pin_cpu=drain) as rec:
                         elapsed = wl.run(ncpus)
                     recs[f"{sched_name}/{wl.name}"] = rec.dir
                     tag = f"{elapsed:.3f}s" if elapsed is not None else "no timing"

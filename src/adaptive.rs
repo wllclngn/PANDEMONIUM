@@ -559,14 +559,20 @@ pub fn monitor_loop(
     } else {
         0
     };
+    // osc_park IS THE OSCILLATOR ENVELOPE'S OWN COLLAPSE DETECTOR: ZERO PARKS
+    // AFTER AN IDLE-HEAVY RUN MEANS THE ENVELOPE NEVER WENT QUIET, WHICH IS THE
+    // MINIMUM-ATTENTION-COLLAPSE FAILURE MODE. IT WAS IN THE STATS STRUCT AND ON
+    // THE TERMINAL, BUT NOT ON THIS LINE, SO IT NEVER REACHED THE BENCH ARCHIVE
+    // OR THE PRISM .prom -- THE IDLE POWER QUESTION HAD NO COUNTER BEHIND IT.
     println!(
-        "[KNOBS] regime={} slice_ns={} batch_ns={} preempt_ns={} mwu={:.3} ticks=L:{}/M:{}/H:{} frozen={} l2_hit=B:{}%/I:{}%/L:{}% cross_domain_scatter_pct={} cross_domain_sel_tight={} cross_domain_sel_sync={} cross_domain_sel_normal={} cross_domain_sel_dfl={} cross_domain_enq_t1={} cross_domain_enq_t2={} cross_domain_steal={} cross_domain_step5={}",
+        "[KNOBS] regime={} slice_ns={} batch_ns={} preempt_ns={} mwu={:.3} ticks=L:{}/M:{}/H:{} frozen={} l2_hit=B:{}%/I:{}%/L:{}% cross_domain_scatter_pct={} cross_domain_sel_tight={} cross_domain_sel_sync={} cross_domain_sel_normal={} cross_domain_sel_dfl={} cross_domain_enq_t1={} cross_domain_enq_t2={} cross_domain_steal={} cross_domain_step5={} osc_park={}",
         regime.label(), final_knobs.slice_ns, final_knobs.batch_slice_ns,
         final_knobs.preempt_thresh_ns,
         mwu.scale(regime),
         light_ticks, mixed_ticks, heavy_ticks, frozen_ticks,
         l2_cum_b, l2_cum_i, l2_cum_l,
         x_scatter_pct, x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7],
+        final_stats.nr_osc_park,
     );
 
     // READ UEI EXIT REASON

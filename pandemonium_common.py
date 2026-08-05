@@ -790,15 +790,24 @@ def wait_for_no_scheduler(timeout: float = 10.0) -> bool:
 # cleanup anywhere else. (The old per-guard SIGINT missed the systemd scheduler
 # and left the box stuck on a CPU subset; this does not.)
 
-def eject_scheduler(trace_mode: bool = False) -> None:
+def eject_scheduler(trace_mode: bool = False, interrupted: bool = False) -> None:
     """Leave NO sched_ext scheduler registered. In trace_mode the user's CURRENT
     scheduler is theirs -- never eject it. systemctl stop, then force-kill by exact
     comm (the ops name and the scx_-prefixed comm, then a cmdline match) for a bare
-    loader systemctl does not own."""
+    loader systemctl does not own.
+
+    `interrupted` says WHICH exit path fired: a signal, or a normal end-of-run
+    atexit. The distinction is the whole message -- this used to log
+    "interrupted" unconditionally, so a clean run ended on a WARN that read as an
+    aborted one and flatly contradicted the report's own "scheduler ran clean"
+    verdict written seconds earlier. Same teardown either way, honest label."""
     if trace_mode or not is_scx_active():
         return
     name = scx_scheduler_name()
-    log_warn(f"interrupted -- ejecting active scheduler ({name})")
+    if interrupted:
+        log_warn(f"interrupted -- ejecting active scheduler ({name})")
+    else:
+        log_info(f"exit cleanup -- ejecting active scheduler ({name})")
     # sudo, never bare systemctl: unprivileged systemctl escalates to polkit,
     # whose TTY agent prints its red AUTHENTICATING banner mid-log and times out
     # if unanswered. sudo gives one plain password prompt on the tty (or none,
@@ -848,7 +857,7 @@ def install_exit_guard(eject: bool = True, trace_mode: bool = False) -> None:
 
     ran = [False]
 
-    def _cleanup() -> None:
+    def _cleanup(interrupted: bool = False) -> None:
         # Once. The SIGINT path runs _cleanup then re-raises, which exits the
         # interpreter and fires the atexit registration a second time -- the
         # doubled eject was two password prompts in a row on interrupt.
@@ -871,12 +880,12 @@ def install_exit_guard(eject: bool = True, trace_mode: bool = False) -> None:
             pass
         if eject:
             try:
-                eject_scheduler(trace_mode)
+                eject_scheduler(trace_mode, interrupted)
             except Exception:
                 pass
 
     def _on_signal(signum, _frame) -> None:
-        _cleanup()
+        _cleanup(interrupted=True)
         signal.signal(signum, signal.SIG_DFL)
         os.kill(os.getpid(), signum)
 

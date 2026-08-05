@@ -583,31 +583,223 @@ def write_stability_markers(rec_dir: Path, dmesg: "DmesgMonitor",
         log_warn(f"could not write stability markers to {rec_dir.name}: {e}")
 
 
-def _split_digest(digest: str) -> tuple[str, str, str]:
-    """Split a digest into (stability, system, rest). SCHEDULER STABILITY +
-    CLEAN-ROOM and SYSTEM are machine-wide -- printed once at the report top;
-    THERMAL/POWER + POORLY-BEHAVING + KEY METRICS stay per-workload."""
-    s = digest.lstrip("\n")
-    body_markers = ("\nSYSTEM", "\nTHERMAL/POWER", "\nPOORLY-BEHAVING",
-                    "\nKEY METRICS")
-    stability = ""
-    if s.startswith("SCHEDULER STABILITY"):
-        end = min([len(s)] + [m for m in (s.find(x) for x in body_markers) if m != -1])
-        stability = s[:end].rstrip()
-        s = s[end:].lstrip("\n")
-    system = ""
-    if s.startswith("SYSTEM"):
-        end = min([len(s)] + [m for m in (s.find(x) for x in body_markers[1:])
-                              if m != -1])
-        system = s[:end].rstrip()
-        s = s[end:].lstrip("\n")
-    return stability, system, s
+def digest_envelope(analyze: str, rec_dir: Path) -> tuple[dict | None, str]:
+    """(envelope, text) for one recording's montauk digest.
+
+    The ENVELOPE (`--digest --redact --json`) is what prism reads; the text is
+    kept only so a failed parse can still print montauk's own verdict verbatim
+    rather than a scraped approximation of it. This replaces the previous
+    marker-hunting split of the text digest -- montauk renders both faces from
+    one typed result, so parsing the prose was scraping a rendering when the data
+    was one flag away."""
+    import json as _json
+    text = subprocess.run([analyze, str(rec_dir), "--digest", "--redact"],
+                          capture_output=True, text=True).stdout
+    r = subprocess.run([analyze, str(rec_dir), "--digest", "--redact", "--json"],
+                       capture_output=True, text=True)
+    if r.returncode != 0 or not r.stdout.strip():
+        log_warn(f"montauk_analyze --digest --json produced nothing for "
+                 f"{rec_dir.name} -- carrying its text digest verbatim")
+        return None, text
+    try:
+        return _json.loads(r.stdout), text
+    except ValueError:
+        log_warn(f"unparseable digest envelope for {rec_dir.name} -- carrying "
+                 f"its text digest verbatim")
+        return None, text
 
 
-# THERMAL/POWER lines worth keeping in an end-user report -- the signal a user
-# acts on. cpu clock / energy / ctx-sw / migrations / branch-mis are detail that
-# stays in the recording, not the report.
-_THERMAL_KEEP = ("cpu temp", "power", "idle")
+# ENVELOPE RENDERERS. One per block montauk's digest emits, reproducing its own
+# formats (prom_population.cpp's system_info_block / scx_stability_block /
+# thermal_power_block, trace_analyze.cpp's emit_offenders_text) from the typed
+# fields instead of from its prose. Same output, no string surgery.
+
+def _render_stability(env: dict) -> str:
+    st = env.get("stability") or {}
+    if not st:
+        return ""
+    out = ["SCHEDULER STABILITY"]
+    ejections = st.get("ejections") or []
+    if ejections:
+        for e in ejections:
+            line = f"{e.get('scheduler', '?')} -- \"{e.get('reason', '')}\""
+            phase, cores = e.get("phase", ""), e.get("cores", "")
+            if phase or cores:
+                inner = phase + ((", " if phase else "") + f"{cores}c" if cores else "")
+                line += f"  (during {inner})"
+            out.append(f"  EJECTED      {line}")
+    else:
+        out.append("  no ejection -- scheduler ran clean")
+    wd = st.get("watchdog_worst_pct")
+    if wd is not None:
+        line = f"  watchdog     worst sojourn {wd:.0f}% of the 30s sched_ext limit"
+        where = st.get("watchdog_where", "")
+        if where:
+            line += f"  ({where})"
+        if wd >= 50:
+            line += "  [NEAR-EJECTION]"
+        out.append(line)
+    verdict = st.get("cleanroom_verdict", "")
+    if verdict:
+        detail = st.get("cleanroom_detail", "")
+        out += ["", "CLEAN-ROOM",
+                f"  state        {verdict}" + (f" -- {detail}" if detail else "")]
+    return "\n".join(out)
+
+
+def _render_system(env: dict) -> str:
+    sy = env.get("system") or {}
+    if not sy:
+        return ""
+    cpu = (f"{sy.get('cpu_model', '?')} ({sy.get('physical_cores', '?')}c/"
+           f"{sy.get('logical_cpus', '?')}t")
+    if sy.get("cache_domains"):
+        cpu += f", {sy['cache_domains']} cache domains"
+    out = ["SYSTEM", f"  cpu        {cpu})",
+           f"  memory     {sy.get('mem_total_gib', '?')} GiB"]
+    if sy.get("gpu"):
+        out.append(f"  gpu        {sy['gpu']}")
+    out += [f"  kernel     {sy.get('kernel', '?')}",
+            f"  scheduler  {sy.get('scheduler', '?')}"]
+    return "\n".join(out)
+
+
+def _render_thermal(env: dict) -> str:
+    """THERMAL/POWER trimmed to what an end-user acts on: temperature, power draw
+    and idle residency. Clock / energy-per-instruction / ctx-sw / migrations /
+    branch-miss rates stay in the recording -- montauk's full block has them, the
+    shareable report does not need them."""
+    tp = env.get("thermal_power") or {}
+    out = []
+    if "cpu_temp_peak_c" in tp:
+        out.append(f"  cpu temp   peak {tp['cpu_temp_peak_c']:.1f} C  "
+                   f"avg {tp['cpu_temp_avg_c']:.1f} C")
+    if "power_avg_w" in tp:
+        out.append(f"  power      avg {tp['power_avg_w']:.1f} W  "
+                   f"peak {tp['power_peak_w']:.1f} W")
+    if tp.get("dominant_cstate"):
+        out.append(f"  idle       {tp['dominant_cstate']} avg "
+                   f"{tp.get('dominant_cstate_pct', 0.0):.1f}% (dominant)")
+    return "\n".join(["THERMAL/POWER"] + out) if out else ""
+
+
+def _render_offenders(env: dict) -> str:
+    offs = env.get("offenders") or []
+    if not offs:
+        return "POORLY-BEHAVING ITEMS: none detected"
+    out = ["POORLY-BEHAVING ITEMS (ranked)",
+           f"{'kind':<14} {'id':<18} {'metric':<16} {'value':>14}  sev"]
+    for o in offs:
+        idobj = o.get("id", "")
+        if o.get("obj"):
+            idobj = f"{idobj}/{o['obj']}"
+        sev = o.get("sev", 0)
+        sv = "HIGH" if sev >= 2 else ("MED" if sev == 1 else "LOW")
+        out.append(f"{o.get('kind', ''):<14} {idobj:<18} "
+                   f"{o.get('metric', ''):<16} {o.get('value', 0.0):>14.6g}  {sv}")
+    return "\n".join(out)
+
+
+def _report_by_name(env: dict, name: str) -> dict:
+    return next((r for r in (env.get("reports") or [])
+                 if r.get("name") == name), {})
+
+
+def _render_capture(env: dict) -> str:
+    """montauk's capture-loss qualification, directly above the numbers it
+    qualifies. The tracer sheds under load -- exactly when the interesting events
+    happen -- so a quantile off a partial stream is a weaker claim than the same
+    quantile off a whole one, and comparing two arms captured at different rates
+    compares their sampling as much as their scheduling. Absent when the capture
+    predates drop accounting, which montauk reports as absence rather than as
+    zero, so silence here means UNKNOWN loss, never proven-clean."""
+    dig = env.get("digest") or {}
+    if "capture_completeness" not in dig:
+        return ""
+    pct = 100.0 * dig["capture_completeness"]
+    dropped = int(dig.get("dropped_events", 0))
+    observed = int(dig.get("events_observed", 0))
+    if dropped == 0:
+        return f"CAPTURE  complete -- {observed} events, none dropped"
+    return (f"CAPTURE  {pct:.1f}% complete -- {observed} events kept, {dropped} "
+            f"dropped at the ring\n"
+            f"         counts are lower bounds and tail quantiles are biased "
+            f"downward; compare arms only at like completeness")
+
+
+def _render_key_metrics(env: dict) -> str:
+    """KEY METRICS from the envelope's report objects. An empty verdict means the
+    report had nothing to say (dispatch-stall on a trace with no floored wakes),
+    which is dropped rather than printed as boilerplate."""
+    if not (env.get("digest") or {}).get("has_events", False):
+        return ""
+    out = []
+    sched = _report_by_name(env, "sched")
+    if sched.get("verdict"):
+        out += ["REPORT sched", f"VERDICT: {sched['verdict']}"]
+        stru = sched.get("structure") or {}
+        if stru.get("class"):
+            out.append(f"STRUCTURE: latency-over-trace {stru['class']}; "
+                       f"~{stru.get('distinct_estimate', 0)} distinct values; "
+                       f"inversion ratio {stru.get('inversion_ratio', 0.0):.2f}")
+        regions = sched.get("located_regions") or []
+        if regions:
+            shown = ", ".join(f"{r.get('class', '?')}"
+                              f"[{r.get('start_pct', 0.0):.0f}%.."
+                              f"{r.get('end_pct', 0.0):.0f}%]"
+                              for r in regions[:5])
+            extra = f" +{len(regions) - 5} more" if len(regions) > 5 else ""
+            out.append(f"LOCATED: {len(regions)} structured region(s) "
+                       f"{shown}{extra}")
+    # dispatch-stall with no pass-overs at all is boilerplate: the sched VERDICT
+    # already carries the tick-floor share, and the stall report adds nothing but
+    # a row of zeros. Gated on the typed gauges rather than on the shape of the
+    # sentence, which is what the old text pass had to match.
+    stall = _report_by_name(env, "dispatch-stall")
+    if stall.get("verdict"):
+        g = {x.get("name"): x.get("value") for x in (stall.get("gauges") or [])}
+        empty = (g.get("montauk_analysis_dispatch_avg_passovers", 0) == 0
+                 and g.get("montauk_analysis_dispatch_passover_p99", 0) == 0)
+        if not empty:
+            out += ["", "REPORT dispatch-stall", f"VERDICT: {stall['verdict']}"]
+    # kstrand only earns space when it actually names a stranded kthread: with no
+    # rows its verdict is a negative, and a report of nothing found is what the
+    # offender list's absence already says.
+    kst = _report_by_name(env, "kstrand")
+    rows = kst.get("kthreads") or []
+    if kst.get("verdict") and rows:
+        out += ["", "REPORT kstrand", f"VERDICT: {kst['verdict']}"]
+        if rows:
+            out.append(f"{'kthread':<18} {'cpu':<5} {'strands':<7} {'max_ms':<9} "
+                       f"{'p99_ms':<9} {'held':<6} {'dark':<6} held_by")
+            for k in rows:
+                hb = k.get("held_by") or {}
+                held_by = (f"{hb.get('task', '')} {hb.get('coverage_pct', 0.0):.0f}%"
+                           if hb else "")
+                out.append(f"{k.get('kthread', ''):<18} {k.get('cpu', 0):<5} "
+                           f"{k.get('strands', 0):<7} {k.get('max_ms', 0.0):<9.1f} "
+                           f"{k.get('p99_ms', 0.0):<9.1f} {k.get('held', 0):<6} "
+                           f"{k.get('dark', 0):<6} {held_by}")
+    return "\n".join(["KEY METRICS"] + out) if out else ""
+
+
+def _render_body(env: dict, is_cachyos: bool = False) -> str:
+    """The per-workload body: thermal (dropped for cachyos -- workload heat is not
+    the runtime's), ranked offenders, then KEY METRICS."""
+    blocks = []
+    if not is_cachyos:
+        blocks.append(_render_thermal(env))
+    blocks += [_render_offenders(env), _render_capture(env), _render_key_metrics(env)]
+    return "\n\n".join(b for b in blocks if b)
+
+
+def _envelope_p99(env: dict) -> int | None:
+    """sched-report p99 wake2run (us), or None when the recording has no event
+    stream. Read from the typed field, never regexed back out of the verdict."""
+    w = (_report_by_name(env, "sched").get("wake2run") or {})
+    p99 = w.get("p99_us")
+    return int(round(p99)) if p99 is not None else None
+
 
 # Profile families and schedulers, longest-match-first so PANDEMONIUM-BPF is not
 # shadowed by PANDEMONIUM. Used to parse a clean recording label into (family,
@@ -625,16 +817,173 @@ def _parse_label_meta(label: str) -> tuple[str | None, str | None]:
     return fam, sched
 
 
-def _parse_p99(body: str) -> int | None:
-    """The sched-report p99 wake2run (us) from a digest body, or None if untraced.
-    Matches `p99 <N>us` (the trailing space excludes the p999 token)."""
-    m = re.search(r"p99 (\d+)us", body)
-    return int(m.group(1)) if m else None
+def _workload_cell(label: str, sched: str | None) -> str:
+    """The label with the scheduler token removed: the WORKLOAD, which is what a
+    scheduler comparison must hold fixed.
+
+    The family alone is too coarse to compare on. The cachyos stage runs several
+    distinct workloads (primes, xz, stress-ng) under one family name, so keying
+    the population by family pooled three different measurements into one group
+    and reported N=3 -- three unlike workloads dressed as three repeats of the
+    same one. The variance in that group is workload spread, not run-to-run
+    noise, and reading power off it would be reading it off the wrong thing.
+    Keyed per workload, each cell is N=1 until the run is actually repeated,
+    which is the truth."""
+    cell = label
+    if sched:
+        cell = cell.replace(f"-{sched}-", "-").replace(f"-{sched}", "")
+    return cell.strip("-") or label
 
 
 def _sched_short(sched: str) -> str:
     return {"PANDEMONIUM-BPF": "BPF", "PANDEMONIUM-ADAPTIVE": "ADAPTIVE"}.get(
         sched, sched)
+
+
+# POPULATION STATISTICS
+# The COMPARISON block is a RATIO OF TWO POINT ESTIMATES: one run per arm, no
+# effect size, no significance, no idea how many runs a verdict would need. That
+# is exactly the question montauk's population face answers -- Cliff's delta,
+# permutation p, the run count for 80% power and multiple-comparison-best -- and
+# it consumes a .prom set keyed by the compare axis. So prism writes its
+# trace-derived p99 as a labeled metric per run, then hands the set to the
+# analyzer and renders its verdict. Repeat runs (--iterations N, or several
+# invocations) accumulate into the same set, which is what turns an underpowered
+# N=1 note into an actual verdict.
+
+_POP_METRIC = "pandemonium_prism_wake2run_p99_us"
+
+
+def write_population_prom(meta: list[tuple[str | None, str | None, int | None]],
+                          stamp: str) -> Path | None:
+    """One .prom per run: the traced p99 per (workload, scheduler). scheduler is
+    the compare axis; the WORKLOAD is the cell, so montauk compares schedulers
+    against the same workload and never pools unlike ones."""
+    rows = [(c, s, p) for c, s, p in meta if c and s and p is not None]
+    if not rows:
+        return None
+    out = [f"# HELP {_POP_METRIC} Traced wake2run p99 per workload (us)",
+           f"# TYPE {_POP_METRIC} gauge"]
+    for cell, sched, p99 in rows:
+        out.append(f'{_POP_METRIC}{{scheduler="{sched}",workload="{cell}"}} {p99}')
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    path = LOG_DIR / f"prism-pop-{stamp}.prom"
+    try:
+        path.write_text("\n".join(out) + "\n")
+    except OSError as e:
+        log_warn(f"could not write population metrics: {e}")
+        return None
+    return path
+
+
+def read_prom_gauges(path: Path) -> list[tuple[str, dict, float]]:
+    """(name, labels, value) per sample line in a Prometheus exposition file.
+    montauk's population face has no --json, but it emits its full typed result
+    as .prom -- one of its three renderings of one result -- so this reads the
+    structured output rather than the human report."""
+    out = []
+    try:
+        text = path.read_text()
+    except OSError:
+        return out
+    for ln in text.splitlines():
+        ln = ln.strip()
+        if not ln or ln.startswith("#"):
+            continue
+        name, _, rest = ln.partition("{")
+        if not rest:
+            parts = ln.split()
+            if len(parts) == 2:
+                try:
+                    out.append((parts[0], {}, float(parts[1])))
+                except ValueError:
+                    pass
+            continue
+        labelstr, _, valstr = rest.rpartition("}")
+        labels = {}
+        for kv in re.findall(r'(\w+)="([^"]*)"', labelstr):
+            labels[kv[0]] = kv[1]
+        try:
+            out.append((name, labels, float(valstr.strip())))
+        except ValueError:
+            pass
+    return out
+
+
+def _build_population(analyze: str, prom: Path | None) -> str:
+    """Run montauk's population comparison over every prism-pop .prom on the box
+    and render its verdict. The whole set is the population: one run is N=1 and
+    montauk says so rather than pretending otherwise."""
+    if prom is None:
+        return ""
+    proms = sorted(LOG_DIR.glob("prism-pop-*.prom"))
+    if not proms:
+        return ""
+    r = subprocess.run([analyze, *[str(p) for p in proms],
+                        "--by", "scheduler", "--pairs", "all",
+                        "--metric", _POP_METRIC],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        log_warn("population analysis failed -- COMPARISON stands alone")
+        return ""
+    cache = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+    emitted = Path(cache) / "montauk" / f"analysis-pop-scheduler-{_POP_METRIC}.prom"
+    gauges = read_prom_gauges(emitted)
+    if not gauges:
+        return ""
+    # Pair-keyed gauges (cliff / perm_p / power_n) and group-keyed gauges
+    # (n / mean / mcb_is_best) land on different label sets: the pair lines carry
+    # pair="a__b", the group lines carry group="a". A pair's run count is the
+    # smaller of its two groups'.
+    cells: dict[tuple[str, str], dict[str, float]] = {}
+    group_n: dict[tuple[str, str], int] = {}
+    best: dict[str, list[str]] = {}
+    for name, labels, value in gauges:
+        cell, pair, group = (labels.get("cell", ""), labels.get("pair", ""),
+                             labels.get("group", ""))
+        if name == "montauk_pop_mcb_is_best":
+            # 1 best, 0 tied-for-best, -1 not best.
+            if value >= 0 and group:
+                best.setdefault(cell, []).append(
+                    group + ("" if value == 1 else " (tied)"))
+            continue
+        if name == "montauk_pop_n" and group:
+            group_n[(cell, group)] = int(value)
+            continue
+        if not pair:
+            continue
+        key = name.replace("montauk_pop_", "")
+        cells.setdefault((cell, pair), {})[key] = value
+    if not cells:
+        return ""
+    fam_of = lambda cell: (re.search(r"workload=(\S+)", cell) or [None, "?"])[1] \
+        if "workload=" in cell else "?"
+    def pair_n(cell: str, pair: str) -> int:
+        a, _, b = pair.partition("__")
+        ns = [group_n.get((cell, a)), group_n.get((cell, b))]
+        ns = [n for n in ns if n is not None]
+        return min(ns) if ns else 0
+
+    out = [f"POPULATION  (montauk cross-run statistics over {len(proms)} run(s), "
+           f"per workload)"]
+    underpowered = False
+    for (cell, pair), g in sorted(cells.items(),
+                                  key=lambda kv: (fam_of(kv[0][0]), kv[0][1])):
+        n = pair_n(cell, pair)
+        underpowered = underpowered or n < 3
+        cliff, p = g.get("cliff", 0.0), g.get("perm_p", 1.0)
+        power = int(g.get("power_n", 0))
+        censored = g.get("power_censored", 0) == 1
+        out.append(f"  {fam_of(cell):18} {pair.replace('__', ' vs ')}: "
+                   f"N={n} cliff {cliff:+.2f} perm p={p:.3f} "
+                   f"power n{'>' if censored else '='}{power}")
+    for cell, groups in sorted(best.items()):
+        out.append(f"  {fam_of(cell):18} MCB best (lower p99): "
+                   + ", ".join(sorted(groups)))
+    if underpowered:
+        out.append("  N<3 per arm -- montauk reports the effect size but the "
+                   "inference is underpowered; repeat runs accumulate here")
+    return "\n".join(out)
 
 
 def _build_comparison(meta: list[tuple[str | None, str | None, int | None]]) -> str:
@@ -669,49 +1018,6 @@ def _build_comparison(meta: list[tuple[str | None, str | None, int | None]]) -> 
         base_str = f"EEVDF {base}us" if base is not None else "EEVDF n/a"
         out.append(f"  {fam:18} {base_str} -> " + ", ".join(parts))
     return "\n".join(out) if len(out) > 1 else ""
-
-
-def _consolidate_body(body: str, is_cachyos: bool = False) -> str:
-    """Trim the digest body to what an end-user report needs. The full montauk
-    digest still lives in the recording; this is the consolidated view the report
-    carries. Drops:
-      - the "not analyzed (no per-event trace)" KEY METRICS non-result;
-      - an all-zero dispatch-stall block (no pass-overs) -- pure boilerplate; the
-        sched VERDICT already carries the tick-floor %. A real stall is kept;
-      - THERMAL/POWER detail -> kept to temp/power/idle; for cachyos (no latency,
-        not the runtime) the THERMAL/POWER block is dropped entirely."""
-    lines = body.split("\n")
-    out = []
-    i, n = 0, len(lines)
-    while i < n:
-        ln = lines[i]
-        st = ln.strip()
-        if st == "KEY METRICS: not analyzed (no per-event trace)":
-            i += 1
-            continue
-        if st == "REPORT dispatch-stall":
-            verdict = lines[i + 1] if i + 1 < n else ""
-            if "avg 0.0 pass-overs" in verdict and "p99 0 pass-overs" in verdict:
-                break
-        if st == "THERMAL/POWER":
-            j = i + 1
-            block = []
-            while j < n and lines[j].startswith("  "):
-                block.append(lines[j])
-                j += 1
-            if is_cachyos:
-                # Drop the whole block (header + lines) and a trailing blank.
-                i = j + 1 if (j < n and lines[j].strip() == "") else j
-                continue
-            out.append(ln)  # header
-            for bl in block:
-                if any(bl.strip().startswith(k) for k in _THERMAL_KEEP):
-                    out.append(bl)
-            i = j
-            continue
-        out.append(ln)
-        i += 1
-    return "\n".join(out).rstrip()
 
 
 def _coldwork_ramp(rec_dir: Path) -> str | None:
@@ -807,21 +1113,29 @@ def build_report(recs: list[Path], tag: str, stamp: str,
     stab_text = ""
     sys_text = ""
     workloads = []   # (label, body)
-    meta = []        # (family, scheduler, p99)
+    meta = []        # (family, scheduler, p99) for COMPARISON
+    pop = []         # (workload cell, scheduler, p99) for POPULATION
     for d in recs:
         write_stability_markers(d, dmesg, cleanroom)
-        out = subprocess.run(
-            [analyze, str(d), "--digest", "--redact"],
-            capture_output=True, text=True).stdout
-        stab, sysblock, body = _split_digest(out)
-        if stab and not stab_text:
-            stab_text = stab
-        if sysblock and not sys_text:
-            sys_text = sysblock
+        env, text = digest_envelope(analyze, d)
         label = _clean_label(d.name)
         fam, sched = _parse_label_meta(label)
-        meta.append((fam, sched, _parse_p99(body)))
-        cbody = _consolidate_body(body, is_cachyos=(fam == "cachyos"))
+        if env is None:
+            # No envelope: carry montauk's own text digest verbatim rather than
+            # scrape it, and contribute no p99 to the comparison (an unparsed
+            # number is not a number).
+            meta.append((fam, sched, None))
+            pop.append((_workload_cell(label, sched), sched, None))
+            workloads.append((label, text.strip()))
+            continue
+        if not stab_text:
+            stab_text = _render_stability(env)
+        if not sys_text:
+            sys_text = _render_system(env)
+        p99 = _envelope_p99(env)
+        meta.append((fam, sched, p99))
+        pop.append((_workload_cell(label, sched), sched, p99))
+        cbody = _render_body(env, is_cachyos=(fam == "cachyos"))
         ramp = _coldwork_ramp(d)   # cold-wake recordings carry coldwork-quanta.txt
         if ramp:
             cbody = (cbody + "\n" + ramp) if cbody.strip() else ramp
@@ -840,6 +1154,12 @@ def build_report(recs: list[Path], tag: str, stamp: str,
     comparison = _build_comparison(meta)
     if comparison:
         lines += [comparison, ""]
+    # The ratio above is two point estimates; this is montauk's verdict on
+    # whether the difference survives an effect size, a permutation test and a
+    # power check across every run recorded on this box.
+    population = _build_population(analyze, write_population_prom(pop, stamp))
+    if population:
+        lines += [population, ""]
     storm = _storm_section()
     if storm:
         lines += [storm, ""]
@@ -905,7 +1225,19 @@ def main() -> int:
                     help="skip the EEVDF baseline (and any external schedulers) -- run "
                          "only the PANDEMONIUM arms. Propagates to the default profile "
                          "and every --dev workload.")
-    args = ap.parse_args()
+    # CHILD PASSTHROUGH. Everything after a bare `--` goes to the --dev child
+    # verbatim. The dispatcher deliberately does NOT learn any child's private
+    # flags: a table of which child takes which flag is the same fragility that
+    # once killed pcpu and locality mid-list, one level up. `--` keeps the
+    # contract (the three uniform flags, passed unconditionally) while still
+    # letting an operator drive a child that has its own modes.
+    argv = sys.argv[1:]
+    passthrough = []
+    if "--" in argv:
+        cut = argv.index("--")
+        argv, passthrough = argv[:cut], argv[cut + 1:]
+    args = ap.parse_args(argv)
+    args.passthrough = passthrough
 
     # --schedulers and --all-scx are two ways to pick the SAME thing (the
     # external field); running both is ambiguous. Warn with a usage hint rather
@@ -930,6 +1262,7 @@ def main() -> int:
         "contention":  [_pt, "prism-contention"],
         "scale":       [_pt, "prism-scale"],
         "ipc":         [str(TESTS_DIR / "prism-ipc.py")],
+        "golden":      [str(TESTS_DIR / "prism-golden.py")],
         "power":       [str(TESTS_DIR / "prism-power.py")],
         "cachyos":     [str(TESTS_DIR / "prism-cachyos.py")],
         "scx":         [_pt, "prism-scx"],
@@ -944,13 +1277,13 @@ def main() -> int:
     # SEMANTIC differences, not argument-surface differences:
     # Children that need root REGARDLESS of --trace: the unconditional tracers
     # (capture is what they are, and montauk's eBPF attach needs it).
-    PRISM_DEV_ROOT = {"strand", "locality"}
+    PRISM_DEV_ROOT = {"strand", "locality", "golden"}
     # PROBE children measure whatever scheduler is LIVE -- they load nothing
     # themselves. The pre-flight _stop_running_scheduler before every child
     # guaranteed a probe always measured EEVDF/none (its target stopped moments
     # before the window opened). A probe instead gets the pandemonium service
     # ENSURED running, matching how pandemonium-tests starts arms.
-    PRISM_DEV_PROBE = {"locality"}
+    PRISM_DEV_PROBE = {"locality", "golden"}
     if args.list or args.dev == []:
         log_info("PRISM -- shine the system through it, read the spectrum:")
         log_info("  (no flag)         the end-user pass: short profile + forensics scrape, one report")
@@ -1014,6 +1347,9 @@ def main() -> int:
                 dev_cmd += ["--iterations", str(args.iterations)]
             if args.trace:
                 dev_cmd.append("--trace")
+            # Child-private flags last, so a child mode can override a uniform
+            # default it also accepts.
+            dev_cmd += args.passthrough
             rc = subprocess.run([sys.executable, *dev_cmd]).returncode or rc
         return rc
 
@@ -1123,7 +1459,7 @@ def main() -> int:
             restore_all_cpus(get_possible_cpus())
         except Exception:
             pass
-        eject_scheduler(trace_mode)
+        eject_scheduler(trace_mode, interrupted=True)
         raise
     finally:
         remove_montauk_if_ours(installed_by_us, uninstall_after)

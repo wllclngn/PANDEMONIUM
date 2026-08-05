@@ -392,7 +392,7 @@ def _write_cross_domain_marker_text(output, rec_dir):
 
 def trace_workload(sched_name, activate_cmd, pattern, label, stamp, body_fn, *,
                    baseline_s=0.0, events=False, pin_cpu=None,
-                   trace_activation=False):
+                   trace_activation=False, sched_detail=False):
     """Record `montauk --trace pattern` around a scheduler workload.
 
     Default: activate `sched_name` via start_and_wait(activate_cmd), record while
@@ -412,7 +412,8 @@ def trace_workload(sched_name, activate_cmd, pattern, label, stamp, body_fn, *,
 
     if trace_activation:
         with montauk_trace(pattern, rlabel, stamp, baseline_s=baseline_s,
-                           events=events, pin_cpu=pin_cpu) as rec:
+                           events=events, pin_cpu=pin_cpu,
+                           sched_detail=sched_detail) as rec:
             guard = start_and_wait(activate_cmd, sched_name) if activate_cmd else None
             if activate_cmd is not None and guard is None:
                 log_error(f"[{sched_name}] failed to activate "
@@ -435,7 +436,8 @@ def trace_workload(sched_name, activate_cmd, pattern, label, stamp, body_fn, *,
     rec_dir = None
     try:
         with montauk_trace(pattern, rlabel, stamp, baseline_s=baseline_s,
-                           events=events, pin_cpu=pin_cpu) as rec:
+                           events=events, pin_cpu=pin_cpu,
+                           sched_detail=sched_detail) as rec:
             rec_dir = rec.dir
             return rec.dir, body_fn(rec.dir)
     finally:
@@ -1840,6 +1842,15 @@ def write_prometheus(data: dict, stamp: str) -> Path:
                               knobs[key],
                               {**telem_labels, "path": xk})
 
+                # OSCILLATOR ENVELOPE PARKS: the idle-quiescence collapse
+                # detector. Zero after an idle-heavy arm means the envelope
+                # never parked, so the control effort kept recomputing through
+                # the quiet -- the counter to read beside an idle power delta.
+                if "osc_park" in knobs:
+                    gauge("pandemonium_bench_osc_park",
+                          "Oscillator envelope park entries",
+                          knobs["osc_park"], telem_labels)
+
             if tick_agg:
                 for field in ["idle_pct", "preempt",
                               "wake_avg_us", "p99_us"]:
@@ -1932,6 +1943,7 @@ def prom_sys_create(path: Path, version: str, git: dict, max_cpus: int):
         ("pandemonium_sys_regime_ticks", "Ticks spent in each regime"),
         ("pandemonium_sys_cross_domain_scatter_pct", "Placement-side cross-CCX scatter percent"),
         ("pandemonium_sys_cross_domain_path", "Cross-CCX landings per placement path"),
+        ("pandemonium_sys_osc_park", "Oscillator envelope park entries"),
         ("pandemonium_sys_latency_samples", "Latency probe samples"),
         ("pandemonium_sys_latency_median_us", "Median probe latency us"),
         ("pandemonium_sys_latency_p99_us", "P99 probe latency us"),
@@ -2020,6 +2032,9 @@ def prom_sys_append_knobs(path: Path, knobs: dict, label_str: str):
             if key in knobs:
                 f.write(f'pandemonium_sys_cross_domain_path{{{label_str},'
                         f'path="{xk}"}} {knobs[key]}\n')
+        if "osc_park" in knobs:
+            f.write(f"pandemonium_sys_osc_park{{{label_str}}} "
+                    f"{knobs['osc_park']}\n")
 
 
 def prom_sys_append_probe(path: Path, lat: dict, label_str: str):
@@ -3273,9 +3288,16 @@ def trace_pcpu_burst(stamp: str, n_cpus: int, duration: int,
     arms = field_arms(n_cpus, schedulers, all_scx, pandemonium_only)
     traced = 0
     for sched_name, activate_cmd in arms:
+        # sched_detail: this arm's ENTIRE question is why a burst wake sat on the
+        # tick floor (60%+ of wakes here), and without CPU_IDLE + PICK streaming
+        # dispatch-stall can only say PREEMPT-STARVED and stop -- it cannot split
+        # DARK (the CPU sat idle with the task queued) from HELD (a hog held it),
+        # and placement-race / kick-latency / slice return "re-capture to
+        # resolve". The ~6x event cost buys the attribution this stage exists for.
         rec_dir, _ = trace_workload(sched_name, activate_cmd,
                                     "pandemonium", f"pcpu-burst-{n_cpus}c", stamp,
-                                    body, events=True, pin_cpu=drain)
+                                    body, events=True, pin_cpu=drain,
+                                    sched_detail=True)
         if rec_dir is None:
             log_error(f"[pcpu-burst] {sched_name} failed to activate -- skipped")
             continue
@@ -5321,9 +5343,15 @@ def trace_contention_storm(stamp: str, n_cpus: int, duration: int,
     arms = field_arms(n_cpus, schedulers, all_scx, pandemonium_only)
     traced = 0
     for sched_name, activate_cmd in arms:
+        # sched_detail for the same reason pcpu-burst takes it: the measured
+        # quantity is how long a probe sat behind a deep batch flood, and the
+        # DARK-vs-HELD split plus the pick-order attribution need CPU_IDLE and
+        # PICK on the stream. The probe is one thread, so the extra volume is
+        # bounded by the batch workers' switches, not by a fan-out.
         rec_dir, _ = trace_workload(sched_name, activate_cmd,
                                     "pand-cont", f"{phase}-{n_cpus}c", stamp, body,
-                                    events=True, pin_cpu=drain)
+                                    events=True, pin_cpu=drain,
+                                    sched_detail=True)
         if rec_dir is None:
             log_error(f"[contention/{phase}] {sched_name} failed to activate -- skipped")
             continue

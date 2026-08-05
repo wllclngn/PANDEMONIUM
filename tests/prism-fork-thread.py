@@ -31,7 +31,7 @@ from pandemonium_common import (
     wait_for_deactivation,
     montauk_available, MONTAUK_LOG_INTERVAL_MS,
     table_header, table_row, LABEL_W, PrometheusBuilder,
-    mean_stdev, median,
+    mean_stdev, median, get_online_cpus,
 )
 
 sys.path.insert(0, str(Path(__file__).parent.resolve()))
@@ -390,10 +390,17 @@ def _run_load_traced(timeout, groups=NUM_GROUPS, threaded=True, loops=None):
 def trace_capture(sched_name, cmd, stamp, duration,
                   groups=NUM_GROUPS, threaded=True, loops=None):
     load_timeout = duration if duration > 0 else LOAD_SAFETY_TIMEOUT
+    # PIN THE DRAIN CORE. The messaging storm saturates every CPU, and an
+    # unpinned montauk gets scheduled against its own subject: it stops draining
+    # the ring and sheds events exactly in the windows worth measuring. Measured
+    # unpinned: 19.1M events dropped, 5.70% capture completeness, and a per-arm
+    # completeness spread (5.70 / 8.24 / 8.44) that biased the arms unequally
+    # against each other. Every other prism stage already pins.
+    drain = max(0, get_online_cpus() - 1)
 
     def body(rec_dir):
-        log_info(f"[{sched_name}] running storm "
-                 f"(montauk recording, window {load_timeout:.0f}s)...")
+        log_info(f"[{sched_name}] running storm (montauk on cpu{drain}, "
+                 f"window {load_timeout:.0f}s)...")
         elapsed = _run_load_traced(load_timeout, groups, threaded, loops)
         if elapsed is not None:
             log_info(f"[{sched_name}] load completed in {elapsed:.3f}s")
@@ -404,7 +411,7 @@ def trace_capture(sched_name, cmd, stamp, duration,
 
     rec_dir, _ = trace_workload(sched_name, cmd, TRACE_PATTERN, "fork-thread",
                                 stamp, body, baseline_s=BASELINE_SECONDS,
-                                events=True)
+                                events=True, pin_cpu=drain)
     if rec_dir is not None:
         log_info(f"[{sched_name}] recording: {rec_dir}")
     return rec_dir
@@ -487,28 +494,47 @@ def run_trace(args):
 _LOC_TIERS = ("same-L2", "same-L3", "same-socket", "cross-socket")
 
 
-def _parse_p99_us(body):
-    # `p99 <N>us` -- the trailing space keeps it from matching the p999 token.
-    m = re.search(r"p99 (\d+)us", body)
-    return int(m.group(1)) if m else None
+def _json_out(argv):
+    """Parsed --json envelope from a montauk_analyze invocation, or None."""
+    import json as _json
+    r = subprocess.run(argv, capture_output=True, text=True, timeout=90)
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
+    try:
+        return _json.loads(r.stdout)
+    except ValueError:
+        log_warn(f"unparseable envelope from {' '.join(argv[1:3])}")
+        return None
 
 
-def _parse_cross_domain_pct(body):
-    m = re.search(r"([\d.]+)% cross-domain", body)
-    return float(m.group(1)) if m else None
-
-
-def _parse_locality(report):
+def _locality_from_env(env):
+    """Locality tiers out of the locality report's gauges. tier_moves carries one
+    gauge per cache-tier distance; the mapped-migration total is their sum, and
+    the tier percentages are shares of it. No cache_topology in the recording
+    means no tier gauges, which reads back as the empty result the report renders
+    as N/A."""
     out = {"migrations": None, "tiers": {}}
-    if "no cross-CPU migrations" in report or "no cache_topology" in report:
+    if not env:
         return out
-    m = re.search(r"(\d+)\s+migrations", report)
-    if m:
-        out["migrations"] = int(m.group(1))
-    for tier in _LOC_TIERS:
-        m = re.search(rf"^{re.escape(tier)}\s+(\d+)\s+([\d.]+)%", report, re.M)
+    rep = next((r for r in (env.get("reports") or [])
+                if r.get("name") == "locality"), {})
+    moves = {}
+    for g in rep.get("gauges") or []:
+        if g.get("name") != "montauk_analysis_locality_tier_moves":
+            continue
+        m = re.search(r'tier="([^"]+)"', g.get("labels", "") or "")
         if m:
-            out["tiers"][tier] = (int(m.group(1)), float(m.group(2)))
+            moves[m.group(1)] = g.get("value", 0)
+    if not moves:
+        return out
+    total = sum(moves.values())
+    out["migrations"] = int(total)
+    # Gauge labels are underscored (same_l2); the report's column headings are
+    # the hyphenated tier names.
+    for tier in _LOC_TIERS:
+        v = moves.get(tier.replace("-", "_").lower())
+        if v is not None:
+            out["tiers"][tier] = (int(v), (100.0 * v / total) if total else 0.0)
     return out
 
 
@@ -516,18 +542,38 @@ def analyze_trace(rec_dir):
     """Phase-1 readings from one montauk recording: wake2run p99 (latency) and
     placement locality / cross-domain scatter (cause). {} on missing recording or
     analyzer -- the report then renders those columns as N/A and keeps the cost
-    side intact."""
+    side intact.
+
+    Both readings come from montauk's --json envelopes. The regexes that used to
+    pull them back out of the rendered text are gone: the digest publishes
+    wake2run as typed quantiles and locality publishes per-tier gauges, so
+    scraping the prose was re-deriving what the tool already states."""
     out = {}
     if rec_dir is None or not Path(rec_dir).exists():
         return out
     try:
-        dig = subprocess.run([MONTAUK_ANALYZE, str(rec_dir), "--digest"],
-                             capture_output=True, text=True, timeout=60).stdout
-        out["p99_us"] = _parse_p99_us(dig)
-        out["cross_domain_pct"] = _parse_cross_domain_pct(dig)
-        loc = subprocess.run([MONTAUK_ANALYZE, str(rec_dir), "--report", "locality"],
-                             capture_output=True, text=True, timeout=60).stdout
-        out["locality"] = _parse_locality(loc)
+        dig = _json_out([MONTAUK_ANALYZE, str(rec_dir), "--digest", "--json"])
+        if dig:
+            sched = next((r for r in (dig.get("reports") or [])
+                          if r.get("name") == "sched"), {})
+            w = sched.get("wake2run") or {}
+            if w.get("p99_us") is not None:
+                out["p99_us"] = int(round(w["p99_us"]))
+            if w.get("crossdomain_pct") is not None:
+                out["cross_domain_pct"] = float(w["crossdomain_pct"])
+        # --report reads the EVENT STREAM, not the recording dir. This used to
+        # pass the dir, which montauk rejects with "short read on header", so the
+        # locality columns had never once been populated -- they rendered N/A on
+        # every run. The stream sits beside the dir as <dir>.events, or inside it
+        # as events.bin for a freeze-archive layout; try both, the way the digest
+        # does.
+        events = Path(str(rec_dir) + ".events")
+        if not events.is_file():
+            events = Path(rec_dir) / "events.bin"
+        if events.is_file():
+            out["locality"] = _locality_from_env(
+                _json_out([MONTAUK_ANALYZE, str(events), "--report", "locality",
+                           "--json"]))
     except (subprocess.TimeoutExpired, OSError) as e:
         log_warn(f"montauk_analyze failed on {rec_dir}: {e}")
     return out

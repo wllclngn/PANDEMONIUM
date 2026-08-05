@@ -1,0 +1,24 @@
+# montauk behavioral golden -- one frozen fact per line.
+# Hand-editable: per-key tolerance is editing one gauge line.
+golden_version 2
+workload archive-5.17.0-8c
+montauk_version 8.7.0
+env kernel 7.1.5-arch1-2
+env cpu AMD Ryzen 5 3600 6-Core Processor
+env cores 12
+completeness unknown
+gauge statistical mean 10.0000 0 2186 pandemonium_scale_latency_p99_us{scheduler="EEVDF",cores="8"}
+gauge statistical mean 10.0000 0 2549 pandemonium_scale_burst_p99_us{scheduler="EEVDF",cores="8"}
+gauge statistical mean 10.0000 0 2412 pandemonium_scale_longrun_latency_p99_us{scheduler="EEVDF",cores="8"}
+gauge statistical mean 10.0000 0 2587 pandemonium_scale_mixed_latency_p99_us{scheduler="EEVDF",cores="8"}
+gauge statistical mean 10.0000 0 0.1373 pandemonium_scale_deadline_miss_ratio{scheduler="EEVDF",cores="8"}
+gauge statistical mean 10.0000 0 78 pandemonium_scale_latency_p99_us{scheduler="PANDEMONIUM (BPF)",cores="8"}
+gauge statistical mean 10.0000 0 65 pandemonium_scale_burst_p99_us{scheduler="PANDEMONIUM (BPF)",cores="8"}
+gauge statistical mean 10.0000 0 798 pandemonium_scale_longrun_latency_p99_us{scheduler="PANDEMONIUM (BPF)",cores="8"}
+gauge statistical mean 10.0000 0 879 pandemonium_scale_mixed_latency_p99_us{scheduler="PANDEMONIUM (BPF)",cores="8"}
+gauge statistical mean 10.0000 0 0.0031 pandemonium_scale_deadline_miss_ratio{scheduler="PANDEMONIUM (BPF)",cores="8"}
+gauge statistical mean 10.0000 0 93 pandemonium_scale_latency_p99_us{scheduler="PANDEMONIUM (ADAPTIVE)",cores="8"}
+gauge statistical mean 10.0000 0 162 pandemonium_scale_burst_p99_us{scheduler="PANDEMONIUM (ADAPTIVE)",cores="8"}
+gauge statistical mean 10.0000 0 242 pandemonium_scale_longrun_latency_p99_us{scheduler="PANDEMONIUM (ADAPTIVE)",cores="8"}
+gauge statistical mean 10.0000 0 210 pandemonium_scale_mixed_latency_p99_us{scheduler="PANDEMONIUM (ADAPTIVE)",cores="8"}
+gauge statistical mean 10.0000 0 0.0017 pandemonium_scale_deadline_miss_ratio{scheduler="PANDEMONIUM (ADAPTIVE)",cores="8"}

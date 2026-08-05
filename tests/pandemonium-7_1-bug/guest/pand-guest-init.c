@@ -14,6 +14,12 @@
 //   pand.writers=N                fsync writers (default 4)
 //   pand.duration=N               seconds under capture (default 60)
 //   pand.idle_ms=N                DARK-mode idle gap (default 150)
+//   pand.darkstrand=1             run the MINIMAL #3687 reproducer instead of
+//                                 the strand load. Same condition, but the
+//                                 verdict comes from the reproducer's own fsync
+//                                 timing rather than from a montauk report --
+//                                 which is the point: it is what ships to the
+//                                 issue, so it is what gets tested.
 
 #define _GNU_SOURCE
 #include <fcntl.h>
@@ -37,6 +43,7 @@
 #define KWINPROXY   "/bin/pand-kwin-proxy"
 #define IDLEPING    "/bin/pand-idle-ping"
 #define LOCKBLOCK   "/bin/pand-lock-block"
+#define DARKSTRAND  "/bin/dark-strand"
 #define SCRATCH     "/scratch"
 #define OUT         "/out"
 
@@ -136,11 +143,13 @@ int main(void) {
         close(fd);
     }
     char sched[64], mode[16], hogs[16], writers[16], duration[16], idle[16];
+    char darkstrand[8];
     cmdline_get("sched", sched, sizeof(sched), "pandemonium");
     cmdline_get("mode", mode, sizeof(mode), "dark");
     cmdline_get("writers", writers, sizeof(writers), "4");
     cmdline_get("duration", duration, sizeof(duration), "60");
     cmdline_get("idle_ms", idle, sizeof(idle), "150");
+    cmdline_get("darkstrand", darkstrand, sizeof(darkstrand), "0");
     char hogs_default[16];
     snprintf(hogs_default, sizeof(hogs_default), "%d", online_cpus() - 1);
     cmdline_get("hogs", hogs, sizeof(hogs), hogs_default);
@@ -278,7 +287,12 @@ int main(void) {
     // needs (found the hard way: a real, reproducible harness hang, not a
     // kernel finding). Remove once the induction capture is complete.
     pid_t hog_pids[4] = {0};
-    if (ioflood) {
+    if (darkstrand[0] == '1') {
+        say("running dark-strand (minimal #3687 reproducer)");
+        char *ds_argv[] = {(char *)DARKSTRAND, duration, writers,
+                           (char *)SCRATCH, NULL};
+        spawn_wait(ds_argv);
+    } else if (ioflood) {
         for (int hog_n = 0; hog_n < 4; hog_n++) {
             pid_t hog_pid = fork();
             if (hog_pid < 0) {
