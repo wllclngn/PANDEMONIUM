@@ -3,7 +3,7 @@
 #
 # Runs a migration-heavy load (perf bench sched messaging -- the same storm the
 # fork-thread gate uses), captures it under montauk (--trace-out per-event stream
-# + the embedded cache_topology snapshot), and folds montauk_analyze --report
+# + the embedded cache_topology snapshot), and folds montauk --analyze --report
 # locality: every migration becomes a cache-tier distance (same-L2 / same-L3 /
 # same-socket / cross-socket) and the report prints the distribution + the
 # tier-to-tier decay. That decay is the screening signal T4 reads; on a multi-L3
@@ -93,7 +93,7 @@ def _locality_from_envelope(rep: dict) -> dict | None:
 
 
 def parse_locality(report: str, envelope=None) -> dict:
-    """Envelope-first: read montauk_analyze's structured --json when complete;
+    """Envelope-first: read montauk --analyze's structured --json when complete;
     the regex text parse below survives ONLY as the fallback for a montauk
     whose locality envelope lacks these fields."""
     rep = envelope_report(envelope, "locality")

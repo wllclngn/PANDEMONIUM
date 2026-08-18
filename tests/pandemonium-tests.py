@@ -36,11 +36,10 @@ from pandemonium_common import (
     set_cpu_online, restrict_cpus, restore_all_cpus, CpuGuard,
     get_possible_cpus, get_online_cpus, compute_core_counts,
     mean_stdev, percentile, mean as sub_mean, variance as sub_variance,
-    montauk_trace, montauk_available, MONTAUK,
+    montauk_trace, montauk_available, MONTAUK, montauk_analyze_argv,
     PrometheusBuilder, table_header, table_row,
     stall_susceptibility,
     install_exit_guard, register_exit_cleanup,
-    cpu_release_deprecated,
  warm_sudo, refresh_sudo,
 )
 from ipc_workload import (
@@ -345,7 +344,7 @@ def parse_migration_line(stdout_text: str) -> dict:
 def _write_cross_domain_marker(guard, rec_dir):
     """Producer marker (mirrors prism's write_stability_markers): after a
     traced PANDEMONIUM run stops, parse its shutdown [KNOBS] line for the per-path
-    cross-CCX attribution and write it into the recording dir. montauk_analyze
+    cross-CCX attribution and write it into the recording dir. montauk --analyze
     --digest surfaces it as a CROSS-CCX PLACEMENT block, so a multi-CCX user can
     tell SEL_DFL (topology-blind fallback) from STEAL/STEP5 (dispatch-side) in one
     read instead of only seeing montauk's trace-derived scatter percentage. No-op
@@ -390,6 +389,117 @@ def _write_cross_domain_marker_text(output, rec_dir):
         pass
 
 
+# THE ADAPTIVE LAYER'S PER-TICK CHAOS LINE, WHICH NOTHING RECORDED.
+# `chaos: lam=2.13 H=0.42 det=1.00 x=7 frozen: 1 (n=42)` is printed once per
+# second by the --verbose adaptive loop and was, until now, discarded with the
+# rest of scheduler stdout. A full day of 2026-07-29 benchmarking produced zero
+# samples of it, which is why every question about the quiescence gate -- does it
+# ever fire, does DET behave as assumed, does saturation read as quiescent --
+# was unanswerable from the archive rather than merely unanswered.
+_CHAOS_LINE_RE = re.compile(
+    r"chaos:\s*lam=(?P<lam>[-\d.]+)\s+H=(?P<h>[-\d.]+)\s+det=(?P<det>[-\d.]+)"
+    r"\s+x=(?P<x>\d+)\s+frozen:\s*(?P<frozen>\d+)\s*\(n=(?P<n>\d+)\)"
+)
+
+# THE LIVE LOAD GRAPH'S SUMMARY, ON THE SAME TELEMETRY LINE.
+# `graph: n=12 e=66 cpl=0.32/0.05/0.88` -- CPUs, edges that computed, then mean/
+# min/max Pecora-Carroll coupling. The SPREAD is the measurement that decides
+# whether the graph is worth pricing against: if min and max sit together the
+# matrix is flat, the graph is complete-and-uniform, and it carries nothing the
+# static topology does not already have.
+_GRAPH_LINE_RE = re.compile(
+    r"graph:\s*n=(?P<gn>\d+)\s+e=(?P<ge>\d+)\s+"
+    r"cpl=(?P<cmean>[-\d.]+)/(?P<cmin>[-\d.]+)/(?P<cmax>[-\d.]+)"
+)
+
+
+def _write_chaos_markers_text(output, rec_dir):
+    """Fold the adaptive layer's per-tick chaos samples into the recording.
+
+    Emitted as a .prom beside cross_domain.prom, so the quiescence gate is
+    answered from the same archive as everything else rather than by watching a
+    terminal. The FROZEN FRACTION is the headline: An AND-gate whose HVG term
+    never latches never freezes at all, and a zero here says so immediately.
+
+    Records the distribution, not just the last value -- the gate's behavior is a
+    time series and the final tick is the least interesting sample in it."""
+    if rec_dir is None or not output:
+        return
+    lam, det, frozen = [], [], []
+    for m in _CHAOS_LINE_RE.finditer(output):
+        try:
+            lam.append(float(m.group("lam")))
+            det.append(float(m.group("det")))
+            frozen.append(int(m.group("frozen")))
+        except ValueError:
+            continue
+    # Graph samples come off the same line; a run predating the graph simply
+    # yields none rather than zeros.
+    g_edges, g_mean, g_spread = [], [], []
+    for m in _GRAPH_LINE_RE.finditer(output):
+        try:
+            e = int(m.group("ge"))
+            if e == 0:
+                continue
+            g_edges.append(e)
+            g_mean.append(float(m.group("cmean")))
+            g_spread.append(float(m.group("cmax")) - float(m.group("cmin")))
+        except ValueError:
+            continue
+
+    if not lam:
+        return
+    n = len(lam)
+
+    def _q(vals, q):
+        s = sorted(vals)
+        return s[min(len(s) - 1, int(q * len(s)))]
+
+    lines = [
+        f"pandemonium_chaos_samples {n}",
+        f"pandemonium_chaos_frozen_ticks {sum(frozen)}",
+        # THE ONE NUMBER CLUSTER A EXISTS TO GET. 0 MEANS THE GATE NEVER
+        # FIRED ACROSS THE WHOLE RUN.
+        f"pandemonium_chaos_frozen_fraction {sum(frozen) / n:.4f}",
+        f"pandemonium_chaos_lambda_p50 {_q(lam, 0.50):.4f}",
+        f"pandemonium_chaos_lambda_p99 {_q(lam, 0.99):.4f}",
+        f"pandemonium_chaos_det_p50 {_q(det, 0.50):.4f}",
+        f"pandemonium_chaos_det_p99 {_q(det, 0.99):.4f}",
+        # THE TWO GATE TERMS, COUNTED SEPARATELY. AN AND-GATE THAT NEVER
+        # FIRES IS DIAGNOSED BY WHICH TERM WITHHELD, NOT BY THE VERDICT.
+        f"pandemonium_chaos_lambda_in_band "
+        f"{sum(1 for v in lam if v <= 2.6) / n:.4f}",
+        f"pandemonium_chaos_det_in_band "
+        f"{sum(1 for v in det if v >= 0.90) / n:.4f}",
+    ]
+    if g_mean:
+        gn = len(g_mean)
+        lines += [
+            f"pandemonium_graph_samples {gn}",
+            f"pandemonium_graph_edges_p50 {_q(g_edges, 0.50)}",
+            f"pandemonium_graph_coupling_mean_p50 {_q(g_mean, 0.50):.4f}",
+            # THE FALSIFICATION. A spread at or near zero says every CPU pair
+            # couples identically, so the live graph reduces to the static one.
+            f"pandemonium_graph_coupling_spread_p50 {_q(g_spread, 0.50):.4f}",
+            f"pandemonium_graph_coupling_spread_max {max(g_spread):.4f}",
+        ]
+
+    try:
+        (Path(rec_dir) / "chaos.prom").write_text("\n".join(lines) + "\n")
+    except OSError:
+        pass
+
+
+def _write_chaos_markers(guard, rec_dir):
+    if guard is None or rec_dir is None:
+        return
+    try:
+        output = guard.read_output()
+    except Exception:
+        return
+    _write_chaos_markers_text(output, rec_dir)
+
+
 def trace_workload(sched_name, activate_cmd, pattern, label, stamp, body_fn, *,
                    baseline_s=0.0, events=False, pin_cpu=None,
                    trace_activation=False, sched_detail=False):
@@ -425,6 +535,7 @@ def trace_workload(sched_name, activate_cmd, pattern, label, stamp, body_fn, *,
                 if guard is not None:
                     stop_and_wait(guard)
                     _write_cross_domain_marker(guard, rec.dir)
+                    _write_chaos_markers(guard, rec.dir)
 
     guard = None
     if activate_cmd is not None:
@@ -444,6 +555,7 @@ def trace_workload(sched_name, activate_cmd, pattern, label, stamp, body_fn, *,
         if guard is not None:
             stop_and_wait(guard)
             _write_cross_domain_marker(guard, rec_dir)
+            _write_chaos_markers(guard, rec_dir)
 
 
 # MEASUREMENT
@@ -1241,7 +1353,7 @@ def analyze_ipc_trace(events_path: str) -> dict:
     res: dict = {}
     try:
         rep = subprocess.run(
-            [MONTAUK + "_analyze", events_path, "--report",
+            [*montauk_analyze_argv(), events_path, "--report",
              "sched,locality,dispatch-stall,fractal"],
             capture_output=True, text=True, timeout=180)
     except (OSError, subprocess.SubprocessError):
@@ -1400,11 +1512,7 @@ def parse_tick_lines(stdout_text: str) -> list[dict]:
             flags = regime_match.group(2).upper()
             tick["longrun_active"] = "LONGRUN" in flags
 
-            if tick["regime"] == "BPF":
-                m = re.search(r"procdb:\s*(\d+)\s", line)
-                if m:
-                    tick["procdb_hits"] = int(m.group(1))
-            else:
+            if tick["regime"] != "BPF":
                 m = re.search(r"p99:\s*(\d+)us", line)
                 if m:
                     tick["p99_us"] = int(m.group(1))
@@ -1413,10 +1521,6 @@ def parse_tick_lines(stdout_text: str) -> list[dict]:
                     tick["tier_p99_batch"] = int(m.group(1))
                     tick["tier_p99_interactive"] = int(m.group(2))
                     tick["tier_p99_latcrit"] = int(m.group(3))
-                m = re.search(r"procdb:\s*(\d+)/(\d+)", line)
-                if m:
-                    tick["procdb_total"] = int(m.group(1))
-                    tick["procdb_confident"] = int(m.group(2))
                 m = re.search(r"sleep:\s*io=(\d+)%", line)
                 if m:
                     tick["io_pct"] = int(m.group(1))
@@ -1892,9 +1996,6 @@ _SYS_TICK_FIELDS = [
     ("slice_us", "pandemonium_sys_slice_us"),
     ("batch_us", "pandemonium_sys_batch_us"),
     ("io_pct", "pandemonium_sys_io_pct"),
-    ("procdb_total", "pandemonium_sys_procdb_total"),
-    ("procdb_confident", "pandemonium_sys_procdb_confident"),
-    ("procdb_hits", "pandemonium_sys_procdb_total"),
 ]
 
 _SYS_TICK_TIERED = [
@@ -1929,8 +2030,6 @@ def prom_sys_create(path: Path, version: str, git: dict, max_cpus: int):
         ("pandemonium_sys_slice_us", "Current time slice us"),
         ("pandemonium_sys_batch_us", "Current batch slice us"),
         ("pandemonium_sys_io_pct", "IO sleep percentage"),
-        ("pandemonium_sys_procdb_total", "ProcDb profiles"),
-        ("pandemonium_sys_procdb_confident", "Confident ProcDb profiles"),
         ("pandemonium_sys_l2_hit_pct", "L2 cache hit rate by tier"),
         ("pandemonium_sys_tier_p99_us", "Per-tier P99 latency us"),
         ("pandemonium_sys_knob_slice_ns", "Final knob: time slice ns"),
@@ -3244,7 +3343,7 @@ def trace_pcpu_burst(stamp: str, n_cpus: int, duration: int,
     """One montauk-traced burst-starvation capture, hard-capped at `duration`s.
     Saturates every CPU, then detonates fork/exec bursts for the window while
     montauk records the per-event wake-to-run -- so the worst burst wakeup is in
-    the .events for montauk_analyze --digest. Trace IS the artifact; no
+    the .events for montauk --analyze --digest. Trace IS the artifact; no
     probe/baseline/recovery measurement here. Workers run the `pandemonium`
     binary (stress-worker / burst tasks), so montauk targets comm `pandemonium`.
     montauk pins a drain core (CPUs are saturated) so it never drops events."""
@@ -3629,7 +3728,7 @@ def _storm_captured(json_text: str):
 
 
 def _parse_storm_report(text: str) -> dict:
-    """Parse `montauk_analyze --report storm` output into a verdict dict. montauk --
+    """Parse `montauk --analyze --report storm` output into a verdict dict. montauk --
     not a scheduler-tick scrape -- is the storm observer: the StormReport VERDICT line
     carries the fraction, the REAL-IPI-vs-IDLE-churn kind and the kick/reenqueue rates."""
     d = {"kind": None, "pct": 0.0, "storm": 0, "intervals": 0,
@@ -3670,20 +3769,10 @@ def trace_storm_cycle(stamp, n_cpus, duration, busy_per_cpu=4,
     powersave, stormwork drives the boot condition: a busy sched_ext population
     plus one SCHED_FIFO thread per CPU whose every wake yanks its CPU from scx
     (cpu_release -> reenqueue_local). montauk traces the flood and its StormReport
-    (`montauk_analyze --report storm`) names the storm fraction and -- via fentry
+    (`montauk --analyze --report storm`) names the storm fraction and -- via fentry
     counters on scx_bpf_kick_cpu/reenqueue_local -- REAL IPI storm vs IDLE re-enqueue
     churn. EEVDF cannot storm (no Tier-0 kick loop), so the scored arms are the
     PANDEMONIUM variants; default is BPF."""
-    # cpu_release is DEPRECATED on kernel 7.1+ (sched_ext for-6.19 rework) and
-    # reworked into a deferred async reenqueue. This bench FLOODS cpu_release by
-    # design -- one SCHED_FIFO thread per CPU yanks its CPU from scx every wake --
-    # which hard-locks the box on 7.1+. The storm% it scores is a pre-7.1 failure
-    # mode. Skip rather than freeze.
-    if cpu_release_deprecated():
-        log_warn(f"[storm] skipped on kernel {os.uname().release}: the cpu_release "
-                 "kick-storm reproducer floods an op deprecated in 7.1+ and hard-locks "
-                 "the box. Pre-7.1 only.")
-        return 0
     src = Path(__file__).resolve().parent
     swbin = f"/tmp/stormwork-{stamp}"   # name kept so montauk's comm trace target is unchanged
     cc = subprocess.run(["gcc", "-O2", "-march=native", "-pthread", "-o", swbin,
@@ -3725,23 +3814,13 @@ def trace_storm_cycle(stamp, n_cpus, duration, busy_per_cpu=4,
             trace = f"/tmp/storm-{tag}-{stamp}.bin"
             log_info(f"[storm] {sched_name}: flooding {duration}s under montauk")
             with open(trace + ".err", "w") as ef:
-                # MONTAUK_SCX_STORM DISABLED -- v7.1 HARD-LOCK.
-                # Setting it opts in the fentry/fexit trampolines on sched_ext's
-                # hot kfuncs (scx_bpf_kick_cpu / scx_bpf_reenqueue_local). On the
-                # 7.1 kernel this box runs, arming them under a live scx load
-                # HARD-LOCKS the machine -- a full manual power-cycle, reproduced
-                # 2026-07-14. montauk's "attach while scx is quiescent" protocol
-                # did NOT prevent it: the probes stay live across the sweep and
-                # the box froze anyway. Until a freeze-safe kick observer exists
-                # (a tracepoint on the reschedule IPI path, not a live-text
-                # trampoline on the kfunc), this capture runs with the probes
-                # OFF. The var is scrubbed from the child env, not merely unset,
-                # so an ambient `export MONTAUK_SCX_STORM=1` in the caller's shell
-                # (the exact route that froze the box) cannot re-arm it here. With
-                # the probes off the storm report honestly reads "not captured"
-                # (montauk v7.17.0), never a fabricated kick/s=0.
-                storm_env = {k: v for k, v in os.environ.items()
-                             if k != "MONTAUK_SCX_STORM"}
+                # Arm the fentry/fexit trampolines on sched_ext's hot kfuncs
+                # (scx_bpf_kick_cpu / scx_bpf_reenqueue_local). Without this the
+                # StormReport has no kick counters to read and the report renders
+                # "not captured" -- the storm surface is the whole point of this
+                # capture, so the probes go on explicitly rather than inheriting
+                # whatever the caller's shell happened to export.
+                storm_env = dict(os.environ, MONTAUK_SCX_STORM="1")
                 mon = subprocess.Popen([MONTAUK, "--trace", "stormwork",
                                         "--trace-out", trace],
                                        stdout=subprocess.DEVNULL, stderr=ef,
@@ -3761,13 +3840,13 @@ def trace_storm_cycle(stamp, n_cpus, duration, busy_per_cpu=4,
                     log_warn(f"[storm] {sched_name}: montauk trace did not attach")
             guard.stop()
             wait_for_deactivation(5.0)
-            rep = subprocess.run([MONTAUK + "_analyze", trace, "--report", "storm"],
+            rep = subprocess.run([*montauk_analyze_argv(), trace, "--report", "storm"],
                                  capture_output=True, text=True)
             # v7.17.0: query the captured bit as structured data and stamp it
             # into the artifact NOW -- the trace is deleted below, so this is
             # the only moment absence-vs-zero can be recorded. An unmeasured
             # storm surface must never fossilize as an empty .storm file.
-            jrep = subprocess.run([MONTAUK + "_analyze", trace, "--report", "storm", "--json"],
+            jrep = subprocess.run([*montauk_analyze_argv(), trace, "--report", "storm", "--json"],
                                   capture_output=True, text=True)
             cap = _storm_captured(jrep.stdout)
             body = rep.stdout
@@ -4302,7 +4381,7 @@ def cmd_bench_scale(args) -> int:
                 if run_full or args.longrun:
                     # Long-running process test. Capture the probe's wake-to-run
                     # with montauk (pand-probe comm) so the interactive-stall tail
-                    # lands in .events for montauk_analyze, not just p99/worst.
+                    # lands in .events for montauk --analyze, not just p99/worst.
                     longrun_count = max(4, n // 2)
                     _safe = (sched_name.replace(" ", "-")
                              .replace("(", "").replace(")", ""))
@@ -4403,6 +4482,17 @@ def cmd_bench_scale(args) -> int:
                     # marker into its recording dir from the drained shutdown stdout.
                     if _ipc_rec is not None:
                         _write_cross_domain_marker_text(stdout, _ipc_rec.dir)
+                    # The chaos/graph summary must survive a run with NO recording
+                    # dir. _ipc_rec is only set under --trace, so on a plain
+                    # `--dev ipc` there was nowhere to put it and the coupling
+                    # spread went unread even though the telemetry was in stdout
+                    # the whole time. Fall back to the archive, which is where
+                    # every other durable per-run artifact already lives.
+                    _chaos_dst = _ipc_rec.dir if _ipc_rec is not None else None
+                    if _chaos_dst is None:
+                        _chaos_dst = ARCHIVE_DIR / f"chaos-{sched_name.split()[-1].strip('()')}-{n}c-{stamp}"
+                        _chaos_dst.mkdir(parents=True, exist_ok=True)
+                    _write_chaos_markers_text(stdout, _chaos_dst)
 
                     # LONGRUN ACTIVATION VERIFICATION
                     longrun_ticks = [t for t in ticks if t.get("longrun_active")]

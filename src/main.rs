@@ -17,7 +17,6 @@ mod log;
 mod adaptive;
 mod chaos;
 mod cli;
-mod procdb;
 mod scheduler;
 mod topology;
 mod tuning;
@@ -178,22 +177,6 @@ fn run_scheduler(
             // BPF-ONLY MODE: SCHEDULER RUNS WITH DEFAULT KNOBS, NO RUST TUNING
             // STILL PRINTS STATS SO BENCHMARKS GET TELEMETRY FOR BOTH PHASES
             log_info!("PANDEMONIUM IS ACTIVE (BPF ONLY, CTRL+C TO EXIT)");
-            // ONE-SHOT PROCDB WARM-START. BPF-only mode has no adaptive loop,
-            // so without this every app launch re-learns task classes from cold
-            // (12C BPF app-launch 16ms vs ADAPTIVE ~2ms). ProcessDb::new() loads
-            // the persisted profiles and flush_predictions() populates
-            // task_class_init, which enable() reads on every spawn. Construct,
-            // log, drop -- no loop, no 1Hz tax. Stale-but-warm beats cold.
-            match crate::procdb::ProcessDb::new() {
-                Ok(db) => {
-                    let (total, confident) = db.summary();
-                    log_info!(
-                        "PROCDB: BPF-mode warm-start {}/{} confident profiles",
-                        confident, total
-                    );
-                }
-                Err(e) => log_warn!("PROCDB WARM-START FAILED: {}", e),
-            }
             let mut prev = scheduler::PandemoniumStats::default();
             while !SHUTDOWN.load(Ordering::Relaxed) && !sched.exited() {
                 watchdog::LOOP_HEARTBEAT.fetch_add(1, Ordering::Relaxed);

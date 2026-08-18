@@ -29,7 +29,7 @@ from pandemonium_common import (
     log, log_info, log_warn, log_error,
     is_scx_active, scx_scheduler_name,
     wait_for_deactivation,
-    montauk_available, MONTAUK_LOG_INTERVAL_MS,
+    montauk_available, MONTAUK_LOG_INTERVAL_MS, MONTAUK, montauk_analyze_argv,
     table_header, table_row, LABEL_W, PrometheusBuilder,
     mean_stdev, median, get_online_cpus,
 )
@@ -55,7 +55,7 @@ NR_LOOPS = NR_LOOPS_FULL  # SET BY main() BASED ON --quick FLAG
 # cost for one workload in one report.
 BURST_LOOPS = 1500               # short messaging burst for the traced phase
 BURST_WINDOW = 12.0              # hard cap on each traced burst (s)
-MONTAUK_ANALYZE = shutil.which("montauk_analyze") or "/usr/local/bin/montauk_analyze"
+ANALYZE = montauk_analyze_argv(shutil.which("montauk") or MONTAUK)
 
 # WORKLOAD SWEEP -- a cell is one shape of `perf bench sched messaging`: a mode
 # (thread = shared address space; process = separate, the actual fork arm) and a
@@ -373,9 +373,24 @@ BASELINE_SECONDS = 3.0            # quiet idle recorded before the storm, for co
 LOAD_SAFETY_TIMEOUT = 180.0       # hard cap so a wedged scheduler can't hang the run
 
 
-def _run_load_traced(timeout, groups=NUM_GROUPS, threaded=True, loops=None):
+def _run_load_traced(timeout, groups=NUM_GROUPS, threaded=True, loops=None,
+                     avoid_cpu=None):
+    """avoid_cpu: keep the storm OFF montauk's drain core.
+
+    Pinning montauk was only half the isolation. The storm saturates every CPU,
+    so a montauk pinned to cpuN still contends with the storm ON cpuN -- it can
+    no longer migrate, which is worse than nothing under a load that fills the
+    machine. Measured on a 20-core box with the pin alone, the arms still came
+    back 8.6 / 15.0 / 15.4% complete, a 1.8x spread that the report then compared
+    head to head. The drain core has to be EXCLUSIVE, which means constraining
+    the load, not just the tracer."""
     nloops = loops if loops is not None else NR_LOOPS
     cmd = _messaging_cmd(groups, threaded, nloops)
+    if avoid_cpu is not None:
+        online = get_online_cpus()
+        others = [c for c in range(online) if c != avoid_cpu]
+        if others:
+            cmd = ["taskset", "-c", ",".join(map(str, others))] + cmd
     t0 = time.time()
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -399,9 +414,10 @@ def trace_capture(sched_name, cmd, stamp, duration,
     drain = max(0, get_online_cpus() - 1)
 
     def body(rec_dir):
-        log_info(f"[{sched_name}] running storm (montauk on cpu{drain}, "
-                 f"window {load_timeout:.0f}s)...")
-        elapsed = _run_load_traced(load_timeout, groups, threaded, loops)
+        log_info(f"[{sched_name}] running storm (montauk alone on cpu{drain}, "
+                 f"storm on the rest, window {load_timeout:.0f}s)...")
+        elapsed = _run_load_traced(load_timeout, groups, threaded, loops,
+                                   avoid_cpu=drain)
         if elapsed is not None:
             log_info(f"[{sched_name}] load completed in {elapsed:.3f}s")
         else:
@@ -486,7 +502,7 @@ def run_trace(args):
 
 
 # ---- phase 1: short traced burst -> wake2run latency + placement locality ----
-# Reuses montauk_analyze the same way prism does: --digest carries the
+# Reuses `montauk --analyze` the same way prism does: --digest carries the
 # wake2run p99 and the cross-domain scatter on one line; --report locality breaks
 # the migrations into cache-tier distances. The perf-stat timing run (phase 2)
 # cannot see either -- it only measures cost. Phase 1 supplies latency and cause.
@@ -495,7 +511,7 @@ _LOC_TIERS = ("same-L2", "same-L3", "same-socket", "cross-socket")
 
 
 def _json_out(argv):
-    """Parsed --json envelope from a montauk_analyze invocation, or None."""
+    """Parsed --json envelope from a `montauk --analyze` invocation, or None."""
     import json as _json
     r = subprocess.run(argv, capture_output=True, text=True, timeout=90)
     if r.returncode != 0 or not r.stdout.strip():
@@ -552,7 +568,7 @@ def analyze_trace(rec_dir):
     if rec_dir is None or not Path(rec_dir).exists():
         return out
     try:
-        dig = _json_out([MONTAUK_ANALYZE, str(rec_dir), "--digest", "--json"])
+        dig = _json_out([*ANALYZE, str(rec_dir), "--digest", "--json"])
         if dig:
             sched = next((r for r in (dig.get("reports") or [])
                           if r.get("name") == "sched"), {})
@@ -572,10 +588,10 @@ def analyze_trace(rec_dir):
             events = Path(rec_dir) / "events.bin"
         if events.is_file():
             out["locality"] = _locality_from_env(
-                _json_out([MONTAUK_ANALYZE, str(events), "--report", "locality",
+                _json_out([*ANALYZE, str(events), "--report", "locality",
                            "--json"]))
     except (subprocess.TimeoutExpired, OSError) as e:
-        log_warn(f"montauk_analyze failed on {rec_dir}: {e}")
+        log_warn(f"montauk --analyze failed on {rec_dir}: {e}")
     return out
 
 

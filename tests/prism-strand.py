@@ -9,7 +9,7 @@
 # freezes (audio/input survive, anything touching disk wedges).
 #
 # montauk is the instrument: a --trace-out capture across the window, folded by
-# `montauk_analyze --report kstrand`, which ranks the worst-stranded kthreads and
+# `montauk --analyze --report kstrand`, which ranks the worst-stranded kthreads and
 # splits each wait HELD (CPU busy through it -- a genuine scheduler strand) from
 # DARK (CPU idle/tickless -- no rescue scan). A HELD strand in the 100ms+ band is
 # the freeze signature. This bench asserts that signature is ABSENT under

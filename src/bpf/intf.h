@@ -108,6 +108,20 @@ struct pandemonium_stats {
 	// strand fix -- it should track the formerly tick-floored burst wakes while
 	// the >=900us wake2run bucket collapses.
 	u64 nr_spill_kick_preempt;
+	// PER-CPU RUNNABLE DEPTH, ACCUMULATED. THE ADAPTIVE LAYER HAD NO QUEUE
+	// SERIES AT ALL: IT INFERRED LOAD FROM idle_pct, ONE SYSTEM-WIDE INTEGER
+	// PERCENTAGE, WHICH IS WHY THE WHOLE CHAOS LAYER RAN OVER 16 SAMPLES OF
+	// ONE SCALAR. THIS IS THE SERIES PER-CPU REGIME AND PECORA-CARROLL
+	// COUPLING BOTH REQUIRE -- COUPLING MEASURES THE RELATIONSHIP BETWEEN TWO
+	// SERIES, AND UNTIL NOW EXACTLY ONE EXISTED ANYWHERE IN THE SYSTEM.
+	//
+	// SUM/SAMPLES RATHER THAN AN INSTANTANEOUS VALUE, MATCHING THE
+	// wake_lat_sum/wake_lat_samples PAIR ABOVE: A 1HZ READER SAMPLING A QUEUE
+	// THAT MOVES AT MICROSECOND SCALE ALIASES BADLY, SO BPF ACCUMULATES AT
+	// TICK RATE AND USERSPACE DIFFERENCES BOTH FIELDS FOR A TRUE INTERVAL
+	// MEAN. MONOTONIC; NEVER RESET IN BPF.
+	u64 rq_depth_sum;
+	u64 rq_depth_samples;
 };
 
 // XDOM path indices for pandemonium_stats.nr_cross_domain[] (diagnostic).
@@ -119,16 +133,5 @@ struct pandemonium_stats {
 #define XDOM_ENQ_T2      5   // enqueue TIER 2 warm-anchor spill
 #define XDOM_STEAL       6   // dispatch STEP 1 R_eff steal (this_cpu vs peer)
 #define XDOM_STEP5       7   // dispatch STEP 5 cross-domain work-conservation scan
-
-// PROCESS CLASSIFICATION: BPF OBSERVES, RUST LEARNS, BPF APPLIES
-// SHARED BETWEEN BPF MAPS (task_class_observe, task_class_init) AND RUST (procdb.rs)
-struct task_class_entry {
-	u8  tier;
-	u8  _pad[7];
-	u64 avg_runtime;
-	u64 runtime_dev;    // EWMA |RUNTIME - AVG_RUNTIME|
-	u64 wakeup_freq;    // WAKEUP FREQUENCY (EWMA)
-	u64 csw_rate;       // CONTEXT SWITCH RATE (EWMA)
-};
 
 #endif // __INTF_H

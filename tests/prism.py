@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from pandemonium_common import (  # noqa: E402
     log, get_version, get_git_info, log_info, log_warn, log_error,
     MONTAUK, montauk_available, DmesgMonitor, montauk_trace, install_hint,
+    montauk_analyze_argv,
     TRACE_DIR, LOG_DIR, get_online_cpus, get_possible_cpus,
     is_scx_active, scx_scheduler_name, wait_for_deactivation,
     stall_susceptibility, median, restore_all_cpus,
@@ -41,9 +42,16 @@ from pandemonium_common import (  # noqa: E402
 TESTS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = TESTS_DIR.parent
 
-# The report needs both the tracer (montauk) and the analyzer (montauk_analyze).
+# The tracer and the analyzer are ONE binary as of montauk v8.10.0 -- the
+# analyzer is a mode (`--analyze`), not a separate file to check for.
 MONTAUK_INSTALLED = Path(MONTAUK)
-MONTAUK_ANALYZE_INSTALLED = MONTAUK_INSTALLED.with_name("montauk_analyze")
+# sublimation does every stream and numeric step in this file. The ephemeral
+# install used to place only the two binaries above, so a run that opted to
+# uninstall afterward never got sublimation at all: it fell back to Python for
+# the whole report and said so once, in a warning, on a line nobody reads. It
+# ships with montauk and belongs in the ephemeral set for the same reason the
+# analyzer does -- the report cannot be assembled correctly without it.
+SUBLIMATION_INSTALLED = MONTAUK_INSTALLED.with_name("sublimation")
 
 # montauk is not bundled. When it is missing, prism clones it from the
 # canonical repo and drives montauk's OWN installer -- it is a wrapper, not a
@@ -92,11 +100,13 @@ _PROFILE_LABELS = {
 }
 
 
-def _analyze_bin() -> str:
-    """Prefer the freshly-built montauk_analyze from the clone (it matches the
-    montauk we just installed); fall back to the installed path."""
-    clone_a = MONTAUK_CLONE / "build" / "montauk_analyze"
-    return str(clone_a) if clone_a.is_file() else str(MONTAUK_ANALYZE_INSTALLED)
+def _analyze_argv() -> list[str]:
+    """Prefer the freshly-built montauk from the clone (it matches what we just
+    installed); fall back to the installed one. Returns the ARGV PREFIX, since
+    the analyzer is a mode word and a path string cannot carry one."""
+    clone_m = MONTAUK_CLONE / "build" / "montauk"
+    binary = str(clone_m) if clone_m.is_file() else str(MONTAUK_INSTALLED)
+    return montauk_analyze_argv(binary)
 
 
 def ensure_trace_dir() -> None:
@@ -195,13 +205,13 @@ def _version_tuple(s: str) -> tuple:
 
 
 def _installed_montauk_version() -> tuple | None:
-    """The installed montauk's version via `montauk_analyze --version`. None if
-    it is too old to have the flag (pre-7.5.0 printed nothing) or unreadable --
-    either way, a candidate for upgrade."""
-    if not MONTAUK_ANALYZE_INSTALLED.is_file():
+    """The installed montauk's version via `montauk --analyze --version`. None
+    if it is too old to have the flag (pre-7.5.0 printed nothing) or unreadable
+    -- either way, a candidate for upgrade."""
+    if not MONTAUK_INSTALLED.is_file():
         return None
     try:
-        r = subprocess.run([str(MONTAUK_ANALYZE_INSTALLED), "--version"],
+        r = subprocess.run([*montauk_analyze_argv(), "--version"],
                            capture_output=True, text=True, timeout=10)
         out = r.stdout.strip()
         if r.returncode == 0 and re.match(r"^\d+\.\d+", out):
@@ -241,7 +251,7 @@ def ensure_montauk() -> tuple[bool, bool, bool]:
     current version (read dynamically, not hardcoded) it is upgraded -- uninstall
     old, clone + install latest -- so the report is never assembled against a
     montauk too old to surface a crash front and center."""
-    have_analyze = MONTAUK_ANALYZE_INSTALLED.is_file()
+    have_analyze = MONTAUK_INSTALLED.is_file()
     upgrade = False
     if montauk_available() and have_analyze:
         cur = _installed_montauk_version()
@@ -301,10 +311,19 @@ def ensure_montauk() -> tuple[bool, bool, bool]:
         build = MONTAUK_CLONE / "build"
         ok = r.returncode == 0
         for name, dst in (("montauk", MONTAUK_INSTALLED),
-                          ("montauk_analyze", MONTAUK_ANALYZE_INSTALLED)):
+                          ("sublimation", SUBLIMATION_INSTALLED)):
             src = build / name
             if not src.is_file() or subprocess.run(
                     ["install", "-m755", str(src), str(dst)]).returncode != 0:
+                # sublimation missing is not fatal -- the Python fallbacks are
+                # real, if slower and less capable -- but it must be LOUD, not a
+                # warning buried under a successful install.
+                if name == "sublimation":
+                    log_warn("sublimation did not install; stream and numeric "
+                             "analysis will fall back to Python for this entire "
+                             "report. Numbers stay correct, shape verdicts get "
+                             "coarser.")
+                    continue
                 ok = False
     else:
         # Keep: run montauk's own installer (as the user; it sudo's its own
@@ -327,7 +346,7 @@ def ensure_montauk() -> tuple[bool, bool, bool]:
         ok = subprocess.run(_as_user([sys.executable, str(installer),
                             "--bpf", kflag]), cwd=MONTAUK_CLONE).returncode == 0
 
-    if not (ok and montauk_available() and MONTAUK_ANALYZE_INSTALLED.is_file()):
+    if not (ok and montauk_available()):
         log_error("montauk install failed.")
         return False, False, False
     log_info(f"montauk installed -> {MONTAUK_INSTALLED.parent}")
@@ -345,10 +364,23 @@ def remove_montauk_if_ours(installed_by_us: bool, uninstall_after: bool) -> None
         subprocess.run(["rm", "-rf", str(MONTAUK_CLONE)])
         log_info(f"keeping montauk at {MONTAUK_INSTALLED.parent}.")
         return
-    subprocess.run(["rm", "-f", str(MONTAUK_INSTALLED),
-                    str(MONTAUK_ANALYZE_INSTALLED)])
+    # Every binary the ephemeral install placed, or the uninstall leaves the
+    # system dirtier than it found it -- sublimation was installed here and not
+    # removed, which is the half-uninstall a benchmark harness must never do.
+    removed = []
+    for path in (MONTAUK_INSTALLED, SUBLIMATION_INSTALLED):
+        if path.is_file():
+            subprocess.run(["rm", "-f", str(path)])
+            removed.append(path.name)
     subprocess.run(["rm", "-rf", str(MONTAUK_CLONE)])
-    log_info("montauk removed.")
+    # Name what went, and verify rather than assume: an uninstall that reports
+    # success while leaving a binary behind is worse than one that refuses.
+    left = [p.name for p in (MONTAUK_INSTALLED, SUBLIMATION_INSTALLED)
+            if p.is_file()]
+    if left:
+        log_warn(f"uninstall incomplete -- still present: {', '.join(left)}")
+    else:
+        log_info(f"montauk removed ({', '.join(removed) or 'nothing to remove'}).")
 
 
 def _sched_flags(bench: str, schedulers: str, all_scx: bool) -> list[str]:
@@ -598,7 +630,7 @@ def digest_envelope(analyze: str, rec_dir: Path) -> tuple[dict | None, str]:
     r = subprocess.run([analyze, str(rec_dir), "--digest", "--redact", "--json"],
                        capture_output=True, text=True)
     if r.returncode != 0 or not r.stdout.strip():
-        log_warn(f"montauk_analyze --digest --json produced nothing for "
+        log_warn(f"montauk --analyze --digest --json produced nothing for "
                  f"{rec_dir.name} -- carrying its text digest verbatim")
         return None, text
     try:
@@ -986,29 +1018,65 @@ def _build_population(analyze: str, prom: Path | None) -> str:
     return "\n".join(out)
 
 
-def _build_comparison(meta: list[tuple[str | None, str | None, int | None]]) -> str:
-    """Turn the per-recording (family, scheduler, p99) tuples into the headline
-    the report exists to give: EEVDF vs PANDEMONIUM p99, with the ratio. Only
-    traced families (those with a p99) appear; cachyos has no trace, so it is
-    absent here. lower p99 is better, so ratio = EEVDF / PANDEMONIUM."""
+# Arms whose capture completeness differs by more than this ratio are not
+# comparable, and the report says so instead of printing the number. montauk's
+# own capture-loss line already states the rule -- "compare arms only at like
+# completeness" -- and the 2026-08-05 field report printed a headline "5.7x
+# better" across arms at 8.6% and 15.4%, with the caveat sitting two sections
+# below where nobody reads it beside the number it disqualifies. A caveat that
+# does not suppress is a caveat that does not work.
+_COMPLETENESS_RATIO_MAX = 1.25
+
+
+def _build_comparison(
+    meta: list[tuple[str | None, str | None, int | None, float | None]],
+) -> str:
+    """Turn the per-recording (family, scheduler, p99, completeness) tuples into
+    the headline the report exists to give: EEVDF vs PANDEMONIUM p99, with the
+    ratio. Only traced families (those with a p99) appear; cachyos has no trace,
+    so it is absent here. lower p99 is better, so ratio = EEVDF / PANDEMONIUM.
+
+    EVERY traced family with a baseline is reported, wins and losses alike.
+    _COMPARE_ORDER fixes the ORDER of the ones it names and nothing more -- as a
+    membership test it silently withheld regressions, which is how the field
+    report's cold-wake-starve loss (EEVDF 20us against PANDEMONIUM 104us) reached
+    us in the body of the report while the summary above it showed four straight
+    wins. A summary that structurally cannot show a regression is not a summary."""
     fam_p99: dict[str, dict[str, int]] = {}
-    for fam, sched, p99 in meta:
+    fam_comp: dict[str, dict[str, float]] = {}
+    for fam, sched, p99, comp in meta:
         if fam and sched and p99 is not None:
             fam_p99.setdefault(fam, {})[sched] = p99
+            if comp is not None:
+                fam_comp.setdefault(fam, {})[sched] = comp
     if not fam_p99:
         return ""
+    # Named families first in their curated order, then everything else that has
+    # measurements, so a new workload appears without being added to a list.
+    ordered = [f for f in _COMPARE_ORDER if f in fam_p99]
+    ordered += sorted(f for f in fam_p99 if f not in _COMPARE_ORDER)
     out = ["COMPARISON  (p99 wake2run, lower is better)"]
-    for fam in _COMPARE_ORDER:
-        m = fam_p99.get(fam)
-        if not m:
-            continue
+    for fam in ordered:
+        m = fam_p99[fam]
         base = m.get("EEVDF")
+        comps = fam_comp.get(fam, {})
         parts = []
         for sched in ("PANDEMONIUM-BPF", "PANDEMONIUM-ADAPTIVE", "PANDEMONIUM"):
             if sched not in m:
                 continue
             v = m[sched]
-            if base and v > 0:
+            # Suppress the RATIO, never the measurement: both arms' numbers stay
+            # visible, only the comparison between them is withheld.
+            skew = None
+            bc, vc = comps.get("EEVDF"), comps.get(sched)
+            if bc and vc and min(bc, vc) > 0:
+                r = max(bc, vc) / min(bc, vc)
+                if r > _COMPLETENESS_RATIO_MAX:
+                    skew = r
+            if skew is not None:
+                parts.append(f"{_sched_short(sched)} {v}us (ratio withheld -- "
+                             f"arm completeness differs {skew:.1f}x)")
+            elif base and v > 0:
                 ratio = base / v
                 verdict = (f"{ratio:.1f}x better" if ratio >= 1
                            else f"{1 / ratio:.1f}x worse")
@@ -1066,7 +1134,7 @@ def _coldwork_ramp(rec_dir: Path) -> str | None:
 
 def _storm_section() -> str:
     """Surface montauk's storm verdict into the report. trace_storm_cycle writes
-    storm-*.storm (the `montauk_analyze --report storm` output) to LOG_DIR; the newest
+    storm-*.storm (the `montauk --analyze --report storm` output) to LOG_DIR; the newest
     is this run's. The storm is the one failure the warm/controlled benches never
     trigger, so the shareable report carries montauk's verdict -- storm% and the
     REAL-IPI-vs-IDLE-churn classification, straight from the trace."""
@@ -1105,7 +1173,7 @@ def build_report(recs: list[Path], tag: str, stamp: str,
     lines = [f"PRISM v{ver} [{git['commit']}{dirty}] [{tag}]",
              f"captured: {stamp}",
              ""]
-    analyze = _analyze_bin()
+    analyze = _analyze_argv()
     # First pass: digest each recording, hoist the machine-wide blocks once, and
     # collect each workload's consolidated body + (family, scheduler, p99) so the
     # comparison can lead the report. The COMPARISON section is the headline -- it
@@ -1124,7 +1192,7 @@ def build_report(recs: list[Path], tag: str, stamp: str,
             # No envelope: carry montauk's own text digest verbatim rather than
             # scrape it, and contribute no p99 to the comparison (an unparsed
             # number is not a number).
-            meta.append((fam, sched, None))
+            meta.append((fam, sched, None, None))
             pop.append((_workload_cell(label, sched), sched, None))
             workloads.append((label, text.strip()))
             continue
@@ -1133,7 +1201,11 @@ def build_report(recs: list[Path], tag: str, stamp: str,
         if not sys_text:
             sys_text = _render_system(env)
         p99 = _envelope_p99(env)
-        meta.append((fam, sched, p99))
+        # Completeness travels with the p99 so COMPARISON can refuse a ratio
+        # across unlike captures. Absent means UNKNOWN, never proven-clean, so a
+        # missing value never satisfies the like-completeness test by default.
+        meta.append((fam, sched, p99,
+                     (env.get("digest") or {}).get("capture_completeness")))
         pop.append((_workload_cell(label, sched), sched, p99))
         cbody = _render_body(env, is_cachyos=(fam == "cachyos"))
         ramp = _coldwork_ramp(d)   # cold-wake recordings carry coldwork-quanta.txt
@@ -1168,7 +1240,7 @@ def build_report(recs: list[Path], tag: str, stamp: str,
         lines.append(f"WORKLOAD {label}")
         lines.append(body if body.strip() else "  (no analyzable data)")
     # Fallback only if the front-and-center stability block did not render (e.g.
-    # an older montauk_analyze without scx_stability_block): never lose a crash.
+    # an older montauk without scx_stability_block): never lose a crash.
     if dmesg.crashed and not stab_text:
         lines += ["", f"SCHEDULER CRASH: {dmesg.crash_msg}"]
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -1568,7 +1640,6 @@ def read(path: str) -> str:
 class Tools:
     def __init__(self):
         self.montauk = shutil.which("montauk")
-        self.montauk_analyze = shutil.which("montauk_analyze")
         self.sublimation = shutil.which("sublimation")
         self.coredumpctl = shutil.which("coredumpctl")
         self.journalctl = shutil.which("journalctl")
@@ -1580,7 +1651,10 @@ def sub_grep(t: Tools, text: str, pattern: str, flags: list[str] | None = None) 
     if not text:
         return []
     if t.sublimation:
-        rc, out = run([t.sublimation, "grep", *(flags or []), pattern], stdin=text)
+        # "search", not "grep": there is no grep verb, and an unknown command
+        # exits 2, so the rc guard below sent every call to the Python fallback
+        # instead. Silent, and the reason this never surfaced as a failure.
+        rc, out = run([t.sublimation, "search", *(flags or []), pattern], stdin=text)
         if rc in (0, 1):
             return [ln for ln in out.splitlines() if ln]
     rx = re.compile(pattern, re.IGNORECASE if (flags and "-i" in flags) else 0)
@@ -1842,10 +1916,11 @@ def analyze_event(t: Tools, event: Event, window: str) -> None:
 
     # if a montauk trace covers this window, let the instrument speak
     traces = glob.glob("/tmp/pandemonium/*.events") + glob.glob("/tmp/pandemonium/**/*.prom", recursive=True)
-    if traces and t.montauk_analyze:
+    if traces and t.montauk:
         newest = max(traces, key=os.path.getmtime)
         info(f"montauk artifact found: {newest} -- analyzing")
-        rc, out = run([t.montauk_analyze, newest, "--report", "kstrand,dispatch-stall,endstate"], timeout=45)
+        rc, out = run([*montauk_analyze_argv(t.montauk), newest,
+                       "--report", "kstrand,dispatch-stall,endstate"], timeout=45)
         if rc == 0:
             for ln in out.splitlines():
                 if ln.startswith("REPORT") or "VERDICT" in ln or "strand" in ln.lower():
@@ -1947,7 +2022,7 @@ def forensics_main() -> int:
     t = Tools()
     info(f"system-forensics on {os.uname().nodename}  kernel {os.uname().release}  "
          f"root={'yes' if t.is_root else 'NO -- reduced coverage'}")
-    info(f"tools: montauk_analyze={'y' if t.montauk_analyze else 'n'} "
+    info(f"tools: montauk={'y' if t.montauk else 'n'} "
          f"sublimation={'y' if t.sublimation else 'n'} journalctl={'y' if t.journalctl else 'n'} "
          f"coredumpctl={'y' if t.coredumpctl else 'n'}")
     if not t.sublimation:

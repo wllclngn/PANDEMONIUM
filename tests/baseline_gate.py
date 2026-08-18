@@ -33,7 +33,7 @@ synthetic fixture, gated byte-exact against a golden):
       python3 baseline_gate.py --self-test
       python3 baseline_gate.py --self-test --update   # refreeze, shows the diff
 
-montauk is the only analyzer. This shells montauk_analyze (its fixed --by
+montauk is the only analyzer. This shells `montauk --analyze` (its fixed --by
 version comparator + --alias to bridge the bench_->scale_ family rename) and
 reads the structured montauk_pop_mean gauges it emits.
 """
@@ -70,14 +70,17 @@ DEFAULT_TOL = 0.15       # candidate may sit up to 15% above baseline before fai
 ABS_FLOOR_US = 25.0      # ignore sub-25us absolute deltas (measurement noise)
 
 
-def resolve_analyzer() -> str:
-    env = os.environ.get("MONTAUK_ANALYZE")
+def resolve_analyzer() -> list[str]:
+    """ARGV PREFIX -- the analyzer is a mode of montauk as of v8.10.0, so this
+    returns [binary, "--analyze"] and never a bare path. This file is standalone
+    (no pandemonium_common import) so the mode word is spelled here, once."""
+    env = os.environ.get("MONTAUK_BIN") or os.environ.get("MONTAUK_ANALYZE")
     if env and Path(env).exists():
-        return env
-    found = shutil.which("montauk_analyze")
+        return [env, "--analyze"]
+    found = shutil.which("montauk")
     if found:
-        return found
-    sys.exit("baseline_gate: montauk_analyze not found (set MONTAUK_ANALYZE or "
+        return [found, "--analyze"]
+    sys.exit("baseline_gate: montauk not found (set MONTAUK_BIN or "
              "install montauk)")
 
 
@@ -190,7 +193,7 @@ def judge(cells: dict, tol: float, abs_floor: float, baseline: str) -> list:
 
 def run_analyze(analyzer, args, cache_dir) -> str:
     env = dict(os.environ, XDG_CACHE_HOME=str(cache_dir))
-    subprocess.run([analyzer, *args], env=env, capture_output=True, text=True,
+    subprocess.run([*analyzer, *args], env=env, capture_output=True, text=True,
                    check=False)
     hits = list((Path(cache_dir) / "montauk").glob("analysis-pop-*.prom"))
     return "\n".join(p.read_text() for p in hits)

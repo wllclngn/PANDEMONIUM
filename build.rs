@@ -74,17 +74,27 @@ fn main() {
     let gen_include = out_dir.join("include");
     let skel_out = out_dir.join("bpf.skel.rs");
 
+    // A/B SWITCH: PAND_NO_RQ_DEPTH=1 compiles the per-CPU depth tick sample out,
+    // so its cost can be measured against a build that keeps it. Env-driven
+    // rather than a cargo feature because it is a measurement tool, not a
+    // shipping configuration.
+    let mut cflags: Vec<String> = vec![
+        "-std=gnu23".into(),
+        "-I".into(),
+        "include".into(),
+        "-I".into(),
+        gen_include.to_str().unwrap().into(),
+        "-I".into(),
+        vmlinux_dir.to_str().unwrap().into(),
+    ];
+    println!("cargo:rerun-if-env-changed=PAND_NO_RQ_DEPTH");
+    if std::env::var("PAND_NO_RQ_DEPTH").is_ok() {
+        cflags.push("-DPAND_NO_RQ_DEPTH".into());
+    }
+
     SkeletonBuilder::new()
         .source(BPF_SRC)
-        .clang_args([
-            "-std=gnu23",
-            "-I",
-            "include",
-            "-I",
-            gen_include.to_str().unwrap(),
-            "-I",
-            vmlinux_dir.to_str().unwrap(),
-        ])
+        .clang_args(cflags)
         .build_and_generate(&skel_out)
         .unwrap();
 

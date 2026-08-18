@@ -36,7 +36,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.resolve()))
 from pandemonium_common import (
-    LOG_DIR, get_version, get_git_info,
+    LOG_DIR, get_version, get_git_info, montauk_analyze_argv,
     log_info, log_warn, log_error,
     check_sources_changed, build,
     is_scx_active, scx_scheduler_name, get_online_cpus,
@@ -76,14 +76,17 @@ DEFAULT_EXCLUDE = ("wakers", "placement-race")
 DEFAULT_WATCH = ("montauk_pmu",)
 
 
-def resolve_analyze() -> str:
-    env = os.environ.get("MONTAUK_ANALYZE")
+def resolve_analyze() -> list[str]:
+    """ARGV PREFIX for the analyzer. montauk v8.10.0 made it a mode of montauk,
+    so this is [binary, "--analyze"] and never a bare path. MONTAUK_BIN overrides
+    the binary; MONTAUK_ANALYZE is still honoured for the same purpose."""
+    env = os.environ.get("MONTAUK_BIN") or os.environ.get("MONTAUK_ANALYZE")
     if env and Path(env).exists():
-        return env
-    found = shutil.which("montauk_analyze")
+        return montauk_analyze_argv(env)
+    found = shutil.which("montauk")
     if found:
-        return found
-    log_error("montauk_analyze not found -- set MONTAUK_ANALYZE or install montauk")
+        return montauk_analyze_argv(found)
+    log_error("montauk not found -- set MONTAUK_BIN or install montauk")
     sys.exit(2)
 
 
@@ -170,7 +173,7 @@ def freeze(analyze: str, rec: Path, dest: Path, label: str,
     freeze rather than aborting it, so --exclude here is for reports that cannot
     DISCRIMINATE on this workload -- a different judgment, and ours to make.
     """
-    cmd = [analyze, str(rec), "--golden", str(dest), "--update", "--label", label]
+    cmd = [*analyze, str(rec), "--golden", str(dest), "--update", "--label", label]
     if lane:
         cmd.append(f"--{lane}")
     if allow_unknown:
@@ -191,7 +194,7 @@ def freeze(analyze: str, rec: Path, dest: Path, label: str,
 
 def check(analyze: str, rec: Path, golden: Path, lane: str | None,
           allow_unknown: bool) -> tuple[int, str]:
-    cmd = [analyze, str(rec), "--golden", str(golden)]
+    cmd = [*analyze, str(rec), "--golden", str(golden)]
     if lane:
         cmd.append(f"--{lane}")
     if allow_unknown:
