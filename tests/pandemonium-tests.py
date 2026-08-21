@@ -1972,7 +1972,12 @@ def write_prometheus(data: dict, stamp: str) -> Path:
 
     ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
     version = data.get("version", "unknown")
-    path = ARCHIVE_DIR / f"{version}-{stamp}.prom"
+    slug = bench_slug(data)
+    # prism-scale keeps the bare "{version}-{stamp}" archive name it has always
+    # had -- baseline_gate and prism-golden select on it. Every other mode takes
+    # the prism-<bench>-<version>-<stamp> form the other prism-* benches use.
+    path = ARCHIVE_DIR / (f"{version}-{stamp}.prom" if slug == "prism-scale"
+                          else f"{slug}-{version}-{stamp}.prom")
     path.write_text(pb.render())
     return path
 
@@ -2181,6 +2186,32 @@ def gauge_rr(per_sched_times):
     return {"grr_pct": grr_pct, "icc": var_between / total,
             "within_cv": (var_within ** 0.5 / grand * 100.0) if grand > 0 else 0.0,
             "verdict": verdict}
+
+
+# prism-scale's --ipc/--deadline/--launch/--mixed/--longrun/--burst modes are
+# separate benches to anyone reading the cache, so they get separate filenames.
+# Sharing prism-scale's was not only confusing, it was wrong: the archive prom
+# is named "{version}-{stamp}.prom", and baseline_gate globs "[0-9]*.prom" while
+# prism-golden globs "{version}-*.prom", so an IPC-only run dropped a file both
+# of them read as that version's full scale run. The metric FAMILY stays
+# pandemonium_scale_* -- one schema, and renaming it would orphan every archived
+# run -- only the file is named for the bench that produced it.
+_BENCH_SLUGS = (
+    ("deadline_only", "prism-deadline"),
+    ("ipc_only",      "prism-ipc"),
+    ("launch_only",   "prism-launch"),
+    ("mixed_only",    "prism-mixed"),
+    ("longrun_only",  "prism-longrun"),
+    ("burst_only",    "prism-burst"),
+)
+
+
+def bench_slug(data: dict) -> str:
+    """Output basename for a prism-scale run, by mode."""
+    for key, slug in _BENCH_SLUGS:
+        if data.get(key):
+            return slug
+    return "prism-scale"
 
 
 def format_report(data: dict) -> str:
@@ -4530,7 +4561,7 @@ def cmd_bench_scale(args) -> int:
 
     # Save log
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    report_path = LOG_DIR / f"prism-scale-{stamp}.log"
+    report_path = LOG_DIR / f"{bench_slug(data)}-{stamp}.log"
     report_path.write_text(report)
     log_info(f"REPORT: {report_path}")
 

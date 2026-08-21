@@ -1110,8 +1110,17 @@ class MontaukTrace:
             cmd += ["--sched-detail"]
         if self.pin_cpu is not None:
             cmd = ["taskset", "-c", str(self.pin_cpu)] + cmd
+        # SCRUB THE STORM PROBES FROM EVERY CAPTURE THAT DID NOT ASK FOR THEM.
+        # MONTAUK_SCX_STORM arms fentry/fexit trampolines on sched_ext's hot
+        # kfuncs (scx_bpf_kick_cpu / scx_bpf_reenqueue_local). Only the storm
+        # bench wants that, and it sets the var on its own child explicitly. An
+        # ambient export in the caller's shell is the documented route that
+        # hard-locked this box on 2026-07-14, and every capture here inherits the
+        # environment, so the guard belongs on the shared launcher rather than on
+        # the one bench that opts in.
+        env = {k: v for k, v in os.environ.items() if k != "MONTAUK_SCX_STORM"}
         self.proc = subprocess.Popen(cmd, stdout=self._out,
-                                     stderr=subprocess.STDOUT)
+                                     stderr=subprocess.STDOUT, env=env)
         if not self._wait_for_attach():
             log_warn(f"montauk slow to attach (see {self.stdout_path})")
         if self.baseline_s > 0:
