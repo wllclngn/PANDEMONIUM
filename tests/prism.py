@@ -33,6 +33,8 @@ from pandemonium_common import (  # noqa: E402
     log, get_version, get_git_info, log_info, log_warn, log_error,
     MONTAUK, montauk_available, DmesgMonitor, montauk_trace, install_hint,
     montauk_analyze_argv,
+    montauk_envelope, envelope_report, envelope_gauges, envelope_verdict,
+    envelope_capture, envelope_offenders,
     TRACE_DIR, LOG_DIR, get_online_cpus, get_possible_cpus,
     is_scx_active, scx_scheduler_name, wait_for_deactivation,
     stall_susceptibility, median, restore_all_cpus,
@@ -391,9 +393,9 @@ def _sched_flags(bench: str, schedulers: str, all_scx: bool) -> list[str]:
       cachyos / fork-thread / burst-starvation / sojourn-pressure : --all-scx | --schedulers
       ipc (-> prism-scale)                                        : --schedulers"""
     takes_all = bench in ("cachyos", "fork-thread", "burst-starvation",
-                          "sojourn-pressure", "cold-wake")
+                          "sojourn-pressure", "cold-wake", "power")
     takes_list = bench in ("cachyos", "fork-thread", "ipc", "scale", "burst-starvation",
-                           "sojourn-pressure", "cold-wake")
+                           "sojourn-pressure", "cold-wake", "power")
     if all_scx and takes_all:
         return ["--all-scx"]
     if schedulers and takes_list:
@@ -447,7 +449,7 @@ def run_profile(schedulers: str, all_scx: bool, ultra: bool = False,
                      "--trace", "--iterations", "1",
                      "--workloads", PROFILE_CACHYOS_WORKLOADS]),
         ("fork-thread", [py, str(TESTS_DIR / "prism-fork-thread.py"),
-                         "--quick", "--trace", "--compare-eevdf",
+                         "--quick",
                          "--iterations", str(PROFILE_ITERATIONS)]),
         ("ipc", [py, str(TESTS_DIR / "prism-ipc.py"),
                  "--trace", "--core-counts", str(ncpus)]),
@@ -732,11 +734,6 @@ def _render_offenders(env: dict) -> str:
     return "\n".join(out)
 
 
-def _report_by_name(env: dict, name: str) -> dict:
-    return next((r for r in (env.get("reports") or [])
-                 if r.get("name") == name), {})
-
-
 def _render_capture(env: dict) -> str:
     """montauk's capture-loss qualification, directly above the numbers it
     qualifies. The tracer sheds under load -- exactly when the interesting events
@@ -766,7 +763,7 @@ def _render_key_metrics(env: dict) -> str:
     if not (env.get("digest") or {}).get("has_events", False):
         return ""
     out = []
-    sched = _report_by_name(env, "sched")
+    sched = envelope_report(env, "sched")
     if sched.get("verdict"):
         out += ["REPORT sched", f"VERDICT: {sched['verdict']}"]
         stru = sched.get("structure") or {}
@@ -787,7 +784,7 @@ def _render_key_metrics(env: dict) -> str:
     # already carries the tick-floor share, and the stall report adds nothing but
     # a row of zeros. Gated on the typed gauges rather than on the shape of the
     # sentence, which is what the old text pass had to match.
-    stall = _report_by_name(env, "dispatch-stall")
+    stall = envelope_report(env, "dispatch-stall")
     if stall.get("verdict"):
         g = {x.get("name"): x.get("value") for x in (stall.get("gauges") or [])}
         empty = (g.get("montauk_analysis_dispatch_avg_passovers", 0) == 0
@@ -797,7 +794,7 @@ def _render_key_metrics(env: dict) -> str:
     # kstrand only earns space when it actually names a stranded kthread: with no
     # rows its verdict is a negative, and a report of nothing found is what the
     # offender list's absence already says.
-    kst = _report_by_name(env, "kstrand")
+    kst = envelope_report(env, "kstrand")
     rows = kst.get("kthreads") or []
     if kst.get("verdict") and rows:
         out += ["", "REPORT kstrand", f"VERDICT: {kst['verdict']}"]
@@ -828,7 +825,7 @@ def _render_body(env: dict, is_cachyos: bool = False) -> str:
 def _envelope_p99(env: dict) -> int | None:
     """sched-report p99 wake2run (us), or None when the recording has no event
     stream. Read from the typed field, never regexed back out of the verdict."""
-    w = (_report_by_name(env, "sched").get("wake2run") or {})
+    w = (envelope_report(env, "sched").get("wake2run") or {})
     p99 = w.get("p99_us")
     return int(round(p99)) if p99 is not None else None
 
@@ -1276,6 +1273,11 @@ def main() -> int:
     ap.add_argument("--iterations", type=int, default=1, metavar="N",
                     help="run the profile N times (one report per run), to see "
                          "past per-run noise (default: 1)")
+    ap.add_argument("--cores", metavar="LIST", default=None,
+                    help="comma-separated core widths for a --dev child that "
+                         "sweeps width (scale, contention, pcpu, scx), e.g. "
+                         "--cores 2. Default: the child's own auto sweep "
+                         "(2,4,8,...,max). No effect on the profile pass")
     ap.add_argument("--ultra", action="store_true",
                     help="trace the width-specific faults (burst-starvation, "
                          "sojourn-pressure) at EVERY core width (2,4,8,...,max) "
@@ -1284,9 +1286,11 @@ def main() -> int:
                          "many files, sizes from KB to hundreds of MB")
     ap.add_argument("--dev", nargs="*", default=None, metavar="WORKLOAD",
                     help="run ONE OR MORE sustained dev validations by name (fork-thread, "
-                         "strand, storm, pcpu, contention, scale, locality, cold-wake, "
-                         "ipc, power, cachyos, scx), or 'all' for the full sweep. "
-                         "Bare --dev lists them.")
+                         "strand, storm, pcpu, contention, scale, ipc, power, cachyos, "
+                         "scx), or 'all' for the full sweep. Bare --dev lists them. "
+                         "A CHILD'S OWN FLAGS TRAVEL AFTER `--`: "
+                         "`--dev cachyos -- --workloads primes` selects inside that "
+                         "child's suite, where a bare --workload would bind to prism's.")
     ap.add_argument("--list", action="store_true",
                     help="list the PRISM workloads (default + dev tiers) and exit")
     ap.add_argument("--trace", action="store_true",
@@ -1327,8 +1331,6 @@ def main() -> int:
     PRISM_DEV = {
         "fork-thread": [str(TESTS_DIR / "prism-fork-thread.py")],
         "strand":      [str(TESTS_DIR / "prism-strand.py")],
-        "locality":    [str(TESTS_DIR / "prism-locality.py")],
-        "cold-wake":   [_pt, "prism-coldwake"],
         "storm":       [_pt, "prism-coldwake", "--storm"],
         "pcpu":        [_pt, "prism-pcpu"],
         "contention":  [_pt, "prism-contention"],
@@ -1349,13 +1351,13 @@ def main() -> int:
     # SEMANTIC differences, not argument-surface differences:
     # Children that need root REGARDLESS of --trace: the unconditional tracers
     # (capture is what they are, and montauk's eBPF attach needs it).
-    PRISM_DEV_ROOT = {"strand", "locality", "golden"}
+    PRISM_DEV_ROOT = {"strand", "golden"}
     # PROBE children measure whatever scheduler is LIVE -- they load nothing
     # themselves. The pre-flight _stop_running_scheduler before every child
     # guaranteed a probe always measured EEVDF/none (its target stopped moments
     # before the window opened). A probe instead gets the pandemonium service
     # ENSURED running, matching how pandemonium-tests starts arms.
-    PRISM_DEV_PROBE = {"locality", "golden"}
+    PRISM_DEV_PROBE = {"golden"}
     if args.list or args.dev == []:
         log_info("PRISM -- shine the system through it, read the spectrum:")
         log_info("  (no flag)         the end-user pass: short profile + forensics scrape, one report")
@@ -1368,6 +1370,21 @@ def main() -> int:
         unknown = [n for n in names if n not in PRISM_DEV]
         if unknown:
             log_error(f"unknown --dev workload: {', '.join(unknown)} (try --list)")
+            return 2
+        # NAME COLLISION, CAUGHT RATHER THAN SWALLOWED. prism's own --workload
+        # takes a COMMAND to trace in place of the fixed profile; several
+        # children take --workloads (plural) to SELECT from their own suite.
+        # Passed together the parent won, the child never saw it, and the run
+        # went through the full suite with no error -- the flag looked accepted
+        # and did nothing. Child-private flags travel after `--`.
+        if args.workload or args.attach:
+            flag = "--workload" if args.workload else "--attach"
+            log_error(f"{flag} is prism's own (trace a command you name) and "
+                      f"does not reach a --dev child.")
+            log_error(f"  to select inside a child's suite, pass it after `--`:")
+            log_error(f"    ./pandemonium.py prism --dev {names[0]} "
+                      f"-- --workloads NAME")
+            log_error(f"  the child's own names: ./tests/prism-{names[0]}.py --help")
             return 2
         # SELF-ELEVATE when the run will capture: --trace explicitly passed, OR any
         # selected workload is an unconditional tracer (PRISM_DEV_ROOT). The montauk
@@ -1417,6 +1434,8 @@ def main() -> int:
                 dev_cmd += _sched_flags(n, args.schedulers, args.all_scx)
             if args.iterations > 1:
                 dev_cmd += ["--iterations", str(args.iterations)]
+            if args.cores:
+                dev_cmd += ["--cores", args.cores]
             if args.trace:
                 dev_cmd.append("--trace")
             # Child-private flags last, so a child mode can override a uniform

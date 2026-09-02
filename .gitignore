@@ -21,3 +21,8 @@ benchmark-results/
 # Kernel v7.1 freeze reproducer suite (local only; harness and captures
 # available on request)
 tests/pandemonium-7_1-bug/
+
+# Research / prototyping staging: solver benches, design probes and analysis
+# notes, some referencing confidential sibling research. Local only, graduates
+# into tests/ and the tree once proven. Never shipped.
+tests/research/

@@ -54,6 +54,28 @@ EXCLUDE = {
     "Cargo.lock",
 }
 
+
+def assert_export_is_exactly_include(dst_root):
+    """The export tree may contain WHAT INCLUDE NAMES AND NOTHING ELSE.
+
+    An allowlist that is only consulted while copying is a property of a list
+    someone can edit; this checks the RESULT. Anything that reaches the tree by
+    any route -- a new INCLUDE entry, a stray copy, a file dropped in by hand --
+    fails the export rather than shipping. Nothing needs to be enumerated as
+    forbidden, which is the point: A denylist has to predict what to fear and
+    names it where anyone can read it.
+    """
+    permitted = {e.rstrip("/").split("/")[0] for e in INCLUDE}
+    present = set(os.listdir(dst_root))
+    unexpected = sorted(present - permitted)
+    if unexpected:
+        print("\n  ABORT: the export tree holds entries INCLUDE does not name:")
+        for f in unexpected:
+            print(f"    {f}")
+        shutil.rmtree(dst_root, ignore_errors=True)
+        raise SystemExit(2)
+    print(f"  VERIFY: export tree matches INCLUDE exactly ({len(present)} entries)")
+
 def copy_tree(src_root, dst_root):
     """Copy INCLUDE paths from src_root to dst_root, skipping EXCLUDE."""
     copied = 0
@@ -73,6 +95,12 @@ def copy_tree(src_root, dst_root):
             print(f"  COPY DIR: {entry} ({count} files)")
             copied += count
         else:
+            # EXCLUDE reaches the directory walk through ignore_patterns and never
+            # reached this branch, so a skipped name listed in INCLUDE would have
+            # copied cleanly. Check it here too.
+            if os.path.basename(entry) in EXCLUDE:
+                print(f"  SKIP (excluded): {entry}")
+                continue
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             shutil.copy2(src, dst)
             print(f"  COPY: {entry}")
@@ -671,6 +699,7 @@ def main():
     # STEP 1: COPY
     print("\n#1: COPY SOURCE FILES")
     copied = copy_tree(pand_root, dst_root)
+    assert_export_is_exactly_include(dst_root)
 
     # STEP 2: RENAME CRATE
     print("\n#2: RENAME CRATE")

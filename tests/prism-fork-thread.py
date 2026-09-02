@@ -24,23 +24,20 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.resolve()))
 from pandemonium_common import (
+    start_and_wait, stop_and_wait, find_scheduler, trace_workload, stop_systemd_scheduler,
     LOG_DIR, ARCHIVE_DIR, BINARY,
     get_version, get_git_info,
     log, log_info, log_warn, log_error,
     is_scx_active, scx_scheduler_name,
     wait_for_deactivation,
     montauk_available, MONTAUK_LOG_INTERVAL_MS, MONTAUK, montauk_analyze_argv,
+    montauk_envelope, envelope_report, envelope_gauges, envelope_gauge_by_label, envelope_verdict,
+    envelope_capture,
     table_header, table_row, LABEL_W, PrometheusBuilder,
     mean_stdev, median, get_online_cpus,
 )
 
 sys.path.insert(0, str(Path(__file__).parent.resolve()))
-from importlib import import_module
-_tests = import_module("pandemonium-tests")
-start_and_wait = _tests.start_and_wait
-stop_and_wait = _tests.stop_and_wait
-find_scheduler = _tests.find_scheduler
-trace_workload = _tests.trace_workload
 
 NUM_GROUPS = 24
 NR_LOOPS_FULL = 6000
@@ -54,8 +51,35 @@ NR_LOOPS = NR_LOOPS_FULL  # SET BY main() BASED ON --quick FLAG
 # full iteration below answers "how cheap". Fused, they read latency | cause |
 # cost for one workload in one report.
 BURST_LOOPS = 1500               # short messaging burst for the traced phase
-BURST_WINDOW = 12.0              # hard cap on each traced burst (s)
-ANALYZE = montauk_analyze_argv(shutil.which("montauk") or MONTAUK)
+# THE TRACED BURST'S CAP IS A SAFETY NET, NOT A BUDGET, AND THAT DISTINCTION IS THE
+# WHOLE FIX. It was 12s, chosen when the burst took ~5s, and it worked until the
+# capture cost changed underneath it: sizing montauk's ring so it stops dropping
+# events made the burst slower than the cap, so the load began being CUT instead of
+# COMPLETING -- silently, and unevenly, because EEVDF still finished inside 12s while
+# PANDEMONIUM did not. The slower arm was then handed extra window and booked
+# migrations for the extra seconds alone.
+#
+# THAT FAILURE IS STRUCTURAL, NOT A BAD NUMBER. Any constant standing in for an
+# unknown tracing overhead breaks the next time the overhead moves, and this is the
+# second time this class has bitten -- the first was montauk being starved off its own
+# CPU and dropping 94% of the stream, mitigated by pinning it to a drain core. A
+# mitigation tuned to one day's overhead is not a fix.
+#
+# So the cap no longer participates in the measurement. It is large enough that only a
+# genuinely wedged scheduler reaches it, and reaching it DISCARDS the arm's traced
+# readings rather than reporting a truncated sample as if it were whole. The burst is
+# defined by the WORK it does (BURST_LOOPS), never by the seconds it is allowed.
+BURST_SAFETY = 120.0             # wedge detector; a healthy burst never approaches it
+
+# WHAT THIS BENCH ACTUALLY READS. Every report fork-thread consumes -- wake2run and
+# cross-domain from the sched digest, the locality tiers, dispatch-stall's floored-wake
+# split -- is built from the sched stream; the identity classes are what turn a tid into
+# a named thread for those reports. Nothing here reads io, heap, ntsync, signal or mmap,
+# and on 2026-09-01 those were 38-49% of every capture: A tax levied per event, on the
+# CPU that generated it, and therefore heaviest on whichever arm did the most work. If a
+# report goes quiet after this list changes, the class removed was load-bearing -- add it
+# back rather than dropping the report.
+BURST_CLASSES = "sched,fork,exec,exit,comm"
 
 # WORKLOAD SWEEP -- a cell is one shape of `perf bench sched messaging`: a mode
 # (thread = shared address space; process = separate, the actual fork arm) and a
@@ -232,6 +256,12 @@ def write_prometheus(version, git, stamp, ncpus, cells_data, loops):
                 pb.gauge("burst_locality_tier_pct", f"{mv[1]:.4f}",
                          help="traced-burst migrations at this cache-tier distance (%)",
                          labels=dict(sl, tier=tier))
+            for i, dv in enumerate(loc.get("decay") or []):
+                if dv is not None:
+                    pb.gauge("burst_locality_decay", f"{dv:.4f}",
+                             help="migration density ratio, this cache tier over the "
+                                  "previous one (<1 = density falls with distance)",
+                             labels=dict(sl, step=str(i)))
 
     ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
     path = ARCHIVE_DIR / f"prism-fork-thread-{version}-{stamp}.prom"
@@ -330,15 +360,138 @@ def _cell_block(report, cell, loops, all_results, all_spreads, trace_results):
         if tiers_present:
             report.append("LOCALITY  (traced-burst migrations by cache-tier distance)")
             report.append(table_header("SCHEDULER",
-                          ["MIGRATIONS", *[t.upper() for t in _LOC_TIERS]]))
+                          ["MIGRATIONS", "MIG/S", *[t.upper() for t in _LOC_TIERS],
+                           "DECAY"]))
             for sched_name in all_results:
                 loc = (trace_results.get(sched_name) or {}).get("locality") or {}
                 mig = loc.get("migrations")
-                cells = [str(mig) if mig is not None else "N/A"]
+                rate = loc.get("rate_hz")
+                cells = [str(mig) if mig is not None else "N/A",
+                         f"{rate:.0f}" if rate is not None else "N/A"]
                 for t in _LOC_TIERS:
                     tv = loc.get("tiers", {}).get(t)
                     cells.append(f"{tv[1]:.1f}%" if tv else "-")
+                dec = [d for d in (loc.get("decay") or []) if d is not None]
+                cells.append("/".join(f"{d:.2f}" for d in dec) if dec else "-")
                 report.append(table_row(sched_name, cells))
+            report.append("  decay is each tier's share over the previous one; "
+                          "< 1.00 throughout means density falls with distance. "
+                          "MIG/S is the comparable figure: an arm whose load was "
+                          "CUT at the window ran longer than one that completed, "
+                          "and books migrations for the extra seconds alone.")
+            windows = {n: (trace_results.get(n) or {}) for n in all_results}
+            cut = [n for n, tr in windows.items() if tr.get("load_cut")]
+            done = [n for n, tr in windows.items()
+                    if tr.get("load_cut") is False and tr.get("load_s")]
+            if done:
+                report.append("  BURST  " + "  ".join(
+                    f"{n}={(windows[n] or {}).get('load_s'):.1f}s" for n in done))
+            if cut:
+                report.append(
+                    f"  MISSING ROWS -- {', '.join(cut)} did not finish the burst "
+                    f"inside the {BURST_SAFETY:.0f}s safety net, so its traced "
+                    f"readings were discarded rather than reported truncated. A "
+                    f"healthy burst never reaches the net; investigate that arm "
+                    f"before reading anything else on this cell.")
+            comp = {n: (trace_results.get(n) or {}).get("completeness")
+                    for n in all_results}
+            known = {n: c for n, c in comp.items() if c is not None}
+            if not known:
+                report.append("  CAPTURE  completeness UNKNOWN -- this montauk did not "
+                              "report drop accounting; treat every row as a lower bound.")
+            else:
+                report.append("  CAPTURE  " + "  ".join(
+                    f"{n}={c * 100:.1f}%" for n, c in known.items()))
+                lo, hi = min(known.values()), max(known.values())
+                if len(known) < len(comp):
+                    report.append("  DECLINED -- not every arm reported completeness, so "
+                                  "the arms cannot be shown to be alike. Rows stand "
+                                  "individually; the comparison does not.")
+                elif lo < LOC_COMPLETE_MIN or (hi - lo) > LOC_COMPLETE_SPREAD:
+                    report.append(
+                        f"  DECLINED -- arms captured at unlike completeness "
+                        f"({lo * 100:.1f}%..{hi * 100:.1f}%, band is "
+                        f">={LOC_COMPLETE_MIN * 100:.0f}% within "
+                        f"{LOC_COMPLETE_SPREAD * 100:.0f} points). Counts are lower "
+                        f"bounds and tier shares are biased by which events were lost, "
+                        f"so this table compares sampling as much as scheduling. Raise "
+                        f"the ring (MONTAUK_TRACE_RING) and recapture before quoting it.")
+
+        # FLOORED-WAKE ATTRIBUTION. Beside locality because it answers the
+        # question locality raises: a migration that was not needed is one whose
+        # origin CPU had nothing else to run. DARK is that case measured
+        # directly, and it is the difference between a placement defect and a
+        # saturated machine -- the two look identical in a migration count and
+        # admit opposite fixes.
+        if any((tr or {}).get("stall_class") for tr in trace_results.values()):
+            report.append("")
+            report.append("FLOORED WAKES  (traced burst; why a wake sat past the tick floor)")
+            report.append(table_header("SCHEDULER", ["CLASS", "DARK", "HELD"]))
+            unknown = False
+            for sched_name in all_results:
+                tr = trace_results.get(sched_name) or {}
+                if not tr.get("stall_class"):
+                    continue
+                dk, hd = tr.get("dark_pct"), tr.get("held_pct")
+                if dk is None:
+                    unknown = True
+                report.append(table_row(sched_name, [
+                    tr.get("stall_class", "-"),
+                    f"{dk:.1f}%" if dk is not None else "N/A",
+                    f"{hd:.1f}%" if hd is not None else "N/A"]))
+            if unknown:
+                report.append("  DARK/HELD unavailable -- the capture carried no CPU_IDLE "
+                              "stream, so a floored wake cannot be attributed to an idle "
+                              "origin CPU rather than a busy one. Needs sched_detail.")
+            else:
+                report.append("  DARK = the wake's own CPU sat IDLE through the wait (the "
+                              "move bought nothing); HELD = it was busy (real saturation, "
+                              "and placement cannot reach it).")
+
+        # RUN LENGTH AND SERVICE, beside the tables that argue from them.
+        if any((tr or {}).get("slice_p50_us") for tr in trace_results.values()):
+            report.append("")
+            report.append("RUN LENGTH & SERVICE  (traced burst)")
+            report.append(table_header("SCHEDULER",
+                                       ["SLICE p50", "SLICE p99", "SLICE WORST",
+                                        "INVERSION", "TOP-1 PID", "PIDS"]))
+            for sched_name in all_results:
+                tr = trace_results.get(sched_name) or {}
+                if not tr.get("slice_p50_us"):
+                    continue
+                report.append(table_row(sched_name, [
+                    f"{tr['slice_p50_us']:.1f}us",
+                    f"{tr['slice_p99_us']:.1f}us" if tr.get("slice_p99_us") else "-",
+                    f"{tr['slice_worst_us']:.0f}us" if tr.get("slice_worst_us") else "-",
+                    f"{tr['slice_inversion']:.3f}" if tr.get("slice_inversion") is not None else "-",
+                    f"{tr['service_top1_pct']:.1f}%" if tr.get("service_top1_pct") else "-",
+                    f"{tr['service_pids']:.0f}" if tr.get("service_pids") else "-"]))
+            report.append("  SLICE is what the ordering key's warp is computed FROM "
+                          "(codel_target - last_run_ns), so a population whose runs "
+                          "cluster is a population the warp cannot separate.")
+            report.append("  TOP-1 PID is the busiest process's share of all service "
+                          "across PIDS processes -- the service spread the ordering "
+                          "key produces, not a target it aims at.")
+
+        # CLASS AGREEMENT. montauk's klass is a fixed token per report, meant to be
+        # compared exactly. Two arms of the same run disagreeing is the finding.
+        cls = {n: (trace_results.get(n) or {}).get("classes") or {}
+               for n in all_results}
+        names = [n for n in cls if cls[n]]
+        if len(names) > 1:
+            rows = []
+            for rn in sorted(set().union(*(set(cls[n]) for n in names))):
+                vals = [cls[n].get(rn, "-") for n in names]
+                if len(set(vals)) > 1:
+                    rows.append((rn, vals))
+            if rows:
+                report.append("")
+                report.append("CLASS DISAGREEMENT  (montauk verdict class, per arm)")
+                report.append(table_header("REPORT", names, 22, 24))
+                for rn, vals in rows:
+                    report.append(table_row(rn, vals, 22, 24))
+                report.append("  only reports where the arms DISAGREE are listed; "
+                              "agreement is not a finding.")
             report.append("")
 
 
@@ -425,80 +578,20 @@ def trace_capture(sched_name, cmd, stamp, duration,
                      f"({load_timeout:.0f}s) elapsed -- load cut")
         return elapsed
 
-    rec_dir, _ = trace_workload(sched_name, cmd, TRACE_PATTERN, "fork-thread",
-                                stamp, body, baseline_s=BASELINE_SECONDS,
-                                events=True, pin_cpu=drain)
+    # sched_detail streams CPU_IDLE and the switch-in stints. Without them
+    # placement-race reports NO-IDLE-STREAM and dispatch-stall cannot split a
+    # floored wake into DARK (the CPU sat idle while the task waited elsewhere)
+    # vs HELD (genuinely busy) -- which is the one reading that separates a
+    # placement defect from real saturation. No prism bench passed it before.
+    rec_dir, elapsed = trace_workload(sched_name, cmd, TRACE_PATTERN, "fork-thread",
+                                      stamp, body, baseline_s=BASELINE_SECONDS,
+                                      events=True, pin_cpu=drain, sched_detail=True,
+                                      trace_classes=BURST_CLASSES)
     if rec_dir is not None:
         log_info(f"[{sched_name}] recording: {rec_dir}")
-    return rec_dir
-
-
-def run_trace(args):
-    if os.geteuid() != 0:
-        # SELF-ELEVATE: the trace flow needs root end-to-end (montauk eBPF attach
-        # + sched_ext load), so re-exec under sudo rather than make the user type
-        # it -- matches how every other command elevates its own privileged steps.
-        os.execvp("sudo", ["sudo", sys.executable, *sys.argv])
-    if not montauk_available():
-        log_error(f"montauk not found at {MONTAUK}")
-        return 1
-
-    ver = get_version()
-    git = get_git_info()
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    if not log.child:
-        log_info(f"prism-fork-thread --trace v{ver} [{git['commit']}]  "
-                 f"trace='{TRACE_PATTERN}'  interval={MONTAUK_LOG_INTERVAL_MS}ms  "
-                 f"load=perf bench sched messaging -t -g {NUM_GROUPS} -l {NR_LOOPS}")
-        log.blank()
-
-    if is_scx_active():
-        log_warn(f"sched_ext active ({scx_scheduler_name()}) -- stopping pandemonium")
-        _tests.stop_systemd_scheduler()
-        wait_for_deactivation(5.0)
-    time.sleep(1)
-
-    # Field: EEVDF baseline + PANDEMONIUM (BPF + ADAPTIVE) by default. --all-scx
-    # adds every installed scx; --schedulers L runs EEVDF vs EXACTLY L (PANDEMONIUM
-    # only if named) -- matching field_arms / prism-cachyos. --pandemonium-only
-    # drops EEVDF and externals. EEVDF rides along whenever a field is requested.
-    _sched = getattr(args, "schedulers", "") or ""
-    _all = getattr(args, "all_scx", False)
-    _field_only = bool(_sched) and not _all and not args.pandemonium_only
-    _named = {s.strip().lower() for s in _sched.split(",")} if _sched else set()
-    entries: list[tuple[str, list[str] | None]] = []
-    if not args.pandemonium_only and (args.compare_eevdf or _sched or _all):
-        entries.append(("EEVDF", None))
-    if (not _field_only) or (_named & {"pandemonium", "scx_pandemonium"}):
-        entries.append(("PANDEMONIUM (BPF)", [str(BINARY), "--no-adaptive"]))
-        entries.append(("PANDEMONIUM (ADAPTIVE)", [str(BINARY)]))
-    if not args.pandemonium_only:
-        ext = _tests.SCX_FIELD if _all else [s.strip() for s in _sched.split(",")]
-        for e in ext:
-            if not e or e.lower() in ("pandemonium", "scx_pandemonium", "eevdf"):
-                continue
-            if find_scheduler(e):
-                entries.append((e, [e]))
-            else:
-                log_warn(f"  external scheduler {e} not found in PATH, skipping")
-
-    recs = {}
-    try:
-        for name, cmd in entries:
-            recs[name] = trace_capture(name, cmd, stamp, args.duration)
-            time.sleep(2)
-            print()
-    except KeyboardInterrupt:
-        log.interrupted()
-    finally:
-        if is_scx_active():
-            wait_for_deactivation(5.0)
-
-    print()
-    log_info("Recordings (inspect montauk_trace_thread_* over montauk_scrape_timestamp_ms):")
-    for n, r in recs.items():
-        log_info(f"  {n}: {r}")
-    return 0
+    # elapsed is None when the safety net fired. The caller DISCARDS the arm on
+    # that, so the fact has to survive the return rather than staying in the log.
+    return rec_dir, elapsed
 
 
 # ---- phase 1: short traced burst -> wake2run latency + placement locality ----
@@ -509,18 +602,16 @@ def run_trace(args):
 
 _LOC_TIERS = ("same-L2", "same-L3", "same-socket", "cross-socket")
 
-
-def _json_out(argv):
-    """Parsed --json envelope from a `montauk --analyze` invocation, or None."""
-    import json as _json
-    r = subprocess.run(argv, capture_output=True, text=True, timeout=90)
-    if r.returncode != 0 or not r.stdout.strip():
-        return None
-    try:
-        return _json.loads(r.stdout)
-    except ValueError:
-        log_warn(f"unparseable envelope from {' '.join(argv[1:3])}")
-        return None
+# COMPARABILITY BAND FOR A TRACED CROSS-ARM READING. Migration counts are lower
+# bounds under loss and tier shares are biased by WHICH events were lost, so two
+# arms are only comparable when both captured nearly whole AND captured alike.
+# The failure this guards is not hypothetical: on 2026-09-01 the EEVDF arm
+# captured at 37.2% against the BPF arm's 81.4% and the table said nothing, and
+# the bias runs one way -- the faster arm offers a higher event rate, overruns
+# the ring harder and drops more, so the throughput winner is always the arm
+# whose locality is least sampled.
+LOC_COMPLETE_MIN = 0.95     # every arm must clear this
+LOC_COMPLETE_SPREAD = 0.05  # and the arms must agree within this
 
 
 def _locality_from_env(env):
@@ -529,11 +620,23 @@ def _locality_from_env(env):
     the tier percentages are shares of it. No cache_topology in the recording
     means no tier gauges, which reads back as the empty result the report renders
     as N/A."""
-    out = {"migrations": None, "tiers": {}}
+    out = {"migrations": None, "rate_hz": None, "tiers": {}, "decay": [],
+           "monotonic": None}
     if not env:
         return out
     rep = next((r for r in (env.get("reports") or [])
                 if r.get("name") == "locality"), {})
+    # A COUNT IS ONLY COMPARABLE ACROSS ARMS THAT RAN THE SAME WINDOW, AND THEY DO
+    # NOT. The burst has a hard cap (BURST_SAFETY); an arm whose load COMPLETES
+    # inside it stops early while an arm whose load is CUT runs the whole thing,
+    # so the slower arm is handed more seconds and books more migrations for that
+    # reason alone. Measured 2026-09-01: EEVDF captured 13.4s against
+    # PANDEMONIUM's 15.4s, which inflates the raw count ratio to 7.44x against a
+    # rate ratio of 6.45x. montauk already publishes the rate; prism was printing
+    # the count. Same bias as the completeness one, one layer down.
+    for g in rep.get("gauges") or []:
+        if g.get("name") == "montauk_analysis_locality_migration_rate_hz":
+            out["rate_hz"] = float(g.get("value", 0.0))
     moves = {}
     for g in rep.get("gauges") or []:
         if g.get("name") != "montauk_analysis_locality_tier_moves":
@@ -551,6 +654,17 @@ def _locality_from_env(env):
         v = moves.get(tier.replace("-", "_").lower())
         if v is not None:
             out["tiers"][tier] = (int(v), (100.0 * v / total) if total else 0.0)
+    # TIER-TO-TIER DECAY, folded in from the standalone locality probe: the
+    # ratio of each tier's share to the one before it. Under 1.0 across the
+    # board means migration density FALLS with distance -- placement is paying
+    # for distance. Over 1.0 means the scheduler prefers the farther seat, which
+    # is the defect the R_eff work exists to remove. The distribution alone
+    # cannot say which; that is why this is the screening signal.
+    seq = [out["tiers"][t][1] for t in _LOC_TIERS if t in out["tiers"]]
+    out["decay"] = [round(b / a, 3) if a > 0 else None
+                    for a, b in zip(seq, seq[1:])]
+    known = [d for d in out["decay"] if d is not None]
+    out["monotonic"] = all(d <= 1.0 for d in known) if known else None
     return out
 
 
@@ -568,10 +682,37 @@ def analyze_trace(rec_dir):
     if rec_dir is None or not Path(rec_dir).exists():
         return out
     try:
-        dig = _json_out([*ANALYZE, str(rec_dir), "--digest", "--json"])
+        dig = montauk_envelope(rec_dir)
         if dig:
-            sched = next((r for r in (dig.get("reports") or [])
-                          if r.get("name") == "sched"), {})
+            # CAPTURE COMPLETENESS RIDES WITH EVERY READING TAKEN FROM IT. A tier
+            # share off a partial stream is a weaker claim than the same share off
+            # a whole one, and two arms captured at different rates compare their
+            # sampling as much as their scheduling. montauk reports absence rather
+            # than zero when a capture predates drop accounting, so a missing key
+            # means UNKNOWN loss, never proven-clean.
+            # The DIGEST envelope carries these under "digest"; only the full
+            # --analyze envelope has a top-level "trace". Reading the wrong one
+            # reports UNKNOWN on a capture that knew perfectly well.
+            out.update(envelope_capture(dig))
+            # THE FLOORED-WAKE SPLIT. dispatch-stall rides in the same digest
+            # envelope, so this costs no second analyzer run. PREEMPT-STARVED
+            # says the CPU never picked anything else while the wakee waited;
+            # DARK vs HELD says WHY, and only with CPU_IDLE on the stream:
+            # DARK is the run-CPU sitting IDLE through the wait (a wake placed
+            # somewhere it did not need to be), HELD is a genuinely busy CPU
+            # (real saturation, and no placement change reaches it). montauk
+            # appends the split to its own verdict when it can compute it, so an
+            # absent dark_pct means the capture lacked CPU_IDLE, never that the
+            # split is zero.
+            stall = envelope_report(dig, "dispatch-stall")
+            if stall:
+                out["stall_class"], out["stall_verdict"] = envelope_verdict(stall)
+                sg = envelope_gauges(stall)
+                if "montauk_analysis_dispatch_dark_pct" in sg:
+                    out["dark_pct"] = float(sg["montauk_analysis_dispatch_dark_pct"])
+                if "montauk_analysis_dispatch_held_pct" in sg:
+                    out["held_pct"] = float(sg["montauk_analysis_dispatch_held_pct"])
+            sched = envelope_report(dig, "sched")
             w = sched.get("wake2run") or {}
             if w.get("p99_us") is not None:
                 out["p99_us"] = int(round(w["p99_us"]))
@@ -587,9 +728,50 @@ def analyze_trace(rec_dir):
         if not events.is_file():
             events = Path(rec_dir) / "events.bin"
         if events.is_file():
-            out["locality"] = _locality_from_env(
-                _json_out([*ANALYZE, str(events), "--report", "locality",
-                           "--json"]))
+            # A DIGEST CARRIES THREE REPORTS; THE STREAM CARRIES TWENTY-NINE.
+            # `--digest` folds sched, dispatch-stall and kstrand and nothing
+            # else, so slice, service, locality and every klass beyond those two
+            # are simply absent from it -- reading them off the digest returns
+            # empty and looks like a capture that did not carry them. One full
+            # envelope over the stream replaces the single-report locality read
+            # this used to do, so it costs no extra analyzer run.
+            ev = montauk_envelope(events)
+            out["locality"] = _locality_from_env(ev)
+            if ev:
+                # SLICE IS WHAT THE ORDERING KEY'S WARP IS COMPUTED FROM
+                # (codel_target - last_run_ns), so the spread of dispatched run
+                # lengths bounds how far the warp can reorder at all. service is
+                # the per-PID service spread: top1_pct is the busiest PID's share
+                # of all service, across service_pids processes. Both shipped in
+                # every capture and were read by nobody.
+                sq = envelope_gauge_by_label(envelope_report(ev, "slice"),
+                                            "montauk_analysis_slice_us",
+                                            "quantile")
+                for lab, k in (("0.5", "slice_p50_us"), ("0.99", "slice_p99_us"),
+                               ("worst", "slice_worst_us")):
+                    if lab in sq:
+                        out[k] = float(sq[lab])
+                sl = envelope_gauges(envelope_report(ev, "slice"))
+                if "montauk_analysis_slice_trajectory_inversion" in sl:
+                    out["slice_inversion"] = float(
+                        sl["montauk_analysis_slice_trajectory_inversion"])
+                sg = envelope_gauges(envelope_report(ev, "service"))
+                for g, k in (("montauk_analysis_service_top1_pct", "service_top1_pct"),
+                             ("montauk_analysis_service_pids", "service_pids")):
+                    if g in sg:
+                        out[k] = float(sg[g])
+                # EVERY REPORT CARRIES A klass AND NOTHING COMPARED THEM. A class
+                # differing between two arms of the SAME run is a finding --
+                # SATURATED against PLACEMENT-MISS, ORDER-STARVED against
+                # PREEMPT-STARVED -- and this release caught those only because
+                # they were printed by hand at a terminal.
+                out["classes"] = {}
+                for rn in ("sched", "locality", "dispatch-stall",
+                           "placement-race", "work-conservation", "slice",
+                           "service", "seat"):
+                    k, _ = envelope_verdict(envelope_report(ev, rn))
+                    if k:
+                        out["classes"][rn] = k
     except (subprocess.TimeoutExpired, OSError) as e:
         log_warn(f"montauk --analyze failed on {rec_dir}: {e}")
     return out
@@ -602,14 +784,34 @@ def run_burst_phase(entries, stamp, cell):
     The full perf-stat iteration of the same cell runs after. Returns
     {sched_name: readings}."""
     log_info(f"PHASE 1 [{cell.label}]: traced burst (-l {BURST_LOOPS}, "
-             f"<= {BURST_WINDOW:.0f}s/arm, montauk) -- wake2run + locality")
+             f"<= {BURST_SAFETY:.0f}s/arm, montauk) -- wake2run + locality")
     print()
     trace_results = {}
     for name, cmd in entries:
-        rec_dir = trace_capture(name, cmd, stamp, BURST_WINDOW,
-                                groups=cell.groups, threaded=cell.threaded,
-                                loops=BURST_LOOPS)
+        rec_dir, elapsed = trace_capture(name, cmd, stamp, BURST_SAFETY,
+                                         groups=cell.groups, threaded=cell.threaded,
+                                         loops=BURST_LOOPS)
+        # A CUT LOAD IS A DISCARDED MEASUREMENT, NOT A SMALLER ONE. elapsed is
+        # None when the safety net fired, which means the workload never
+        # finished -- so the capture covers an arbitrary prefix of it, and how
+        # much depends on how slow THIS arm happened to be. Reporting it beside
+        # an arm that completed compares a prefix against a whole, which is the
+        # exact bias this bench keeps rediscovering. Reaching the net is a
+        # failure of the run, so it is reported as one and the arm contributes
+        # no traced row. The perf-stat phase is untouched and still reports.
+        if elapsed is None:
+            log_error(f"[{name}] load did not finish inside the "
+                      f"{BURST_SAFETY:.0f}s safety net -- traced readings for "
+                      f"this arm are DISCARDED (a truncated burst is not a "
+                      f"smaller sample, it is a different one)")
+            trace_results[name] = {"load_cut": True, "load_s": None}
+            time.sleep(2)
+            print()
+            continue
         readings = analyze_trace(rec_dir)
+        if readings:
+            readings["load_cut"] = False
+            readings["load_s"] = elapsed
         trace_results[name] = readings
         if readings:
             p99 = readings.get("p99_us")
@@ -686,13 +888,9 @@ def main():
                          f"e.g. '2,8,24'. Default '{DEFAULT_GROUPS}'. modes x groups "
                          "is the cell grid; every cell is read on all three axes.")
     ap.add_argument("--trace", action="store_true",
-                    help="Capture a montauk eBPF trace of the storm (per-thread "
-                         "dispatch flight recording) instead of the timing run. Root.")
-    ap.add_argument("--compare-eevdf", action="store_true",
-                    help="With --trace: also record EEVDF as the clean reference")
-    ap.add_argument("--duration", type=float, default=0,
-                    help="With --trace: capture window seconds (0 = bench to "
-                         "completion, hard-capped at 180s)")
+                    help="Accepted and ignored: PHASE 1 already records a montauk "
+                         "trace on every run. Kept because prism's unified --dev "
+                         "contract passes it to every child.")
     ap.add_argument("--iterations", type=int, default=1,
                     help="Run each scheduler N times. The MEDIAN is the headline "
                          "(robust to a poisoned outlier run); the per-iteration "
@@ -700,7 +898,7 @@ def main():
                          "the report and archive so a delta can be judged against "
                          "the noise. Default 1.")
     ap.add_argument("--schedulers", type=str, default="",
-                    help="With --trace: comma-separated external scx field "
+                    help="Comma-separated external scx field "
                          "(EEVDF baseline always; PANDEMONIUM only if named). "
                          "Runs EEVDF vs exactly the named schedulers.")
     ap.add_argument("--all-scx", action="store_true",
@@ -719,15 +917,14 @@ def main():
                          "0 = Phi off) plus the topology default and EEVDF. Bare "
                          "--phi-sweep tests {0, default}. Isolates Phi's marginal "
                          "effect on this CPU's CCX layout.")
+    ap.add_argument("--cores", type=str, default=None,
+                    help="Accepted for suite uniformity; the storm runs at native width (the fork rate IS the axis)")
     args = ap.parse_args()
     if args.iterations < 1:
         args.iterations = 1
 
     global NR_LOOPS
     NR_LOOPS = NR_LOOPS_QUICK if args.quick else NR_LOOPS_FULL
-
-    if args.trace:
-        return run_trace(args)
 
     # PHASE 1 gate: the traced burst (wake2run latency + placement locality) runs
     # by default, but not for --phi-sweep (a focused cost A/B), not under --no-burst,
@@ -762,7 +959,7 @@ def main():
     if is_scx_active():
         name = scx_scheduler_name()
         log_warn(f"sched_ext is active ({name}) -- stopping pandemonium service")
-        _tests.stop_systemd_scheduler()
+        stop_systemd_scheduler()
         if not wait_for_deactivation(5.0):
             log_error("Could not deactivate sched_ext")
             return 1

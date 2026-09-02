@@ -50,6 +50,8 @@ from typing import Callable, Optional
 
 sys.path.insert(0, str(Path(__file__).parent.parent.resolve()))
 from pandemonium_common import (
+    table_header, table_row,
+    start_and_wait, stop_and_wait, find_scheduler, stop_systemd_scheduler,
     ARCHIVE_DIR, BINARY, LOG_DIR,
     get_git_info, get_version,
     is_scx_active, log, log_error, log_info, log_warn,
@@ -58,11 +60,6 @@ from pandemonium_common import (
  warm_sudo, refresh_sudo,)
 
 sys.path.insert(0, str(Path(__file__).parent.resolve()))
-from importlib import import_module
-_tests = import_module("pandemonium-tests")
-start_and_wait = _tests.start_and_wait
-stop_and_wait = _tests.stop_and_wait
-find_scheduler = _tests.find_scheduler
 
 # ASSET DIRECTORY. PERSISTENT TEST CORPUS, GENERATED FFMPEG CLONE,
 # AND GENERATED XZ INPUT FILE LIVE HERE BETWEEN INVOCATIONS.
@@ -588,10 +585,11 @@ def write_report(ver: str, git: dict, stamp: str, ncpus: int,
     ]
     sched_names = list(results.keys())
     # PER-WORKLOAD COMPARISON TABLE: WORKLOAD x SCHEDULER.
-    header = f"{'WORKLOAD':<32}" + "".join(f"{s:>22}" for s in sched_names)
-    lines.append(header)
+    # Shared table helpers, not hand-rolled widths: one separator convention
+    # across every bench that prints a comparison table.
+    lines.append(table_header("WORKLOAD", sched_names, 32, 21))
     for wl_name in wl_order:
-        row = f"{wl_name:<32}"
+        row_cells = []
         # FIND WINNER FOR THIS ROW (LOWEST MEAN).
         winners = []
         means = {}
@@ -604,17 +602,15 @@ def write_report(ver: str, git: dict, stamp: str, ncpus: int,
         for s in sched_names:
             v = results[s].get(wl_name)
             if v is None or v[0] is None:
-                cell = "skip/fail"
-                row += f"{cell:>22}"
+                row_cells.append("skip/fail")
             else:
                 mean, sd = v
                 tag = "*" if (mean - best) < 1e-9 and mean == best else " "
-                cell = f"{mean:8.3f}s ±{sd:6.3f}{tag}"
-                row += f"{cell:>22}"
-        lines.append(row)
+                row_cells.append(f"{mean:8.3f}s ±{sd:6.3f}{tag}")
+        lines.append(table_row(wl_name, row_cells, 32, 21))
     # TOTALS ROW (SUM OF PER-WORKLOAD MEANS).
     lines.append("")
-    totals_row = f"{'TOTAL TIME':<32}"
+    totals_cells = []
     totals = {}
     for s in sched_names:
         total = 0.0
@@ -631,13 +627,11 @@ def write_report(ver: str, git: dict, stamp: str, ncpus: int,
         best = min(totals.values())
         for s in sched_names:
             if s not in totals:
-                cell = "incomplete"
-                totals_row += f"{cell:>22}"
+                totals_cells.append("incomplete")
             else:
                 tag = "*" if (totals[s] - best) < 1e-9 and totals[s] == best else " "
-                cell = f"{totals[s]:8.3f}s{tag}"
-                totals_row += f"{cell:>22}"
-        lines.append(totals_row)
+                totals_cells.append(f"{totals[s]:8.3f}s{tag}")
+        lines.append(table_row("TOTAL TIME", totals_cells, 32, 21))
         lines.append("")
         lines.append("* MARKS WINNER (LOWEST MEAN) PER ROW")
     text = "\n".join(lines) + "\n"
@@ -821,6 +815,8 @@ def main() -> int:
                          "scheduler x workload matrix with montauk recording each "
                          "workload's computation (preempt/migration/thread data) "
                          "to /tmp/pandemonium. Wall-times are contaminated; ignored.")
+    ap.add_argument("--cores", type=str, default=None,
+                    help="Accepted for suite uniformity; the cachyos suite runs each workload at native width")
     args = ap.parse_args()
 
     warm_sudo()
@@ -902,7 +898,7 @@ def main() -> int:
     if is_scx_active():
         name = scx_scheduler_name()
         log_warn(f"sched_ext is active ({name}) -- stopping pandemonium service")
-        _tests.stop_systemd_scheduler()
+        stop_systemd_scheduler()
         if not wait_for_deactivation(5.0):
             log_error("Could not deactivate sched_ext")
             return 1

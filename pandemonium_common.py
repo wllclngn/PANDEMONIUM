@@ -8,6 +8,7 @@ import glob
 import math
 import os
 import platform
+import re
 import shutil
 import atexit
 import signal
@@ -457,7 +458,119 @@ def envelope_report(envelope, name: str) -> dict:
     for rep in envelope.get("reports", []):
         if rep.get("name") == name:
             return rep
+    # A DIGEST PUBLISHES THREE REPORTS IN FULL AND ALL 28 CONCLUSIONS BESIDE
+    # THEM. montauk keeps `reports` to the headline set on purpose -- the digest
+    # is the KB-scale shareable artifact -- and carries {name, class, verdict}
+    # for EVERY report in `conclusions` precisely so a structured consumer picks
+    # for its own audience instead of montauk picking three on its behalf. A
+    # reader that only walks `reports` gets nothing for a class the envelope is
+    # holding, which reads as a capture that did not carry it. It did.
+    for con in envelope.get("conclusions", []):
+        if con.get("name") == name:
+            return con
     return envelope if envelope.get("name") == name else {}
+
+
+def montauk_envelope(target, *, digest: bool | None = None,
+                     report: str | None = None):
+    """The montauk --json envelope for a capture, or None.
+
+    THE ONE PLACE THE SUITE OPENS AN ENVELOPE. montauk publishes a typed result
+    per report -- verdict, klass, gauges, offenders -- and the benches were each
+    reaching into the JSON by hand for the two or three fields they happened to
+    want. That is why 21 of montauk's 29 reports had no reader: Not a decision,
+    just that every one of them would have cost another bespoke parser. This trio
+    existed and only prism-locality (orphaned) and prism-strand ever called it.
+
+    THE TARGET'S SHAPE PICKS THE MODE, because `--digest` is accepted for a
+    RECORDING DIRECTORY and rejected for a bare .events FILE -- `unknown flag
+    '--digest'`, which is what a caller gets for passing the sibling events path
+    to a function defaulting the other way. Defaulting `digest` to the answer to
+    "is this a directory" removes the one thing the caller was expected to
+    remember and got wrong. Pass it explicitly only to override.
+
+    `digest` reads the digest envelope, which carries capture completeness.
+    `report` reads one named report over an event stream and never digests.
+    """
+    import json as _json
+    if digest is None:
+        digest = Path(target).is_dir()
+    argv = [*montauk_analyze_argv(), str(target)]
+    argv += ["--report", report] if report else (["--digest"] if digest else [])
+    rc, so, se = run_cmd_capture(argv + ["--json"])
+    if rc != 0 or not so.strip():
+        log_warn(f"montauk --analyze produced no envelope for {target} "
+                 f"(rc={rc}): {se.strip()[:160]}")
+        return None
+    try:
+        return _json.loads(so)
+    except ValueError:
+        log_warn(f"montauk --analyze emitted an unparseable envelope for {target}")
+        return None
+
+
+def envelope_gauge_by_label(report_dict: dict, name: str, label: str) -> dict:
+    """{label_value: gauge_value} for a gauge published once PER LABEL.
+
+    montauk emits a distribution as ONE gauge name repeated across a label --
+    montauk_analysis_slice_us at quantile="0.5", "0.99", "worst" -- and
+    envelope_gauges() keys by name alone, so it keeps the first and drops the
+    rest silently. A caller reading a p99 out of it gets the p50 and no error.
+    """
+    out = {}
+    for g in report_dict.get("gauges") or []:
+        if g.get("name") != name or "value" not in g:
+            continue
+        m = re.search(rf'{re.escape(label)}="([^"]+)"', g.get("labels", "") or "")
+        if m:
+            out[m.group(1)] = g["value"]
+    return out
+
+
+def envelope_verdict(report_dict: dict) -> tuple[str, str]:
+    """(klass, verdict) for one report. klass is the COMPARABLE half.
+
+    montauk keeps these separate on purpose: The verdict sentence carries numbers
+    and therefore drifts, while klass is a short token from a small fixed set --
+    "what a behavioral golden can compare EXACTLY, which is the whole reason it
+    exists separately rather than being parsed back out of the prose". The suite
+    had never compared one, so a class flipping between two arms of the same run
+    (SATURATED vs PLACEMENT-MISS, ORDER-STARVED vs PREEMPT-STARVED) went unread.
+    """
+    return (report_dict.get("class") or "",
+            report_dict.get("verdict") or "")
+
+
+def envelope_offenders(report_dict: dict) -> list:
+    """The ranked misbehaving entities one report names, worst first.
+
+    montauk ranks these by severity across every report and the suite printed
+    tables that never said WHO. Each entry is {kind, id, obj, metric, value, sev}.
+    """
+    offs = report_dict.get("offenders") or []
+    return sorted(offs, key=lambda o: (-int(o.get("sev", 0)),
+                                       -float(o.get("value", 0) or 0)))
+
+
+def envelope_capture(envelope) -> dict:
+    """Capture completeness for an envelope, however it is shaped.
+
+    The DIGEST envelope carries these under "digest"; only the full --analyze
+    envelope has a top-level "trace". Reading the wrong one reports UNKNOWN on a
+    capture that knew perfectly well, which is a mistake this suite has already
+    made once. Absent keys mean UNKNOWN loss, never proven-clean -- montauk
+    reports absence rather than zero when a capture predates drop accounting.
+    """
+    if not isinstance(envelope, dict):
+        return {}
+    src = envelope.get("digest") if isinstance(envelope.get("digest"), dict) else None
+    if src is None or "capture_completeness" not in src:
+        src = envelope.get("trace") if isinstance(envelope.get("trace"), dict) else src
+    if not isinstance(src, dict) or "capture_completeness" not in src:
+        return {}
+    return {"completeness": float(src["capture_completeness"]),
+            "dropped": int(src.get("dropped_events", 0)),
+            "observed": int(src.get("events_observed", src.get("events", 0)))}
 
 
 def envelope_gauges(report_dict: dict) -> dict:
@@ -536,18 +649,35 @@ LABEL_W = 28   # canonical label (first) column width
 COL_W = 10     # canonical numeric column width
 
 
+def _table_widths(n: int, col_w):
+    """Per-column widths from either one width for all, or one per column.
+
+    A single int was the original contract and covers most tables. Benches whose
+    columns are genuinely different sizes -- a 5-wide run count beside a 10-wide
+    wall time -- had to hand-roll their rows instead, which is why two of them
+    never adopted these helpers at all. A sequence is accepted and recycled if
+    it is short, so the caller states widths once.
+    """
+    if isinstance(col_w, int):
+        return [col_w] * n
+    w = list(col_w)
+    return [w[i % len(w)] for i in range(n)] if w else [COL_W] * n
+
+
 def table_header(label: str, columns: list[str],
-                 label_w: int = LABEL_W, col_w: int = COL_W) -> str:
+                 label_w: int = LABEL_W, col_w=COL_W) -> str:
     """A header row: left-justified label, right-justified column names."""
-    body = "".join(f" {c:>{col_w}}" for c in columns)
+    ws = _table_widths(len(columns), col_w)
+    body = "".join(f" {c:>{w}}" for c, w in zip(columns, ws))
     return f"{label:<{label_w}}{body}"
 
 
 def table_row(label: str, cells: list[str],
-              label_w: int = LABEL_W, col_w: int = COL_W) -> str:
+              label_w: int = LABEL_W, col_w=COL_W) -> str:
     """A data row. `cells` are pre-formatted strings (caller owns precision and
     units) so the same helper serves times, counts, percentages, and ratios."""
-    body = "".join(f" {c:>{col_w}}" for c in cells)
+    ws = _table_widths(len(cells), col_w)
+    body = "".join(f" {c:>{w}}" for c, w in zip(cells, ws))
     return f"{label:<{label_w}}{body}"
 
 
@@ -784,6 +914,22 @@ def wait_for_no_scheduler(timeout: float = 10.0) -> bool:
 # cleanup anywhere else. (The old per-guard SIGINT missed the systemd scheduler
 # and left the box stuck on a CPU subset; this does not.)
 
+# DID THIS PROCESS PUT A SCHEDULER ON THE BOX? The exit guard installs at IMPORT of
+# the suite, and eject_scheduler stops whatever scx is active without asking who
+# started it -- so any process that merely IMPORTS the suite (a unit test loading a
+# bench module to check its renderer, for one) would eject a scheduler the user was
+# running, on its way out. Observed 2026-09-01; it only failed to land because the
+# sudo prompt had no tty. Ejecting is correct for a run that ACTIVATED something and
+# wrong for one that did not, and the two are told apart by this flag, not by which
+# entry point was used.
+_WE_ACTIVATED = [False]
+
+
+def note_scheduler_activated() -> None:
+    """Record that THIS process activated a scheduler, so exit teardown may eject it."""
+    _WE_ACTIVATED[0] = True
+
+
 def eject_scheduler(trace_mode: bool = False, interrupted: bool = False) -> None:
     """Leave NO sched_ext scheduler registered. In trace_mode the user's CURRENT
     scheduler is theirs -- never eject it. systemctl stop, then force-kill by exact
@@ -796,6 +942,9 @@ def eject_scheduler(trace_mode: bool = False, interrupted: bool = False) -> None
     aborted one and flatly contradicted the report's own "scheduler ran clean"
     verdict written seconds earlier. Same teardown either way, honest label."""
     if trace_mode or not is_scx_active():
+        return
+    if not _WE_ACTIVATED[0]:
+        # Someone else's scheduler. Leave it exactly as found.
         return
     name = scx_scheduler_name()
     if interrupted:
@@ -918,6 +1067,15 @@ def montauk_decode_argv(binary: str | None = None) -> list[str]:
 
 MONTAUK_ATTACH_TIMEOUT = 10.0
 MONTAUK_LOG_INTERVAL_MS = 100
+# BPF RING SIZE FOR EVERY TRACED CAPTURE. montauk's default is 1M and its own --help names
+# sched-messaging as the workload that default was never sized against: ~2.8M events/s
+# offered against ~254k/s drained. Measured here 2026-09-01 on one --dev fork-thread run,
+# EEVDF captured at 37.2% completeness against the BPF arm's 81.4% -- so the locality table
+# compared a 37% sample to an 81% one. The bias is systematic, not random: The faster arm
+# finishes sooner, offers a higher event rate, overruns the ring harder and drops more, so
+# whichever arm wins on throughput is the arm whose locality is least sampled. This lives
+# on the shared launcher because every bench inherits the same offered rate.
+MONTAUK_TRACE_RING = "256M"
 # QUIESCENT TAIL: Seconds montauk keeps recording AFTER the workload stops.
 #
 # A capture that ends with its workload cannot say what a still-open strand
@@ -1021,8 +1179,15 @@ class DmesgMonitor:
 
         if stamp is None:
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        dmesg_path = LOG_DIR / f"dmesg-{stamp}.log"
+        # A SUBDIRECTORY, NOT THE ARCHIVE ROOT. Every run wrote one of these
+        # beside the logs an operator reads, and most carry nothing but the
+        # sched_ext enable/disable pair. Keeping the content but moving it out
+        # of the listing is the whole fix; a filtered snapshot is also NOT a
+        # substitute for the journal, which is where a watchdog ejection this
+        # capture never saw was found.
+        dmesg_dir = LOG_DIR / "dmesg"
+        dmesg_dir.mkdir(parents=True, exist_ok=True)
+        dmesg_path = dmesg_dir / f"{stamp}.log"
         dmesg_path.write_text("\n".join(new_lines) + "\n")
 
         filtered = [l for l in new_lines
@@ -1066,8 +1231,8 @@ class MontaukTrace:
     def __init__(self, pattern, label, stamp, log_dir=TRACE_DIR,
                  interval_ms=MONTAUK_LOG_INTERVAL_MS, baseline_s=0.0,
                  attach_timeout=MONTAUK_ATTACH_TIMEOUT, events=False,
-                 pin_cpu=None, sched_detail=False,
-                 quiesce_s=MONTAUK_QUIESCE_S):
+                 pin_cpu=None, sched_detail=False, scx_dsq=False,
+                 trace_classes=None, quiesce_s=MONTAUK_QUIESCE_S):
         # quiesce_s: the mirror of baseline_s. baseline_s records quiet BEFORE
         # the workload; this records quiet AFTER it, so a strand still open when
         # the workload stopped is observed against an idle system rather than
@@ -1080,6 +1245,23 @@ class MontaukTrace:
         # streams CPU_IDLE." Off by default -- extra event volume, opt in
         # where that split is the actual question.
         self.sched_detail = sched_detail
+        # trace_classes: capture ONLY the event classes this bench reads. The cost
+        # of tracing is paid per event by the CPU that generates it, so a class
+        # nobody reads is a tax on the measurement -- and it is not a flat tax,
+        # because the arm that does more work emits more events and pays more of
+        # it. Measured 2026-09-01 on fork-thread, which reads sched exclusively:
+        # 38-49% of every capture was IO events, and the tax they levied pushed
+        # the PANDEMONIUM arms past the burst window while EEVDF still finished
+        # inside it. montauk never reserves an excluded class, so this removes the
+        # cost rather than moving it. Declare what the bench READS; a report that
+        # goes quiet after a change here is a class that was load-bearing.
+        self.trace_classes = trace_classes
+        # scx_dsq: arm montauk's placement/drain attribution probes for THIS
+        # capture (MONTAUK_SCX_DSQ). Same hazard class as the storm probes and
+        # scrubbed by the same rule below, so a bench that wants the
+        # placement-versus-drain split asks for it here rather than by exporting
+        # a variable that every other capture would inherit.
+        self.scx_dsq = scx_dsq
         # pin_cpu: taskset montauk to a dedicated CPU so it always drains its
         # ring buffer -- under a saturated workload an unpinned montauk gets
         # starved and DROPS events (400ms+ capture holes), making a per-event
@@ -1103,22 +1285,31 @@ class MontaukTrace:
         self.dir.mkdir(parents=True, exist_ok=True)
         self._out = open(self.stdout_path, "w")
         cmd = [MONTAUK, "--trace", self.pattern, "--log", str(self.dir),
-               "--log-interval-ms", str(self.interval_ms)]
+               "--log-interval-ms", str(self.interval_ms),
+               "--trace-ring-bytes", MONTAUK_TRACE_RING]
         if self.events_path is not None:
             cmd += ["--trace-out", str(self.events_path)]
         if self.sched_detail:
             cmd += ["--sched-detail"]
+        if self.trace_classes:
+            cmd += ["--trace-classes", self.trace_classes]
         if self.pin_cpu is not None:
             cmd = ["taskset", "-c", str(self.pin_cpu)] + cmd
-        # SCRUB THE STORM PROBES FROM EVERY CAPTURE THAT DID NOT ASK FOR THEM.
-        # MONTAUK_SCX_STORM arms fentry/fexit trampolines on sched_ext's hot
-        # kfuncs (scx_bpf_kick_cpu / scx_bpf_reenqueue_local). Only the storm
-        # bench wants that, and it sets the var on its own child explicitly. An
-        # ambient export in the caller's shell is the documented route that
-        # hard-locked this box on 2026-07-14, and every capture here inherits the
-        # environment, so the guard belongs on the shared launcher rather than on
-        # the one bench that opts in.
-        env = {k: v for k, v in os.environ.items() if k != "MONTAUK_SCX_STORM"}
+        # SCRUB THE SCX PROBES FROM EVERY CAPTURE THAT DID NOT ASK FOR THEM.
+        # Both sets arm fentry trampolines on sched_ext kfuncs: MONTAUK_SCX_STORM
+        # on scx_bpf_kick_cpu / scx_bpf_reenqueue_local, MONTAUK_SCX_DSQ on
+        # scx_bpf_dsq_insert{,_vtime} / scx_bpf_dsq_move_to_local. Each has
+        # hard-locked this box under a live scx load -- the storm set on
+        # 2026-07-14, the dsq set on 2026-08-25 -- and an ambient export in the
+        # caller's shell is the documented route both times, because every
+        # capture here inherits the environment. So the guard belongs on the
+        # shared launcher, and a bench that wants either set opts in explicitly.
+        # The list is the enforcement: a third probe set added to montauk and not
+        # added here inherits silently, which is how this rule came to be needed.
+        scx_probe_env = ("MONTAUK_SCX_STORM", "MONTAUK_SCX_DSQ")
+        env = {k: v for k, v in os.environ.items() if k not in scx_probe_env}
+        if self.scx_dsq:
+            env["MONTAUK_SCX_DSQ"] = "1"
         self.proc = subprocess.Popen(cmd, stdout=self._out,
                                      stderr=subprocess.STDOUT, env=env)
         if not self._wait_for_attach():
@@ -1300,3 +1491,545 @@ def stall_susceptibility():
     if why:
         lines.append("  factors    " + "; ".join(why))
     return lines, score
+
+
+# SCHEDULER LIFECYCLE -- THE SHARED HALF OF pandemonium-tests.
+#
+# These moved out of tests/pandemonium-tests.py, which was a 6,500-line ENTRY
+# POINT that four other benches also imported as a LIBRARY -- for exactly seven
+# functions. Reaching them meant a sys.path insert and
+# `import_module("pandemonium-tests")` in every caller, because a hyphenated
+# script name is not importable, and that dance existed solely to cross this
+# 240-line boundary. The file keeps its twelve subcommands; it is no longer
+# something other benches import.
+
+def find_scheduler(name: str) -> str | None:
+    return shutil.which(name)
+
+
+# Active scheduler guards, force-ejected on interrupt or normal exit. sched_ext
+# schedulers run in their OWN process group (start_scheduler: preexec_fn=os.setpgrp),
+# so a Ctrl+C to prism's foreground group never reaches them, and __del__-based cleanup
+# does NOT reliably run on KeyboardInterrupt or interpreter exit -- without this an
+# interrupted run leaves the scheduler REGISTERED and the system stays on it. stop()
+# escalates SIGINT -> SIGKILL, and a SIGKILL'd loader makes the kernel auto-unregister,
+# so this ejects even a hung scheduler.
+_ACTIVE_GUARDS: set = set()
+
+
+def stop_systemd_scheduler() -> None:
+    """Stop the systemd `pandemonium` service -- the canonical clear of a stale sched_ext
+    registration. Sudo-aware: prefixes sudo only when not already root. Use this instead of
+    open-coding `systemctl stop pandemonium` (it was duplicated a dozen ways across the
+    suite, half with the wrong sudo handling)."""
+    prefix = [] if os.geteuid() == 0 else ["sudo"]
+    subprocess.run(prefix + ["systemctl", "stop", "pandemonium"], capture_output=True)
+
+
+class SchedulerProcess:
+    """RAII-style guard for a running sched_ext scheduler."""
+
+    def __init__(self, proc: subprocess.Popen, name: str,
+                 stdout_path: str | None = None,
+                 stderr_path: str | None = None):
+        self.proc = proc
+        self.name = name
+        self.pgid = os.getpgid(proc.pid)
+        self.stdout_path = stdout_path
+        self.stderr_path = stderr_path
+        _ACTIVE_GUARDS.add(self)
+
+    def stop(self):
+        _ACTIVE_GUARDS.discard(self)
+        if self.proc.poll() is not None:
+            return
+        try:
+            os.killpg(self.pgid, signal.SIGINT)
+        except ProcessLookupError:
+            return
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if self.proc.poll() is not None:
+                return
+            time.sleep(0.05)
+        try:
+            os.killpg(self.pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        self.proc.wait()
+
+    def drain_stdout(self) -> str:
+        """Read all stdout captured to file (call after stop)."""
+        if self.stdout_path:
+            try:
+                return Path(self.stdout_path).read_text()
+            except (FileNotFoundError, PermissionError):
+                pass
+        return ""
+
+    def read_stderr(self, limit: int = 4000) -> str:
+        if self.stderr_path:
+            try:
+                return Path(self.stderr_path).read_text()[:limit]
+            except (FileNotFoundError, PermissionError):
+                pass
+        return ""
+
+    def cleanup(self):
+        for p in [self.stdout_path, self.stderr_path]:
+            if p:
+                try:
+                    os.unlink(p)
+                except (FileNotFoundError, PermissionError):
+                    pass
+
+    def __del__(self):
+        self.stop()
+        self.cleanup()
+
+
+def start_scheduler(cmd: list[str], name: str) -> SchedulerProcess | None:
+    """Spawn a scheduler subprocess in its own process group.
+    Stdout and stderr go to files to avoid pipe buffer overflow.
+    Returns None if the binary cannot be found."""
+    bin_path = cmd[0] if cmd else ""
+    if bin_path and not os.path.exists(bin_path) and not shutil.which(bin_path):
+        log_error(f"Binary not found: {bin_path}")
+        return None
+    # Refresh sudo credentials before spawning (prism-scale runs are long)
+    subprocess.run(["sudo", "-v"], capture_output=True)
+    full_cmd = ["sudo"] + cmd
+    log_info(f"Starting: {' '.join(full_cmd)}")
+    # From here the exit guard owns whatever lands on the box. Before this point
+    # an active scheduler is the user's and teardown leaves it alone.
+    note_scheduler_activated()
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    stdout_path = str(LOG_DIR / f"sched-{name}-{os.getpid()}.stdout")
+    stdout_f = open(stdout_path, "w")
+    stderr_path = str(LOG_DIR / f"sched-{name}-{os.getpid()}.stderr")
+    stderr_f = open(stderr_path, "w")
+    proc = subprocess.Popen(
+        full_cmd,
+        stdout=stdout_f,
+        stderr=stderr_f,
+        preexec_fn=os.setpgrp,
+    )
+    stdout_f.close()
+    stderr_f.close()
+    return SchedulerProcess(proc, name, stdout_path, stderr_path)
+
+
+def start_and_wait(cmd: list[str], name: str,
+                   settle_secs: float = 2.0) -> SchedulerProcess | None:
+    """Start a scheduler, wait for sched_ext activation. Returns None on failure."""
+    # Detect stale struct_ops registration before starting
+    try:
+        stale = SCX_OPS.read_text().strip()
+        if stale:
+            log_warn(f"Stale scheduler detected: '{stale}', waiting for cleanup...")
+            if not wait_for_no_scheduler(timeout=15):
+                log_error("stale scheduler did not unregister")
+                return None
+            log_info("Stale scheduler cleared")
+    except (FileNotFoundError, PermissionError):
+        pass
+    guard = start_scheduler(cmd, name)
+    if guard is None:
+        return None
+    if not wait_for_activation(10.0):
+        log_warn(f"{name} did not activate within 10s -- skipping")
+        exited = guard.proc.poll() is not None
+        if exited:
+            log_error(f"{name} process exited early (code {guard.proc.returncode})")
+        else:
+            log_warn(f"{name} process still running but sched_ext not active")
+        stderr = guard.read_stderr()
+        if stderr.strip():
+            for line in stderr.strip().splitlines()[:30]:
+                log_error(f"  {line}")
+        guard.stop()
+        wait_for_deactivation(5.0)
+        return None
+    log_info(f"{name} is active")
+    time.sleep(settle_secs)
+    return guard
+
+
+def sched_ejected(guard) -> bool:
+    """True when the scheduler is no longer the active scx scheduler: the process died OR the
+    BPF was ejected (watchdog) and the kernel fell back to EEVDF while the process lingers.
+    The proc-only `guard.proc.poll()` check missed the ejection -- that was the lie. Use this
+    for every 'did the scheduler survive this phase' check."""
+    if guard is None:
+        return False
+    return guard.proc.poll() is not None or not scheduler_active()
+
+
+def stop_and_wait(guard: SchedulerProcess | None) -> str:
+    """Stop a scheduler, wait for deactivation. Returns captured stdout."""
+    if guard is None:
+        return ""
+    guard.stop()
+    stdout = guard.drain_stdout()
+    if not wait_for_deactivation(5.0):
+        log_warn(f"sched_ext still active after stopping {guard.name}")
+    measure_struct_ops_cleanup()
+    time.sleep(1)
+    return stdout
+
+
+# SCHEDULER STATE AND THE SHUTDOWN-LINE MARKER WRITERS.
+# The trace driver below calls these, so they live beside it: a library that
+# reaches back into its own caller for a helper is not a library.
+
+def scheduler_active(expected: str = "pandemonium") -> bool:
+    """sched_ext is registered AND it is `expected` -- the REAL kernel state, not a live
+    userspace process. A watchdog ejection drops the BPF while the pandemonium process
+    lingers, so proc.poll() reads alive; this reads the scx registration directly, so the
+    harness can never report PANDEMONIUM while the kernel has actually fallen back to EEVDF."""
+    try:
+        return is_scx_active() and scx_scheduler_name() == expected
+    except Exception:
+        return False
+
+
+def measure_struct_ops_cleanup():
+    """Time how long the kernel takes to fully unregister struct_ops."""
+    try:
+        name = SCX_OPS.read_text().strip()
+        if not name:
+            return
+    except (FileNotFoundError, PermissionError):
+        return
+    t0 = time.monotonic()
+    while True:
+        try:
+            name = SCX_OPS.read_text().strip()
+            if not name:
+                elapsed_ms = (time.monotonic() - t0) * 1000
+                log_info(f"  struct_ops cleanup: {elapsed_ms:.0f}ms")
+                return
+        except (FileNotFoundError, PermissionError):
+            elapsed_ms = (time.monotonic() - t0) * 1000
+            log_info(f"  struct_ops cleanup: {elapsed_ms:.0f}ms (ops disappeared)")
+            return
+        if time.monotonic() - t0 > 30:
+            log_error("struct_ops cleanup: STILL REGISTERED AFTER 30s")
+            return
+        time.sleep(0.01)
+
+
+def parse_migration_line(stdout_text: str) -> dict:
+    """Parse the [MIGRATION] per-cause line -- ALL cross-CPU moves by XDOM_* path, not
+    just the cross-domain subset the [KNOBS] line carries. Names which decision drives a
+    within-L3 bounce (steal vs sel vs enq). {} when no [MIGRATION] line (EEVDF / external)."""
+    for line in stdout_text.splitlines():
+        if "[MIGRATION]" not in line:
+            continue
+        out = {}
+        for m in re.finditer(r"(\w+)=(\d+)", line.split("[MIGRATION]")[1]):
+            out[m.group(1)] = int(m.group(2))
+        return out
+    return {}
+
+
+def _write_cross_domain_marker(guard, rec_dir):
+    """Producer marker (mirrors prism's write_stability_markers): after a
+    traced PANDEMONIUM run stops, parse its shutdown [KNOBS] line for the per-path
+    cross-CCX attribution and write it into the recording dir. montauk --analyze
+    --digest surfaces it as a CROSS-CCX PLACEMENT block, so a multi-CCX user can
+    tell SEL_DFL (topology-blind fallback) from STEAL/STEP5 (dispatch-side) in one
+    read instead of only seeing montauk's trace-derived scatter percentage. No-op
+    for EEVDF / external schedulers (no [KNOBS] line)."""
+    if guard is None or rec_dir is None:
+        return
+    try:
+        output = guard.read_output()
+    except Exception:
+        return
+    _write_cross_domain_marker_text(output, rec_dir)
+
+
+def _write_cross_domain_marker_text(output, rec_dir):
+    """Write the cross-domain + migration markers from already-captured scheduler
+    stdout. The IPC path drains the guard via stop_and_wait, so it cannot re-read the
+    guard and passes the drained text here instead."""
+    if rec_dir is None or not output:
+        return
+    knobs = parse_knobs_line(output)
+    mig = parse_migration_line(output)
+    have_xdom = any(f"cross_domain_{p}" in knobs for p in _XDOM_PATHS)
+    have_mig = any(p in mig for p in _XDOM_PATHS)
+    if not have_xdom and not have_mig:
+        return
+    lines = []
+    if "cross_domain_scatter_pct" in knobs:
+        lines.append(f"montauk_cross_domain_scatter_pct {knobs['cross_domain_scatter_pct']}")
+    for p in _XDOM_PATHS:
+        k = f"cross_domain_{p}"
+        if k in knobs:
+            lines.append(f'montauk_cross_domain_path{{path="{p}"}} {knobs[k]}')
+    # ALL-MOVES per-path attribution -- the within-L3 core-to-core bounce the
+    # cross-domain subset above cannot see. montauk_migration_path names the dominant
+    # cause of a migration storm (steal vs sel vs enq) instead of only its cross-CCX share.
+    for p in _XDOM_PATHS:
+        if p in mig:
+            lines.append(f'montauk_migration_path{{path="{p}"}} {mig[p]}')
+    try:
+        (Path(rec_dir) / "cross_domain.prom").write_text("\n".join(lines) + "\n")
+    except OSError:
+        pass
+
+
+# THE ADAPTIVE LAYER'S PER-TICK CHAOS LINE, WHICH NOTHING RECORDED.
+# `chaos: lam=2.13 H=0.42 det=1.00 x=7 frozen: 1 (n=42)` is printed once per
+# second by the --verbose adaptive loop and was, until now, discarded with the
+# rest of scheduler stdout. A full day of 2026-07-29 benchmarking produced zero
+# samples of it, which is why every question about the quiescence gate -- does it
+# ever fire, does DET behave as assumed, does saturation read as quiescent --
+# was unanswerable from the archive rather than merely unanswered.
+_CHAOS_LINE_RE = re.compile(
+    r"chaos:\s*lam=(?P<lam>[-\d.]+)\s+H=(?P<h>[-\d.]+)\s+det=(?P<det>[-\d.]+)"
+    r"\s+x=(?P<x>\d+)\s+frozen:\s*(?P<frozen>\d+)\s*\(n=(?P<n>\d+)\)"
+)
+
+# THE LIVE LOAD GRAPH'S SUMMARY, ON THE SAME TELEMETRY LINE.
+# `graph: n=12 e=66 cpl=0.32/0.05/0.88` -- CPUs, edges that computed, then mean/
+# min/max Pecora-Carroll coupling. The SPREAD is the measurement that decides
+# whether the graph is worth pricing against: if min and max sit together the
+# matrix is flat, the graph is complete-and-uniform, and it carries nothing the
+# static topology does not already have.
+_GRAPH_LINE_RE = re.compile(
+    r"graph:\s*n=(?P<gn>\d+)\s+e=(?P<ge>\d+)\s+"
+    r"cpl=(?P<cmean>[-\d.]+)/(?P<cmin>[-\d.]+)/(?P<cmax>[-\d.]+)"
+)
+
+
+def _write_chaos_markers_text(output, rec_dir):
+    """Fold the adaptive layer's per-tick chaos samples into the recording.
+
+    Emitted as a .prom beside cross_domain.prom, so the quiescence gate is
+    answered from the same archive as everything else rather than by watching a
+    terminal. The FROZEN FRACTION is the headline: An AND-gate whose HVG term
+    never latches never freezes at all, and a zero here says so immediately.
+
+    Records the distribution, not just the last value -- the gate's behavior is a
+    time series and the final tick is the least interesting sample in it."""
+    if rec_dir is None or not output:
+        return
+    lam, det, frozen = [], [], []
+    for m in _CHAOS_LINE_RE.finditer(output):
+        try:
+            lam.append(float(m.group("lam")))
+            det.append(float(m.group("det")))
+            frozen.append(int(m.group("frozen")))
+        except ValueError:
+            continue
+    # Graph samples come off the same line; a run predating the graph simply
+    # yields none rather than zeros.
+    g_edges, g_mean, g_spread = [], [], []
+    for m in _GRAPH_LINE_RE.finditer(output):
+        try:
+            e = int(m.group("ge"))
+            if e == 0:
+                continue
+            g_edges.append(e)
+            g_mean.append(float(m.group("cmean")))
+            g_spread.append(float(m.group("cmax")) - float(m.group("cmin")))
+        except ValueError:
+            continue
+
+    if not lam:
+        return
+    n = len(lam)
+
+    def _q(vals, q):
+        s = sorted(vals)
+        return s[min(len(s) - 1, int(q * len(s)))]
+
+    lines = [
+        f"pandemonium_chaos_samples {n}",
+        f"pandemonium_chaos_frozen_ticks {sum(frozen)}",
+        # THE ONE NUMBER CLUSTER A EXISTS TO GET. 0 MEANS THE GATE NEVER
+        # FIRED ACROSS THE WHOLE RUN.
+        f"pandemonium_chaos_frozen_fraction {sum(frozen) / n:.4f}",
+        f"pandemonium_chaos_lambda_p50 {_q(lam, 0.50):.4f}",
+        f"pandemonium_chaos_lambda_p99 {_q(lam, 0.99):.4f}",
+        f"pandemonium_chaos_det_p50 {_q(det, 0.50):.4f}",
+        f"pandemonium_chaos_det_p99 {_q(det, 0.99):.4f}",
+        # THE TWO GATE TERMS, COUNTED SEPARATELY. AN AND-GATE THAT NEVER
+        # FIRES IS DIAGNOSED BY WHICH TERM WITHHELD, NOT BY THE VERDICT.
+        f"pandemonium_chaos_lambda_in_band "
+        f"{sum(1 for v in lam if v <= 2.6) / n:.4f}",
+        f"pandemonium_chaos_det_in_band "
+        f"{sum(1 for v in det if v >= 0.90) / n:.4f}",
+    ]
+    if g_mean:
+        gn = len(g_mean)
+        lines += [
+            f"pandemonium_graph_samples {gn}",
+            f"pandemonium_graph_edges_p50 {_q(g_edges, 0.50)}",
+            f"pandemonium_graph_coupling_mean_p50 {_q(g_mean, 0.50):.4f}",
+            # THE FALSIFICATION. A spread at or near zero says every CPU pair
+            # couples identically, so the live graph reduces to the static one.
+            f"pandemonium_graph_coupling_spread_p50 {_q(g_spread, 0.50):.4f}",
+            f"pandemonium_graph_coupling_spread_max {max(g_spread):.4f}",
+        ]
+
+    try:
+        dest = Path(rec_dir)
+        # A montauk recording dir gets chaos.prom beside its other artifacts; a
+        # bare path ending in .prom is written directly. The second form exists
+        # because the fallback used to mkdir a whole directory to hold one
+        # 318-byte file, which is how 433 of them accumulated in the archive
+        # root and buried every log the operator actually reads.
+        if dest.suffix == ".prom":
+            dest.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            dest = dest / "chaos.prom"
+        dest.write_text("\n".join(lines) + "\n")
+    except OSError:
+        pass
+
+
+def _write_chaos_markers(guard, rec_dir):
+    if guard is None or rec_dir is None:
+        return
+    try:
+        output = guard.read_output()
+    except Exception:
+        return
+    _write_chaos_markers_text(output, rec_dir)
+
+
+def parse_knobs_line(stdout_text: str) -> dict:
+    """Parse [KNOBS] summary line from scheduler stdout."""
+    for line in stdout_text.splitlines():
+        if "[KNOBS]" not in line:
+            continue
+
+        knobs = {}
+        for m in re.finditer(r"(\w+)=(\S+)", line.split("[KNOBS]")[1]):
+            k, v = m.group(1), m.group(2)
+            if v == "true":
+                knobs[k] = True
+            elif v == "false":
+                knobs[k] = False
+            else:
+                try:
+                    knobs[k] = int(v)
+                except ValueError:
+                    knobs[k] = v
+
+        # Expand ticks=L:5/M:12/H:3
+        if "ticks" in knobs and isinstance(knobs["ticks"], str):
+            ticks_str = knobs.pop("ticks")
+            for part in ticks_str.split("/"):
+                if ":" in part:
+                    prefix, val = part.split(":", 1)
+                    label = {"L": "ticks_light", "M": "ticks_mixed",
+                             "H": "ticks_heavy"}.get(prefix)
+                    if label:
+                        try:
+                            knobs[label] = int(val)
+                        except ValueError:
+                            pass
+
+        # Expand l2_hit=B:75%/I:60%/L:80%
+        if "l2_hit" in knobs and isinstance(knobs["l2_hit"], str):
+            l2_str = knobs.pop("l2_hit")
+            for part in l2_str.split("/"):
+                if ":" in part:
+                    prefix, val = part.split(":", 1)
+                    label = {"B": "l2_hit_batch", "I": "l2_hit_interactive",
+                             "L": "l2_hit_latcrit"}.get(prefix)
+                    if label:
+                        try:
+                            knobs[label] = int(val.rstrip("%"))
+                        except ValueError:
+                            pass
+
+        return knobs
+
+    return {}
+
+
+# GENERIC MONTAUK TRACE DRIVER -- the single body behind every `prism-* --trace`.
+# Each bench supplies its comm `pattern`, a `label`, and a `body_fn(rec_dir)` that
+# runs its workload; this owns the activate -> montauk --trace -> deactivate
+# lifecycle so no bench re-implements it.
+_XDOM_PATHS = ["sel_tight", "sel_sync", "sel_normal", "sel_dfl",
+               "enq_t1", "enq_t2", "steal", "step5"]
+
+
+def trace_workload(sched_name, activate_cmd, pattern, label, stamp, body_fn, *,
+                   baseline_s=0.0, events=False, pin_cpu=None,
+                   trace_activation=False, sched_detail=False,
+                   trace_classes=None):
+    """Record `montauk --trace pattern` around a scheduler workload.
+
+    Default: activate `sched_name` via start_and_wait(activate_cmd), record while
+    body_fn(rec_dir) runs, then stop_and_wait. Returns (rec_dir, body_result), or
+    (None, None) if activation failed (nothing to trace).
+
+    trace_activation=True: montauk records FIRST (pattern should match the
+    SCHEDULER comm), then activation is attempted inside the window -- so a FAILED
+    activation lands in the recording instead of vanishing. body_fn runs only if
+    activation took. Returns (rec_dir, body_result) on success, (rec_dir, None) on
+    activation failure (the failure IS the capture).
+
+    The caller owns the workload; this owns montauk and the scheduler lifecycle.
+    """
+    safe = sched_name.replace(" ", "-").replace("(", "").replace(")", "")
+    rlabel = f"{label}-{safe}"
+
+    if trace_activation:
+        with montauk_trace(pattern, rlabel, stamp, baseline_s=baseline_s,
+                           events=events, pin_cpu=pin_cpu,
+                           sched_detail=sched_detail,
+                           trace_classes=trace_classes) as rec:
+            guard = start_and_wait(activate_cmd, sched_name) if activate_cmd else None
+            if activate_cmd is not None and guard is None:
+                log_error(f"[{sched_name}] failed to activate "
+                          f"-- captured in {rec.dir}")
+                return rec.dir, None
+            try:
+                return rec.dir, body_fn(rec.dir)
+            finally:
+                if guard is not None:
+                    stop_and_wait(guard)
+                    _write_cross_domain_marker(guard, rec.dir)
+                    _write_chaos_markers(guard, rec.dir)
+
+    guard = None
+    if activate_cmd is not None:
+        log_info(f"[{sched_name}] activating scheduler...")
+        guard = start_and_wait(activate_cmd, sched_name)
+        if guard is None:
+            log_error(f"[{sched_name}] failed to activate, skipping")
+            return None, None
+    rec_dir = None
+    try:
+        with montauk_trace(pattern, rlabel, stamp, baseline_s=baseline_s,
+                           events=events, pin_cpu=pin_cpu,
+                           sched_detail=sched_detail,
+                           trace_classes=trace_classes) as rec:
+            rec_dir = rec.dir
+            return rec.dir, body_fn(rec.dir)
+    finally:
+        if guard is not None:
+            stop_and_wait(guard)
+            _write_cross_domain_marker(guard, rec_dir)
+            _write_chaos_markers(guard, rec_dir)
+
+
+# MEASUREMENT
+
+# PROMETHEUS HISTOGRAM BUCKETS (us). 1-2-5 ladder per decade, 1us..1s,
+# shared across every us-domain latency distribution so per-cell CDFs can be
+# reconstructed from the .prom alone.
+HIST_BUCKETS_US = [
+    1, 2, 5, 10, 20, 50, 100, 200, 500,
+    1_000, 2_000, 5_000, 10_000, 20_000, 50_000,
+    100_000, 200_000, 500_000, 1_000_000,
+]

@@ -364,6 +364,8 @@ def main() -> int:
     ap.add_argument("--coldwake", action="store_true",
                     help="also run prism-coldwake after the strand probe -- co-located "
                          "suite (both exercise cold/idle-core dispatch + montauk capture)")
+    ap.add_argument("--cores", type=str, default=None,
+                    help="Accepted for suite uniformity; strand samples kthread strands at native width")
     args = ap.parse_args()
 
     if os.geteuid() != 0:

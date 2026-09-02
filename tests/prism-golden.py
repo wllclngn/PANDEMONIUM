@@ -91,7 +91,7 @@ def resolve_analyze() -> list[str]:
 
 
 # WORKLOAD. Default is the migration-heavy sched-messaging storm (the same load
-# prism-locality uses), in its own process group so one killpg takes the loop and
+# the traced benches use), in its own process group so one killpg takes the loop and
 # every perf child with it. --workload overrides with any shell command.
 
 def start_load(cmd: str | None, groups: int, loops: int) -> subprocess.Popen:

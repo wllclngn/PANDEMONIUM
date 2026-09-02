@@ -3,20 +3,20 @@
 The single reference for everything the suite prints to a terminal. One logger,
 one shape per output kind. Every bench (`prism`, `prism-scale`/
 `pandemonium-tests`, `prism-cachyos`, `prism-fork-thread`, `prism-ipc`,
-`prism-power`, `prism-plot`, `prism-strand`, `prism-locality`) renders through it,
+`prism-power`, `prism-plot`, `prism-strand`) renders through it,
 so a user sees the same grammar everywhere.
 
 Binding rules (from the project doctrine, restated so this file is self-contained):
 
 - Every line is `[HH:MM:SS] [LEVEL]   message`. No exceptions for "headers" or
   "banners" — a header is just a message.
-- No decorative separators anywhere: no `===`, `---`, `***`, `###`, no `== text ==`,
+- No decorative separators anywhere: No `===`, `---`, `***`, `###`, no `== text ==`,
   no box-drawing, no underlines. A blank line is the only separator.
 - Numeric/structural data is a table (header row + aligned columns) or routes to
   sublimation / montauk --analyze. Never an ad-hoc dump.
 - Run benches BARE: `./pandemonium.py ...`, NEVER `sudo ./pandemonium.py ...` -- not in the
   docs, not in program output, not in any instruction or example shown to the user. This is
-  non-negotiable. Each bench acquires root ITSELF: the canonical pattern is a self-elevating
+  non-negotiable. Each bench acquires root ITSELF: The canonical pattern is a self-elevating
   `os.execvp("sudo", ...)` re-exec in `main()` (and on the --dev path, before a trace-capable
   workload), so sudo prompts AFTER the bare command -- once, when the bench actually needs it.
   A bench that only shells out per command warms the sudo cache (`sudo -v`) and prefixes those
@@ -129,7 +129,7 @@ result reads as a continuation by wording, not indent.
 
 ## Tables
 
-Numeric results. Header row of plain column names, then aligned data rows: label
+Numeric results. Header row of plain column names, then aligned data rows: Label
 column left-justified to width 28, numeric columns right-justified to width 10,
 units inline. No separator row. Built via `table_header()` / `table_row()`.
 

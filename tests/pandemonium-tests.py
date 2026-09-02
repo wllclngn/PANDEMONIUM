@@ -39,8 +39,17 @@ from pandemonium_common import (
     montauk_trace, montauk_available, MONTAUK, montauk_analyze_argv,
     PrometheusBuilder, table_header, table_row,
     stall_susceptibility,
-    install_exit_guard, register_exit_cleanup,
- warm_sudo, refresh_sudo,
+    install_exit_guard, note_scheduler_activated, register_exit_cleanup,
+    montauk_envelope, envelope_report, envelope_capture, envelope_verdict,
+    envelope_offenders, envelope_gauges, envelope_gauge_by_label, montauk_report,
+    warm_sudo, refresh_sudo,
+    SchedulerProcess, find_scheduler, stop_systemd_scheduler,
+    start_scheduler, start_and_wait, sched_ejected, stop_and_wait,
+    trace_workload,
+    scheduler_active, measure_struct_ops_cleanup,
+    parse_knobs_line, parse_migration_line,
+    _write_cross_domain_marker_text, _write_chaos_markers_text,
+    _ACTIVE_GUARDS, _XDOM_PATHS, HIST_BUCKETS_US,
 )
 from ipc_workload import (
     measure_ipc_cell, IPC_DEFAULT_ROUNDS, IPC_RTT_PRIMS, IPC_COMM,
@@ -92,18 +101,6 @@ def nuke_stale_build():
 
 # SCHEDULER PROCESS MANAGEMENT
 
-def find_scheduler(name: str) -> str | None:
-    return shutil.which(name)
-
-
-# Active scheduler guards, force-ejected on interrupt or normal exit. sched_ext
-# schedulers run in their OWN process group (start_scheduler: preexec_fn=os.setpgrp),
-# so a Ctrl+C to prism's foreground group never reaches them, and __del__-based cleanup
-# does NOT reliably run on KeyboardInterrupt or interpreter exit -- without this an
-# interrupted run leaves the scheduler REGISTERED and the system stays on it. stop()
-# escalates SIGINT -> SIGKILL, and a SIGKILL'd loader makes the kernel auto-unregister,
-# so this ejects even a hung scheduler.
-_ACTIVE_GUARDS: set = set()
 
 
 def _eject_active_schedulers():
@@ -124,450 +121,19 @@ register_exit_cleanup(_eject_active_schedulers)
 install_exit_guard()
 
 
-def stop_systemd_scheduler() -> None:
-    """Stop the systemd `pandemonium` service -- the canonical clear of a stale sched_ext
-    registration. Sudo-aware: prefixes sudo only when not already root. Use this instead of
-    open-coding `systemctl stop pandemonium` (it was duplicated a dozen ways across the
-    suite, half with the wrong sudo handling)."""
-    prefix = [] if os.geteuid() == 0 else ["sudo"]
-    subprocess.run(prefix + ["systemctl", "stop", "pandemonium"], capture_output=True)
 
 
-class SchedulerProcess:
-    """RAII-style guard for a running sched_ext scheduler."""
-
-    def __init__(self, proc: subprocess.Popen, name: str,
-                 stdout_path: str | None = None,
-                 stderr_path: str | None = None):
-        self.proc = proc
-        self.name = name
-        self.pgid = os.getpgid(proc.pid)
-        self.stdout_path = stdout_path
-        self.stderr_path = stderr_path
-        _ACTIVE_GUARDS.add(self)
-
-    def stop(self):
-        _ACTIVE_GUARDS.discard(self)
-        if self.proc.poll() is not None:
-            return
-        try:
-            os.killpg(self.pgid, signal.SIGINT)
-        except ProcessLookupError:
-            return
-        deadline = time.monotonic() + 3.0
-        while time.monotonic() < deadline:
-            if self.proc.poll() is not None:
-                return
-            time.sleep(0.05)
-        try:
-            os.killpg(self.pgid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        self.proc.wait()
-
-    def drain_stdout(self) -> str:
-        """Read all stdout captured to file (call after stop)."""
-        if self.stdout_path:
-            try:
-                return Path(self.stdout_path).read_text()
-            except (FileNotFoundError, PermissionError):
-                pass
-        return ""
-
-    def read_stderr(self, limit: int = 4000) -> str:
-        if self.stderr_path:
-            try:
-                return Path(self.stderr_path).read_text()[:limit]
-            except (FileNotFoundError, PermissionError):
-                pass
-        return ""
-
-    def cleanup(self):
-        for p in [self.stdout_path, self.stderr_path]:
-            if p:
-                try:
-                    os.unlink(p)
-                except (FileNotFoundError, PermissionError):
-                    pass
-
-    def __del__(self):
-        self.stop()
-        self.cleanup()
 
 
-def start_scheduler(cmd: list[str], name: str) -> SchedulerProcess | None:
-    """Spawn a scheduler subprocess in its own process group.
-    Stdout and stderr go to files to avoid pipe buffer overflow.
-    Returns None if the binary cannot be found."""
-    bin_path = cmd[0] if cmd else ""
-    if bin_path and not os.path.exists(bin_path) and not shutil.which(bin_path):
-        log_error(f"Binary not found: {bin_path}")
-        return None
-    # Refresh sudo credentials before spawning (prism-scale runs are long)
-    subprocess.run(["sudo", "-v"], capture_output=True)
-    full_cmd = ["sudo"] + cmd
-    log_info(f"Starting: {' '.join(full_cmd)}")
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    stdout_path = str(LOG_DIR / f"sched-{name}-{os.getpid()}.stdout")
-    stdout_f = open(stdout_path, "w")
-    stderr_path = str(LOG_DIR / f"sched-{name}-{os.getpid()}.stderr")
-    stderr_f = open(stderr_path, "w")
-    proc = subprocess.Popen(
-        full_cmd,
-        stdout=stdout_f,
-        stderr=stderr_f,
-        preexec_fn=os.setpgrp,
-    )
-    stdout_f.close()
-    stderr_f.close()
-    return SchedulerProcess(proc, name, stdout_path, stderr_path)
 
 
-def start_and_wait(cmd: list[str], name: str,
-                   settle_secs: float = 2.0) -> SchedulerProcess | None:
-    """Start a scheduler, wait for sched_ext activation. Returns None on failure."""
-    # Detect stale struct_ops registration before starting
-    try:
-        stale = SCX_OPS.read_text().strip()
-        if stale:
-            log_warn(f"Stale scheduler detected: '{stale}', waiting for cleanup...")
-            if not wait_for_no_scheduler(timeout=15):
-                log_error("stale scheduler did not unregister")
-                return None
-            log_info("Stale scheduler cleared")
-    except (FileNotFoundError, PermissionError):
-        pass
-    guard = start_scheduler(cmd, name)
-    if guard is None:
-        return None
-    if not wait_for_activation(10.0):
-        log_warn(f"{name} did not activate within 10s -- skipping")
-        exited = guard.proc.poll() is not None
-        if exited:
-            log_error(f"{name} process exited early (code {guard.proc.returncode})")
-        else:
-            log_warn(f"{name} process still running but sched_ext not active")
-        stderr = guard.read_stderr()
-        if stderr.strip():
-            for line in stderr.strip().splitlines()[:30]:
-                log_error(f"  {line}")
-        guard.stop()
-        wait_for_deactivation(5.0)
-        return None
-    log_info(f"{name} is active")
-    time.sleep(settle_secs)
-    return guard
 
 
-def scheduler_active(expected: str = "pandemonium") -> bool:
-    """sched_ext is registered AND it is `expected` -- the REAL kernel state, not a live
-    userspace process. A watchdog ejection drops the BPF while the pandemonium process
-    lingers, so proc.poll() reads alive; this reads the scx registration directly, so the
-    harness can never report PANDEMONIUM while the kernel has actually fallen back to EEVDF."""
-    try:
-        return is_scx_active() and scx_scheduler_name() == expected
-    except Exception:
-        return False
 
 
-def sched_ejected(guard) -> bool:
-    """True when the scheduler is no longer the active scx scheduler: the process died OR the
-    BPF was ejected (watchdog) and the kernel fell back to EEVDF while the process lingers.
-    The proc-only `guard.proc.poll()` check missed the ejection -- that was the lie. Use this
-    for every 'did the scheduler survive this phase' check."""
-    if guard is None:
-        return False
-    return guard.proc.poll() is not None or not scheduler_active()
 
 
-def measure_struct_ops_cleanup():
-    """Time how long the kernel takes to fully unregister struct_ops."""
-    try:
-        name = SCX_OPS.read_text().strip()
-        if not name:
-            return
-    except (FileNotFoundError, PermissionError):
-        return
-    t0 = time.monotonic()
-    while True:
-        try:
-            name = SCX_OPS.read_text().strip()
-            if not name:
-                elapsed_ms = (time.monotonic() - t0) * 1000
-                log_info(f"  struct_ops cleanup: {elapsed_ms:.0f}ms")
-                return
-        except (FileNotFoundError, PermissionError):
-            elapsed_ms = (time.monotonic() - t0) * 1000
-            log_info(f"  struct_ops cleanup: {elapsed_ms:.0f}ms (ops disappeared)")
-            return
-        if time.monotonic() - t0 > 30:
-            log_error("struct_ops cleanup: STILL REGISTERED AFTER 30s")
-            return
-        time.sleep(0.01)
 
-
-def stop_and_wait(guard: SchedulerProcess | None) -> str:
-    """Stop a scheduler, wait for deactivation. Returns captured stdout."""
-    if guard is None:
-        return ""
-    guard.stop()
-    stdout = guard.drain_stdout()
-    if not wait_for_deactivation(5.0):
-        log_warn(f"sched_ext still active after stopping {guard.name}")
-    measure_struct_ops_cleanup()
-    time.sleep(1)
-    return stdout
-
-
-# GENERIC MONTAUK TRACE DRIVER -- the single body behind every `prism-* --trace`.
-# Each bench supplies its comm `pattern`, a `label`, and a `body_fn(rec_dir)` that
-# runs its workload; this owns the activate -> montauk --trace -> deactivate
-# lifecycle so no bench re-implements it.
-_XDOM_PATHS = ["sel_tight", "sel_sync", "sel_normal", "sel_dfl",
-               "enq_t1", "enq_t2", "steal", "step5"]
-
-
-def parse_migration_line(stdout_text: str) -> dict:
-    """Parse the [MIGRATION] per-cause line -- ALL cross-CPU moves by XDOM_* path, not
-    just the cross-domain subset the [KNOBS] line carries. Names which decision drives a
-    within-L3 bounce (steal vs sel vs enq). {} when no [MIGRATION] line (EEVDF / external)."""
-    for line in stdout_text.splitlines():
-        if "[MIGRATION]" not in line:
-            continue
-        out = {}
-        for m in re.finditer(r"(\w+)=(\d+)", line.split("[MIGRATION]")[1]):
-            out[m.group(1)] = int(m.group(2))
-        return out
-    return {}
-
-
-def _write_cross_domain_marker(guard, rec_dir):
-    """Producer marker (mirrors prism's write_stability_markers): after a
-    traced PANDEMONIUM run stops, parse its shutdown [KNOBS] line for the per-path
-    cross-CCX attribution and write it into the recording dir. montauk --analyze
-    --digest surfaces it as a CROSS-CCX PLACEMENT block, so a multi-CCX user can
-    tell SEL_DFL (topology-blind fallback) from STEAL/STEP5 (dispatch-side) in one
-    read instead of only seeing montauk's trace-derived scatter percentage. No-op
-    for EEVDF / external schedulers (no [KNOBS] line)."""
-    if guard is None or rec_dir is None:
-        return
-    try:
-        output = guard.read_output()
-    except Exception:
-        return
-    _write_cross_domain_marker_text(output, rec_dir)
-
-
-def _write_cross_domain_marker_text(output, rec_dir):
-    """Write the cross-domain + migration markers from already-captured scheduler
-    stdout. The IPC path drains the guard via stop_and_wait, so it cannot re-read the
-    guard and passes the drained text here instead."""
-    if rec_dir is None or not output:
-        return
-    knobs = parse_knobs_line(output)
-    mig = parse_migration_line(output)
-    have_xdom = any(f"cross_domain_{p}" in knobs for p in _XDOM_PATHS)
-    have_mig = any(p in mig for p in _XDOM_PATHS)
-    if not have_xdom and not have_mig:
-        return
-    lines = []
-    if "cross_domain_scatter_pct" in knobs:
-        lines.append(f"montauk_cross_domain_scatter_pct {knobs['cross_domain_scatter_pct']}")
-    for p in _XDOM_PATHS:
-        k = f"cross_domain_{p}"
-        if k in knobs:
-            lines.append(f'montauk_cross_domain_path{{path="{p}"}} {knobs[k]}')
-    # ALL-MOVES per-path attribution -- the within-L3 core-to-core bounce the
-    # cross-domain subset above cannot see. montauk_migration_path names the dominant
-    # cause of a migration storm (steal vs sel vs enq) instead of only its cross-CCX share.
-    for p in _XDOM_PATHS:
-        if p in mig:
-            lines.append(f'montauk_migration_path{{path="{p}"}} {mig[p]}')
-    try:
-        (Path(rec_dir) / "cross_domain.prom").write_text("\n".join(lines) + "\n")
-    except OSError:
-        pass
-
-
-# THE ADAPTIVE LAYER'S PER-TICK CHAOS LINE, WHICH NOTHING RECORDED.
-# `chaos: lam=2.13 H=0.42 det=1.00 x=7 frozen: 1 (n=42)` is printed once per
-# second by the --verbose adaptive loop and was, until now, discarded with the
-# rest of scheduler stdout. A full day of 2026-07-29 benchmarking produced zero
-# samples of it, which is why every question about the quiescence gate -- does it
-# ever fire, does DET behave as assumed, does saturation read as quiescent --
-# was unanswerable from the archive rather than merely unanswered.
-_CHAOS_LINE_RE = re.compile(
-    r"chaos:\s*lam=(?P<lam>[-\d.]+)\s+H=(?P<h>[-\d.]+)\s+det=(?P<det>[-\d.]+)"
-    r"\s+x=(?P<x>\d+)\s+frozen:\s*(?P<frozen>\d+)\s*\(n=(?P<n>\d+)\)"
-)
-
-# THE LIVE LOAD GRAPH'S SUMMARY, ON THE SAME TELEMETRY LINE.
-# `graph: n=12 e=66 cpl=0.32/0.05/0.88` -- CPUs, edges that computed, then mean/
-# min/max Pecora-Carroll coupling. The SPREAD is the measurement that decides
-# whether the graph is worth pricing against: if min and max sit together the
-# matrix is flat, the graph is complete-and-uniform, and it carries nothing the
-# static topology does not already have.
-_GRAPH_LINE_RE = re.compile(
-    r"graph:\s*n=(?P<gn>\d+)\s+e=(?P<ge>\d+)\s+"
-    r"cpl=(?P<cmean>[-\d.]+)/(?P<cmin>[-\d.]+)/(?P<cmax>[-\d.]+)"
-)
-
-
-def _write_chaos_markers_text(output, rec_dir):
-    """Fold the adaptive layer's per-tick chaos samples into the recording.
-
-    Emitted as a .prom beside cross_domain.prom, so the quiescence gate is
-    answered from the same archive as everything else rather than by watching a
-    terminal. The FROZEN FRACTION is the headline: An AND-gate whose HVG term
-    never latches never freezes at all, and a zero here says so immediately.
-
-    Records the distribution, not just the last value -- the gate's behavior is a
-    time series and the final tick is the least interesting sample in it."""
-    if rec_dir is None or not output:
-        return
-    lam, det, frozen = [], [], []
-    for m in _CHAOS_LINE_RE.finditer(output):
-        try:
-            lam.append(float(m.group("lam")))
-            det.append(float(m.group("det")))
-            frozen.append(int(m.group("frozen")))
-        except ValueError:
-            continue
-    # Graph samples come off the same line; a run predating the graph simply
-    # yields none rather than zeros.
-    g_edges, g_mean, g_spread = [], [], []
-    for m in _GRAPH_LINE_RE.finditer(output):
-        try:
-            e = int(m.group("ge"))
-            if e == 0:
-                continue
-            g_edges.append(e)
-            g_mean.append(float(m.group("cmean")))
-            g_spread.append(float(m.group("cmax")) - float(m.group("cmin")))
-        except ValueError:
-            continue
-
-    if not lam:
-        return
-    n = len(lam)
-
-    def _q(vals, q):
-        s = sorted(vals)
-        return s[min(len(s) - 1, int(q * len(s)))]
-
-    lines = [
-        f"pandemonium_chaos_samples {n}",
-        f"pandemonium_chaos_frozen_ticks {sum(frozen)}",
-        # THE ONE NUMBER CLUSTER A EXISTS TO GET. 0 MEANS THE GATE NEVER
-        # FIRED ACROSS THE WHOLE RUN.
-        f"pandemonium_chaos_frozen_fraction {sum(frozen) / n:.4f}",
-        f"pandemonium_chaos_lambda_p50 {_q(lam, 0.50):.4f}",
-        f"pandemonium_chaos_lambda_p99 {_q(lam, 0.99):.4f}",
-        f"pandemonium_chaos_det_p50 {_q(det, 0.50):.4f}",
-        f"pandemonium_chaos_det_p99 {_q(det, 0.99):.4f}",
-        # THE TWO GATE TERMS, COUNTED SEPARATELY. AN AND-GATE THAT NEVER
-        # FIRES IS DIAGNOSED BY WHICH TERM WITHHELD, NOT BY THE VERDICT.
-        f"pandemonium_chaos_lambda_in_band "
-        f"{sum(1 for v in lam if v <= 2.6) / n:.4f}",
-        f"pandemonium_chaos_det_in_band "
-        f"{sum(1 for v in det if v >= 0.90) / n:.4f}",
-    ]
-    if g_mean:
-        gn = len(g_mean)
-        lines += [
-            f"pandemonium_graph_samples {gn}",
-            f"pandemonium_graph_edges_p50 {_q(g_edges, 0.50)}",
-            f"pandemonium_graph_coupling_mean_p50 {_q(g_mean, 0.50):.4f}",
-            # THE FALSIFICATION. A spread at or near zero says every CPU pair
-            # couples identically, so the live graph reduces to the static one.
-            f"pandemonium_graph_coupling_spread_p50 {_q(g_spread, 0.50):.4f}",
-            f"pandemonium_graph_coupling_spread_max {max(g_spread):.4f}",
-        ]
-
-    try:
-        (Path(rec_dir) / "chaos.prom").write_text("\n".join(lines) + "\n")
-    except OSError:
-        pass
-
-
-def _write_chaos_markers(guard, rec_dir):
-    if guard is None or rec_dir is None:
-        return
-    try:
-        output = guard.read_output()
-    except Exception:
-        return
-    _write_chaos_markers_text(output, rec_dir)
-
-
-def trace_workload(sched_name, activate_cmd, pattern, label, stamp, body_fn, *,
-                   baseline_s=0.0, events=False, pin_cpu=None,
-                   trace_activation=False, sched_detail=False):
-    """Record `montauk --trace pattern` around a scheduler workload.
-
-    Default: activate `sched_name` via start_and_wait(activate_cmd), record while
-    body_fn(rec_dir) runs, then stop_and_wait. Returns (rec_dir, body_result), or
-    (None, None) if activation failed (nothing to trace).
-
-    trace_activation=True: montauk records FIRST (pattern should match the
-    SCHEDULER comm), then activation is attempted inside the window -- so a FAILED
-    activation lands in the recording instead of vanishing. body_fn runs only if
-    activation took. Returns (rec_dir, body_result) on success, (rec_dir, None) on
-    activation failure (the failure IS the capture).
-
-    The caller owns the workload; this owns montauk and the scheduler lifecycle.
-    """
-    safe = sched_name.replace(" ", "-").replace("(", "").replace(")", "")
-    rlabel = f"{label}-{safe}"
-
-    if trace_activation:
-        with montauk_trace(pattern, rlabel, stamp, baseline_s=baseline_s,
-                           events=events, pin_cpu=pin_cpu,
-                           sched_detail=sched_detail) as rec:
-            guard = start_and_wait(activate_cmd, sched_name) if activate_cmd else None
-            if activate_cmd is not None and guard is None:
-                log_error(f"[{sched_name}] failed to activate "
-                          f"-- captured in {rec.dir}")
-                return rec.dir, None
-            try:
-                return rec.dir, body_fn(rec.dir)
-            finally:
-                if guard is not None:
-                    stop_and_wait(guard)
-                    _write_cross_domain_marker(guard, rec.dir)
-                    _write_chaos_markers(guard, rec.dir)
-
-    guard = None
-    if activate_cmd is not None:
-        log_info(f"[{sched_name}] activating scheduler...")
-        guard = start_and_wait(activate_cmd, sched_name)
-        if guard is None:
-            log_error(f"[{sched_name}] failed to activate, skipping")
-            return None, None
-    rec_dir = None
-    try:
-        with montauk_trace(pattern, rlabel, stamp, baseline_s=baseline_s,
-                           events=events, pin_cpu=pin_cpu,
-                           sched_detail=sched_detail) as rec:
-            rec_dir = rec.dir
-            return rec.dir, body_fn(rec.dir)
-    finally:
-        if guard is not None:
-            stop_and_wait(guard)
-            _write_cross_domain_marker(guard, rec_dir)
-            _write_chaos_markers(guard, rec_dir)
-
-
-# MEASUREMENT
-
-# PROMETHEUS HISTOGRAM BUCKETS (us). 1-2-5 ladder per decade, 1us..1s,
-# shared across every us-domain latency distribution so per-cell CDFs can be
-# reconstructed from the .prom alone.
-HIST_BUCKETS_US = [
-    1, 2, 5, 10, 20, 50, 100, 200, 500,
-    1_000, 2_000, 5_000, 10_000, 20_000, 50_000,
-    100_000, 200_000, 500_000, 1_000_000,
-]
 
 
 def histogram(values: list[float]) -> dict:
@@ -1304,6 +870,138 @@ def measure_deadline(binary: Path, n_cpus: int,
 
 # IPC ROUND-TRIP MEASUREMENT
 
+def _med(vals):
+    s = sorted(vals)
+    n = len(s)
+    if not n:
+        return 0
+    return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
+
+
+def ipc_hop_from_recording(rec) -> dict:
+    """Read the scheduler-side half of one IPC hop back out of the recording the
+    --trace path already writes.
+
+    An RTT is two hops, and a hop is: The waker runs ops.select_cpu and
+    ops.enqueue in its OWN context, then kicks; the target CPU then enters
+    dispatch, drains the DSQ and the wakee runs. montauk's WAKE2RUN comes from
+    tp/sched/sched_wakeup, which fires AFTER enqueue -- so it measures the second
+    half only, and the first half is invisible to it by construction. That
+    asymmetry is the whole reason this is worth reading: RTT/2 minus wake2run
+    minus the run leaves the waker-side path cost as a residual, and the two
+    halves have completely different suspects. Dispatch-side is the waterfall,
+    the kick and the DSQ pop; waker-side is the map-lookup walk through
+    warm_stay_anchor, phi_warm_target and pick_pcpu_dsq_with_spill.
+
+    The capture was already being written and analysed by nothing -- the same gap
+    fork-thread had, where the recording existed and the report read three
+    numbers out of it and stopped.
+    """
+    out = {}
+    if rec is None or not getattr(rec, "dir", None):
+        return out
+    env = montauk_envelope(rec.dir)
+    if env is None:
+        return out
+    out.update(envelope_capture(env))
+    sched = envelope_report(env, "sched")
+    w = sched.get("wake2run") or {}
+    if w.get("p50_us") is not None:
+        out["wake2run_p50_us"] = float(w["p50_us"])
+    klass, _ = envelope_verdict(sched)
+    if klass:
+        out["sched_class"] = klass
+
+    # A DIGEST CARRIES THREE REPORTS; THE STREAM CARRIES TWENTY-NINE. `--digest`
+    # folds sched, dispatch-stall and kstrand, so slice, service and every klass
+    # past those two are absent from it entirely. Read them off the .events
+    # stream that sits beside the recording dir.
+    ev_path = getattr(rec, "events_path", None) or Path(str(rec.dir) + ".events")
+    if not Path(ev_path).is_file():
+        return out
+    ev = montauk_envelope(ev_path)
+    if ev is None:
+        return out
+
+    # SLICE IS WHAT THE ORDERING KEY'S WARP IS COMPUTED FROM
+    # (codel_target_ns - last_run_ns), so the spread of dispatched run lengths
+    # bounds how far the warp can reorder at all. fork-thread reads it; the IPC
+    # capture carries the same distribution and nothing looked.
+    sq = envelope_gauge_by_label(envelope_report(ev, "slice"),
+                                 "montauk_analysis_slice_us", "quantile")
+    for lab, k in (("0.5", "slice_p50_us"), ("0.99", "slice_p99_us"),
+                   ("worst", "slice_worst_us")):
+        if lab in sq:
+            out[k] = float(sq[lab])
+    sl = envelope_gauges(envelope_report(ev, "slice"))
+    if "montauk_analysis_slice_trajectory_inversion" in sl:
+        out["slice_inversion"] = float(
+            sl["montauk_analysis_slice_trajectory_inversion"])
+    sg = envelope_gauges(envelope_report(ev, "service"))
+    for g, k in (("montauk_analysis_service_top1_pct", "service_top1_pct"),
+                 ("montauk_analysis_service_pids", "service_pids")):
+        if g in sg:
+            out[k] = float(sg[g])
+
+    # THE KLASS TOKENS, WHICH ARE THE COMPARABLE HALF. montauk keeps klass apart
+    # from the verdict sentence so it can be compared exactly; collect them per
+    # arm so the caller can print only where two arms DISAGREE.
+    out["classes"] = {}
+    for rn in ("sched", "locality", "dispatch-stall", "placement-race",
+               "work-conservation", "slice", "service", "seat"):
+        k, _ = envelope_verdict(envelope_report(ev, rn))
+        if k:
+            out["classes"][rn] = k
+    return out
+
+
+def reduce_ipc_runs(runs: list) -> dict:
+    """Collapse N measure_ipc results into one: MEDIAN per metric, with the
+    across-run spread kept beside it.
+
+    Percentiles do not average, and pooling the raw samples would erase the one
+    thing repetition exists to expose -- how far a cell moves between IDENTICAL
+    runs. So each run keeps its own distribution, the median is the robust point
+    estimate an A/B is read from, and spread[cell.metric] = [lo, hi] IS the
+    measured noise floor for that cell.
+    """
+    if not runs:
+        return {"survived": True, "pairs": 0}
+    if len(runs) == 1:
+        return runs[0]
+    out = dict(runs[0])
+    out["iterations"] = len(runs)
+    cells = [r.get("cell") or {} for r in runs]
+    keys = set()
+    for c in cells:
+        keys.update(c.keys())
+    merged, spread = {}, {}
+    for k in sorted(keys):
+        dists = [c[k] for c in cells if c.get(k)]
+        if not dists:
+            merged[k] = None
+            continue
+        d = {}
+        for metric in ("p50", "p99", "p999", "worst", "n"):
+            vals = [x[metric] for x in dists if metric in x]
+            if not vals:
+                continue
+            d[metric] = int(_med(vals))
+            if metric != "n" and len(vals) > 1:
+                spread[f"{k}.{metric}"] = [min(vals), max(vals)]
+        merged[k] = d
+    out["cell"] = merged
+    out["spread"] = spread
+    pipe = merged.get("rtt_pipe") or {}
+    out["total_ops"] = pipe.get("n", 0)
+    out["rtt_median_us"] = pipe.get("p50", 0)
+    out["rtt_p99_us"] = pipe.get("p99", 0)
+    out["rtt_p999_us"] = pipe.get("p999", 0)
+    out["rtt_worst_us"] = pipe.get("worst", 0)
+    out["survived"] = all(r.get("survived", True) for r in runs)
+    return out
+
+
 def measure_ipc(binary: Path, n_cpus: int,
                 rounds: int = IPC_DEFAULT_ROUNDS) -> dict:
     """Measure IPC round-trip latency with the shared IPC engine.
@@ -1350,28 +1048,34 @@ def analyze_ipc_trace(events_path: str) -> dict:
     the holder under saturation, and dispatch self-similarity. montauk is the data
     source -- we surface its own verdict lines, not a hand-rolled re-derivation.
     Returns {} when the capture or analyzer is unavailable."""
+    # THIS USED TO SCRAPE montauk's PROSE. It ran the analyzer for TEXT and then
+    # walked the output looking for "REPORT " headers and "VERDICT:" prefixes,
+    # re-deriving from a rendered page what the tool publishes as typed data. A
+    # verdict sentence carries numbers and is free to be reworded; the envelope's
+    # klass is a fixed token precisely so a caller never has to do this.
     res: dict = {}
-    try:
-        rep = subprocess.run(
-            [*montauk_analyze_argv(), events_path, "--report",
-             "sched,locality,dispatch-stall,fractal"],
-            capture_output=True, text=True, timeout=180)
-    except (OSError, subprocess.SubprocessError):
+    env = montauk_envelope(events_path)
+    if env is None:
         return res
-    cur = None
-    for raw in rep.stdout.splitlines():
-        s = raw.strip()
-        if s.startswith("REPORT "):
-            cur = s[len("REPORT "):].strip()
-        elif cur == "sched" and s.startswith("VERDICT:") and "wake2run" in s \
-                and "wake2run" not in res:
-            res["wake2run"] = s[len("VERDICT:"):].strip()
-        elif cur == "locality" and s.startswith("VERDICT:") and "locality" not in res:
-            res["locality"] = s[len("VERDICT:"):].strip()
-        elif cur == "dispatch-stall" and s.startswith("HELD by:"):
-            res["holder"] = s
-        elif cur == "fractal" and s.startswith("dispatch-rate"):
-            res["fractal"] = " ".join(s.split())
+    for name, key in (("sched", "wake2run"), ("locality", "locality"),
+                      ("fractal", "fractal")):
+        rep = envelope_report(env, name)
+        klass, verdict = envelope_verdict(rep)
+        if verdict:
+            res[key] = verdict
+        if klass:
+            res[f"{key}_class"] = klass
+    stall = envelope_report(env, "dispatch-stall")
+    sklass, sverdict = envelope_verdict(stall)
+    if sverdict:
+        res["holder"] = sverdict
+    if sklass:
+        res["holder_class"] = sklass
+    # The ranked entities montauk already names, which this suite has printed
+    # tables around without ever saying WHO.
+    offs = envelope_offenders(stall)
+    if offs:
+        res["holder_offenders"] = offs[:3]
     return res
 
 
@@ -1532,60 +1236,7 @@ def parse_tick_lines(stdout_text: str) -> list[dict]:
                     tick["batch_us"] = int(m.group(1))
         if tick:
             ticks.append(tick)
-
     return ticks
-
-
-def parse_knobs_line(stdout_text: str) -> dict:
-    """Parse [KNOBS] summary line from scheduler stdout."""
-    for line in stdout_text.splitlines():
-        if "[KNOBS]" not in line:
-            continue
-
-        knobs = {}
-        for m in re.finditer(r"(\w+)=(\S+)", line.split("[KNOBS]")[1]):
-            k, v = m.group(1), m.group(2)
-            if v == "true":
-                knobs[k] = True
-            elif v == "false":
-                knobs[k] = False
-            else:
-                try:
-                    knobs[k] = int(v)
-                except ValueError:
-                    knobs[k] = v
-
-        # Expand ticks=L:5/M:12/H:3
-        if "ticks" in knobs and isinstance(knobs["ticks"], str):
-            ticks_str = knobs.pop("ticks")
-            for part in ticks_str.split("/"):
-                if ":" in part:
-                    prefix, val = part.split(":", 1)
-                    label = {"L": "ticks_light", "M": "ticks_mixed",
-                             "H": "ticks_heavy"}.get(prefix)
-                    if label:
-                        try:
-                            knobs[label] = int(val)
-                        except ValueError:
-                            pass
-
-        # Expand l2_hit=B:75%/I:60%/L:80%
-        if "l2_hit" in knobs and isinstance(knobs["l2_hit"], str):
-            l2_str = knobs.pop("l2_hit")
-            for part in l2_str.split("/"):
-                if ":" in part:
-                    prefix, val = part.split(":", 1)
-                    label = {"B": "l2_hit_batch", "I": "l2_hit_interactive",
-                             "L": "l2_hit_latcrit"}.get(prefix)
-                    if label:
-                        try:
-                            knobs[label] = int(val.rstrip("%"))
-                        except ValueError:
-                            pass
-
-        return knobs
-
-    return {}
 
 
 def aggregate_ticks(ticks: list[dict]) -> dict:
@@ -2386,8 +2037,16 @@ def format_report(data: dict) -> str:
         if has_ipc:
             lines.append("")
             _thru = bool(data.get("ipc_only"))
+            # A median with no spread beside it is the single-draw number under a
+            # new name. When the cell was repeated, print what it ranged over --
+            # that range IS this cell's noise floor, and an A/B delta smaller than
+            # it is not a result.
+            _rep = max((s.get("ipc", {}).get("iterations", 1)
+                        for s in schedulers.values()), default=1)
             _hdr = (f"{'SCHEDULER':<28} {'STATUS':>8} {'PRIM':>8} "
                     f"{'P50':>9} {'P99':>9} {'P99.9':>9} {'WORST':>9}")
+            if _rep > 1:
+                _hdr += f" {'P99 RANGE (n=' + str(_rep) + ')':>22}"
             if _thru:
                 _hdr += f" {'RT/s':>10}"
             lines.append(_hdr)
@@ -2409,18 +2068,99 @@ def format_report(data: dict) -> str:
                     row = (f"{nm:<28} {st:>8} {prim:>8} "
                            f"{str(d['p50'])+'us':>9} {str(d['p99'])+'us':>9} "
                            f"{str(d['p999'])+'us':>9} {str(d['worst'])+'us':>9}")
+                    if _rep > 1:
+                        _sp = (ipc.get("spread") or {}).get(f"{key}.p99")
+                        row += (f" {str(_sp[0]) + '-' + str(_sp[1]) + 'us':>22}"
+                                if _sp else f" {'--':>22}")
                     if _thru:
                         # implied round-trips/sec from the median RTT (1 RT ~= p50)
                         rts = int(1e6 / d['p50']) if d.get('p50') else 0
                         row += f" {rts:>10}"
                     lines.append(row)
+                # WHERE THE HOP'S MICROSECONDS GO. An RTT is two hops. A hop is the
+                # waker running select_cpu and enqueue in its OWN context, then the
+                # kick, then the target CPU's dispatch, then the wakee running.
+                # WAKE2RUN fires after enqueue, so it covers the SECOND half only,
+                # and RTT/2 minus it is the waker-side path -- the map-lookup walk
+                # through warm_stay_anchor, phi_warm_target and
+                # pick_pcpu_dsq_with_spill. The two halves have different suspects,
+                # which is the whole reason to split them.
+                _w2r = ipc.get("wake2run_p50_us")
+                _hp50 = ipc.get("hop_pipe_p50_us")
+                if _w2r is not None and _hp50:
+                    _half = _hp50 / 2.0
+                    # REST, NOT waker-side. A hop is waker-side + wake2run + the
+                    # wakee's own run, and only wake2run is measured here -- so what
+                    # is left over is the other TWO terms, not one of them. The run
+                    # is small for a pipe hop and it is not zero, and montauk's
+                    # slice p50 cannot separate it because that distribution is over
+                    # every task in the capture including the stress workers.
+                    _rest = _half - _w2r
+                    lines.append(
+                        f"{'':<28} {'':>8} {'hop':>8} "
+                        f"{'half-RTT ' + f'{_half:.1f}us':>18}"
+                        f"{'  wake2run ' + f'{_w2r:.1f}us':>20}"
+                        f"{'  rest ' + f'{_rest:.1f}us':>16}"
+                        f"   (iter 1; rest = waker-side + run)")
+                elif _thru and ipc.get("completeness") is not None:
+                    # A recording was read and it carried no wake2run. Absence of a
+                    # recording is silent by design -- a run without --trace owes
+                    # no hop row.
+                    lines.append(f"{'':<28} {'':>8} {'hop':>8} "
+                                 f"  wake2run unavailable -- recording analysed but "
+                                 f"carried no sched stream")
+                # RUN LENGTH AND SERVICE, the two distributions the warp is
+                # computed from and measured against. Silent when the capture
+                # carried neither, which is every run without --trace.
+                _sp50, _sp99 = ipc.get("slice_p50_us"), ipc.get("slice_p99_us")
+                _top1, _pids = (ipc.get("service_top1_pct"),
+                                ipc.get("service_pids"))
+                if _sp50 is not None or _top1 is not None:
+                    _seg = []
+                    if _sp50 is not None:
+                        _seg.append(f"slice p50 {_sp50:.1f}us")
+                    if _sp99 is not None:
+                        _seg.append(f"p99 {_sp99:.1f}us")
+                    if ipc.get("slice_inversion") is not None:
+                        _seg.append(f"inversion {ipc['slice_inversion']:.3f}")
+                    if _top1 is not None:
+                        _seg.append(f"top-1 PID {_top1:.1f}%")
+                    if _pids is not None:
+                        _seg.append(f"of {_pids:.0f} PIDs")
+                    lines.append(f"{'':<28} {'':>8} {'run':>8} "
+                                 + "  ".join(_seg))
                 # montauk deep analysis of this scheduler's capture (--ipc only)
+                # (hop absolutes carry the tracer's own per-event cost, which is a
+                #  real fraction of a 7-15us hop -- read the RATIO between arms,
+                #  never the absolute. Both arms pay the same tax.)
                 if _thru:
                     mon = ipc.get("montauk") or {}
                     for mk in ("wake2run", "locality", "holder", "fractal"):
                         mv = mon.get(mk)
                         if mv:
                             lines.append(f"{'':<20}{mk}: {mv}")
+
+            # WHERE THE ARMS DISAGREE, and only there. montauk publishes a klass
+            # token per report precisely so it can be compared exactly rather
+            # than parsed back out of a verdict sentence. Agreement is not a
+            # finding and is not printed.
+            _cls = {sn: (sd.get("ipc", {}).get("classes") or {})
+                    for sn, sd in schedulers.items()}
+            _cls = {sn: c for sn, c in _cls.items() if c}
+            if len(_cls) > 1:
+                _arms = list(_cls)
+                _rows = [
+                    r for r in sorted(set().union(*(set(c) for c in _cls.values())))
+                    if len({_cls[a].get(r, "") for a in _arms}) > 1]
+                if _rows:
+                    lines.append("")
+                    lines.append("CLASS DISAGREEMENT  (montauk verdict class, per arm)")
+                    lines.append(f"{'REPORT':<28}"
+                                 + "".join(f" {a:>22}" for a in _arms))
+                    for r in _rows:
+                        lines.append(f"{r:<28}"
+                                     + "".join(f" {_cls[a].get(r, '--'):>22}"
+                                               for a in _arms))
 
         # Launch table
         has_launch = any(
@@ -3742,19 +3482,21 @@ def cmd_bench_coldwake(args) -> int:
                                 pandemonium_only=getattr(args, "pandemonium_only", False))
 
 
-def _storm_captured(json_text: str):
-    """montauk v7.17.0+: the --json envelope carries an explicit
+def _storm_captured_env(env):
+    """montauk v7.17.0+: the envelope carries an explicit
     montauk_analysis_storm_captured gauge (0 = storm probes unattached, the
-    surface was never measured). Returns True/False, or None when the envelope
-    is unreadable (older analyzer) so the caller falls back to the text verdict."""
-    try:
-        env = json.loads(json_text)
-        for r in env.get("reports", []):
-            for g in r.get("gauges", []):
-                if g.get("name") == "montauk_analysis_storm_captured":
-                    return bool(g.get("value"))
-    except (ValueError, AttributeError):
-        pass
+    surface was never measured). Returns True/False, or None when there is no
+    envelope (older analyzer) so the caller falls back to the text verdict.
+
+    Takes the PARSED envelope rather than a JSON string: the caller already has
+    one from montauk_report, and re-parsing a second analyzer run to get it was
+    the reason this took text at all.
+    """
+    if env is None:
+        return None
+    for r in env.get("reports", []):
+        if "montauk_analysis_storm_captured" in envelope_gauges(r):
+            return bool(envelope_gauges(r)["montauk_analysis_storm_captured"])
     return None
 
 
@@ -3871,16 +3613,16 @@ def trace_storm_cycle(stamp, n_cpus, duration, busy_per_cpu=4,
                     log_warn(f"[storm] {sched_name}: montauk trace did not attach")
             guard.stop()
             wait_for_deactivation(5.0)
-            rep = subprocess.run([*montauk_analyze_argv(), trace, "--report", "storm"],
-                                 capture_output=True, text=True)
+            # ONE INVOCATION, BOTH FACES. montauk_report renders the text and
+            # parses the envelope from the same analyzer run; this used to spawn
+            # the analyzer twice over the same capture for the two halves.
+            _storm_text, _storm_env = montauk_report(trace, "storm")
             # v7.17.0: query the captured bit as structured data and stamp it
             # into the artifact NOW -- the trace is deleted below, so this is
             # the only moment absence-vs-zero can be recorded. An unmeasured
             # storm surface must never fossilize as an empty .storm file.
-            jrep = subprocess.run([*montauk_analyze_argv(), trace, "--report", "storm", "--json"],
-                                  capture_output=True, text=True)
-            cap = _storm_captured(jrep.stdout)
-            body = rep.stdout
+            cap = _storm_captured_env(_storm_env)
+            body = _storm_text
             if cap is False:
                 body = ("captured: 0\n"
                         "STORM: not captured -- storm probes off (MONTAUK_SCX_STORM "
@@ -3939,8 +3681,8 @@ def cmd_bench_pcpu(args) -> int:
     max_cpus = get_possible_cpus()
     restore_all_cpus(max_cpus)
 
-    if args.core_counts:
-        core_counts = [int(c.strip()) for c in args.core_counts.split(",")]
+    if args.cores:
+        core_counts = [int(c.strip()) for c in args.cores.split(",")]
         core_counts = [c for c in core_counts if 2 <= c <= max_cpus]
         core_counts = sorted(set(core_counts))
     else:
@@ -4267,8 +4009,8 @@ def cmd_bench_scale(args) -> int:
 
     # Core counts (use possible, not online -- previous crash may have left CPUs offline)
     max_cpus = get_possible_cpus()
-    if args.core_counts:
-        core_counts = [int(c.strip()) for c in args.core_counts.split(",")]
+    if args.cores:
+        core_counts = [int(c.strip()) for c in args.cores.split(",")]
         core_counts = [c for c in core_counts if 2 <= c <= max_cpus]
         if max_cpus not in core_counts:
             core_counts.append(max_cpus)
@@ -4475,19 +4217,51 @@ def cmd_bench_scale(args) -> int:
                     # enough to resolve a single RTT landing on the CONFIG_HZ tick
                     # floor. The IPC engine is one clean handoff pair per primitive
                     # (cores unsaturated), so montauk needs no pinned drain core.
-                    if getattr(args, "trace", False) and montauk_available():
-                        safe = (sched_name.replace(" ", "-")
-                                .replace("(", "").replace(")", ""))
-                        with montauk_trace(IPC_COMM, f"ipc-{safe}-{n}c", stamp,
-                                           events=True, sched_detail=True) as _rec:
-                            ipc_result = measure_ipc(BINARY, n)
-                        _ipc_rec = _rec
-                        ipc_result["events"] = (str(_rec.events_path)
-                                                if _rec.events_path else None)
-                        log_info(f"[{sched_name}] {n}C IPC montauk trace -> "
-                                 f"{_rec.dir}")
-                    else:
-                        ipc_result = measure_ipc(BINARY, n)
+                    # --iterations REPEATS THE CELL. It used to be accepted and
+                    # ignored on every single-mode branch, so every IPC number
+                    # ever published was a single draw against a standing
+                    # constraint that demands N>=2. Under --trace only the FIRST
+                    # iteration records: a capture is ~500MB and the repeats
+                    # exist for the distribution, not for N more event streams.
+                    _iters = max(1, getattr(args, "iterations", 1))
+                    _runs = []
+                    for _i in range(_iters):
+                        if _iters > 1:
+                            log_info(f"IPC iteration {_i + 1}/{_iters} "
+                                     f"[{sched_name}] {n}C")
+                        if (_i == 0 and getattr(args, "trace", False)
+                                and montauk_available()):
+                            safe = (sched_name.replace(" ", "-")
+                                    .replace("(", "").replace(")", ""))
+                            with montauk_trace(IPC_COMM, f"ipc-{safe}-{n}c",
+                                               stamp, events=True,
+                                               sched_detail=True) as _rec:
+                                _r = measure_ipc(BINARY, n)
+                            _ipc_rec = _rec
+                            _r["events"] = (str(_rec.events_path)
+                                            if _rec.events_path else None)
+                            log_info(f"[{sched_name}] {n}C IPC montauk trace -> "
+                                     f"{_rec.dir}")
+                        else:
+                            _r = measure_ipc(BINARY, n)
+                        _runs.append(_r)
+                    ipc_result = reduce_ipc_runs(_runs)
+                    # THE RECORDING WAS BEING WRITTEN AND READ BY NOTHING. Fold the
+                    # scheduler-side half of the hop in beside the RTT so the table
+                    # can say WHERE the microseconds go, not only how many.
+                    _hop = ipc_hop_from_recording(_ipc_rec)
+                    if _hop and _runs:
+                        # SAME SAMPLE OR NO SAMPLE. wake2run comes from the
+                        # recording, and only the FIRST iteration records -- so the
+                        # half-RTT it is differenced against has to be that same
+                        # iteration's, not the median of all of them. Subtracting a
+                        # single draw from a 3-run median is two samples wearing one
+                        # subtraction sign.
+                        _p50_0 = ((_runs[0].get("cell") or {})
+                                  .get("rtt_pipe") or {}).get("p50")
+                        if _p50_0:
+                            _hop["hop_pipe_p50_us"] = float(_p50_0)
+                    ipc_result.update(_hop)
                     if sched_ejected(guard):
                         ipc_result["survived"] = False
                         log_error(f"{sched_name} CRASHED during IPC test "
@@ -4521,8 +4295,9 @@ def cmd_bench_scale(args) -> int:
                     # every other durable per-run artifact already lives.
                     _chaos_dst = _ipc_rec.dir if _ipc_rec is not None else None
                     if _chaos_dst is None:
-                        _chaos_dst = ARCHIVE_DIR / f"chaos-{sched_name.split()[-1].strip('()')}-{n}c-{stamp}"
-                        _chaos_dst.mkdir(parents=True, exist_ok=True)
+                        _sn = sched_name.split()[-1].strip("()")
+                        _chaos_dst = (ARCHIVE_DIR / "chaos" /
+                                      f"{_sn}-{n}c-{stamp}.prom")
                     _write_chaos_markers_text(stdout, _chaos_dst)
 
                     # LONGRUN ACTIVATION VERIFICATION
@@ -4577,6 +4352,7 @@ def cmd_bench_scale(args) -> int:
                          capture_output=True).returncode
     if ret == 0:
         log_info("Re-starting PANDEMONIUM service...")
+        note_scheduler_activated()
         subprocess.run(["sudo", "systemctl", "start", "pandemonium"],
                        capture_output=True)
         if wait_for_activation(5.0):
@@ -4783,6 +4559,7 @@ def cmd_bench_sys(args) -> int:
                          capture_output=True).returncode
     if ret == 0:
         log_info("Re-starting PANDEMONIUM service...")
+        note_scheduler_activated()
         subprocess.run(["sudo", "systemctl", "start", "pandemonium"],
                        capture_output=True)
         if wait_for_activation(5.0):
@@ -5499,8 +5276,8 @@ def cmd_bench_contention(args) -> int:
     max_cpus = get_possible_cpus()
     restore_all_cpus(max_cpus)
 
-    if args.core_counts:
-        core_counts = [int(c.strip()) for c in args.core_counts.split(",")]
+    if args.cores:
+        core_counts = [int(c.strip()) for c in args.cores.split(",")]
         core_counts = [c for c in core_counts if 2 <= c <= max_cpus]
         core_counts = sorted(set(core_counts))
     else:
@@ -5799,8 +5576,8 @@ def cmd_bench_scx(args) -> int:
     max_cpus = get_possible_cpus()
     restore_all_cpus(max_cpus)
 
-    if args.core_counts:
-        core_counts = [int(c.strip()) for c in args.core_counts.split(",")]
+    if args.cores:
+        core_counts = [int(c.strip()) for c in args.cores.split(",")]
         core_counts = [c for c in core_counts if 2 <= c <= max_cpus]
         core_counts = sorted(set(core_counts))
     else:
@@ -6052,8 +5829,8 @@ def cmd_low_cpu_deadline(args) -> int:
     max_cpus = get_possible_cpus()
     restore_all_cpus(max_cpus)
 
-    if args.core_counts:
-        core_counts = [int(c.strip()) for c in args.core_counts.split(",")]
+    if args.cores:
+        core_counts = [int(c.strip()) for c in args.cores.split(",")]
         core_counts = [c for c in core_counts if 2 <= c <= max_cpus]
         core_counts = sorted(set(core_counts))
     else:
@@ -6152,7 +5929,7 @@ def main() -> int:
                        default=",".join(DEFAULT_EXTERNALS),
                        help=f"Comma-separated external schedulers "
                             f"(default: {','.join(DEFAULT_EXTERNALS)})")
-    bench.add_argument("--core-counts", type=str, default=None,
+    bench.add_argument("--cores", type=str, default=None,
                        help="Comma-separated core counts "
                             "(default: auto 2,4,8,...,max)")
     bench.add_argument("--burst", action="store_true",
@@ -6188,7 +5965,7 @@ def main() -> int:
                                       help="Contention stress test for v5.4.x adaptive features")
     contention_bench.add_argument("--iterations", type=int, default=1,
                                   help="Full workload iterations per core count (default: 1)")
-    contention_bench.add_argument("--core-counts", type=str, default=None,
+    contention_bench.add_argument("--cores", type=str, default=None,
                                   help="Comma-separated core counts "
                                        "(default: auto 2,4,8,...,max)")
     contention_bench.add_argument("--phase", type=str, default=None,
@@ -6228,7 +6005,7 @@ def main() -> int:
                                 help="Per-CPU DSQ visibility stress test (v5.4.8)")
     pcpu_bench.add_argument("--iterations", type=int, default=1,
                             help="Iterations per core count (default: 1)")
-    pcpu_bench.add_argument("--core-counts", type=str, default=None,
+    pcpu_bench.add_argument("--cores", type=str, default=None,
                             help="Comma-separated core counts "
                                  "(default: auto 2,4,8,...,max)")
     pcpu_bench.add_argument("--trace", action="store_true",
@@ -6263,7 +6040,7 @@ def main() -> int:
         default="32768,262144,2097152,8388608,33554432,134217728",
         help="Memory working sets (bytes) for the cold-cache pointer-chase, L1 to "
              "DRAM (default 32KB,256KB,2MB,8MB,32MB,128MB)")
-    coldwake_bench.add_argument("--core-counts", type=str, default=None,
+    coldwake_bench.add_argument("--cores", type=str, default=None,
         help="Accepted for suite uniformity; cold-wake pins one core regardless")
     coldwake_bench.add_argument("--schedulers", type=str, default="",
         help="Comma-separated scheduler field (EEVDF baseline always; "
@@ -6291,7 +6068,7 @@ def main() -> int:
                            help="Functional test duration in seconds (default: 30)")
     scx_bench.add_argument("--stress-duration", type=int, default=31,
                            help="Stress test duration in seconds (default: 31)")
-    scx_bench.add_argument("--core-counts", type=str, default=None,
+    scx_bench.add_argument("--cores", type=str, default=None,
                            help="Comma-separated core counts "
                                 "(default: auto 2,4,8,...,max)")
     scx_bench.add_argument("--pandemonium-only", action="store_true",
@@ -6304,7 +6081,7 @@ def main() -> int:
     lcd = sub.add_parser("low-cpu-deadline",
                          help="v5.7.0 regression guard: ADAPTIVE deadline "
                               "misses at low core counts (2-4C)")
-    lcd.add_argument("--core-counts", type=str, default=None,
+    lcd.add_argument("--cores", type=str, default=None,
                      help="Comma-separated core counts (default: 2,4)")
     lcd.add_argument("--duration", type=int, default=15,
                      help="Measurement duration per core count (default: 15s)")

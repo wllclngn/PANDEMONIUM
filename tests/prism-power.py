@@ -53,6 +53,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.resolve()))
 from pandemonium_common import (
+    start_and_wait, stop_and_wait, find_scheduler, stop_systemd_scheduler,
     LOG_DIR, ARCHIVE_DIR, BINARY,
     get_version, get_git_info,
     log, log_info, log_warn, log_error,
@@ -63,11 +64,6 @@ from pandemonium_common import (
  warm_sudo, refresh_sudo,)
 
 sys.path.insert(0, str(Path(__file__).parent.resolve()))
-from importlib import import_module
-_tests = import_module("pandemonium-tests")
-start_and_wait = _tests.start_and_wait
-stop_and_wait = _tests.stop_and_wait
-find_scheduler = _tests.find_scheduler
 
 
 # CONFIGURATION
@@ -552,7 +548,8 @@ def _fmt(val, width: int, prec: int = 2, suffix: str = "") -> str:
 def write_report(version: str, git: dict, stamp: str, ncpus: int,
                  vendor: str, model: str, power_events: list[str],
                  turbostat_available: bool, runs: int,
-                 cooldown_secs: int, all_results: dict) -> Path:
+                 cooldown_secs: int, all_results: dict,
+                 cold: dict | None = None) -> Path:
     """Render a column-table summary suitable for committing into the
     archive."""
     R: list[str] = []
@@ -679,6 +676,18 @@ def write_report(version: str, git: dict, stamp: str, ncpus: int,
                     row += f" {'n/a':>15}"
                 R.append(row)
             R.append("")
+
+    if cold is not None:
+        R.append("COLD-WAKE  (idle-exit cost -- the other half of the idle trade)")
+        if cold.get("rc") == 0:
+            R.append(f"  ran {cold.get('duration')}s per scheduler arm under "
+                     f"powersave; montauk's COLD-WAKE block separates the")
+            R.append("  governor frequency ramp from scheduler dispatch delay. "
+                     "See the prism-coldwake log and recording.")
+        else:
+            R.append(f"  DID NOT COMPLETE (exit {cold.get('rc')}). The energy "
+                     f"numbers above stand; the cost side is missing.")
+        R.append("")
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     path = LOG_DIR / f"prism-power-{stamp}.log"
@@ -827,6 +836,18 @@ def main() -> int:
                     help="Skip PANDEMONIUM (debugging external schedulers)")
     ap.add_argument("--no-build", action="store_true",
                     help="Skip ensure_build (use existing binary)")
+    # COLD-WAKE IS POWER'S FOURTH ARM. The energy workloads measure what idle
+    # SAVES; cold-wake measures what idle COSTS -- the dispatch delay on the
+    # first wake off a deep-idle core, separated from the governor's frequency
+    # ramp. Reporting the win without the cost is half the trade, which is why
+    # these were never two benches. prism-coldwake keeps its own entry point
+    # because --dev storm shares that implementation.
+    ap.add_argument("--no-cold-wake", action="store_true",
+                    help="Skip the cold-wake arm (energy workloads only)")
+    ap.add_argument("--cold-wake-duration", type=int, default=60,
+                    help="Cold-wake cycle window per scheduler arm (default 60)")
+    ap.add_argument("--cores", type=str, default=None,
+                    help="Accepted for suite uniformity; RAPL is measured whole-package, not per width")
     args = ap.parse_args()
     args.schedulers = [s.strip() for s in args.schedulers.split(",") if s.strip()]
 
@@ -880,7 +901,7 @@ def main() -> int:
     if is_scx_active():
         active = scx_scheduler_name()
         log_warn(f"sched_ext active ({active}) -- stopping pandemonium service")
-        _tests.stop_systemd_scheduler()
+        stop_systemd_scheduler()
         if not wait_for_deactivation(5.0):
             log_error("Could not deactivate sched_ext")
             return 1
@@ -948,11 +969,27 @@ def main() -> int:
         if is_scx_active():
             wait_for_deactivation(5.0)
 
+    cold = None
+    if not args.no_cold_wake:
+        print()
+        log_info("COLD-WAKE ARM: idle-exit latency, the cost side of the idle win")
+        _cw = [sys.executable, str(Path(__file__).parent / "pandemonium-tests.py"),
+               "prism-coldwake", "--trace",
+               "--duration", str(args.cold_wake_duration)]
+        try:
+            _rc = subprocess.run(_cw).returncode
+            cold = {"rc": _rc, "duration": args.cold_wake_duration}
+            if _rc != 0:
+                log_warn(f"cold-wake arm exited {_rc}; energy results stand alone")
+        except Exception as e:
+            log_warn(f"cold-wake arm did not run: {e}")
+
     if any(by_wl for by_wl in all_results.values()):
         print()
         report_path = write_report(ver, git, stamp, n_cpus, vendor, model,
                                    power_events, turbostat_path is not None,
-                                   args.iterations, args.cooldown, all_results)
+                                   args.iterations, args.cooldown, all_results,
+                                   cold=cold)
         prom_path = write_prometheus(ver, git, stamp, n_cpus, vendor, model,
                                      power_events, args.iterations, args.cooldown,
                                      all_results)
