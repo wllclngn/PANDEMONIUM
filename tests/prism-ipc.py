@@ -7,7 +7,7 @@ per-width restrict_cpus, telemetry-on-stop), the per-scheduler crash detection,
 the logging format, and the .prom output that prism-scale and every other
 prism-* use. There is no separate IPC engine or lifecycle here -- that is the
 whole point: the one that does not crash sched_ext is prism-scale's, so we use
-it. All arguments pass straight through (--pandemonium-only, --core-counts,
+it. All arguments pass straight through (--pandemonium-only, --cores,
 --iterations, --schedulers, ...).
 """
 import subprocess

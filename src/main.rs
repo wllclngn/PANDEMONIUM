@@ -309,11 +309,12 @@ fn run_scheduler(
                 0
             };
             println!(
-                "[KNOBS] regime=BPF slice_ns={} batch_ns={} preempt_ns={} l2_hit=B:{}%/I:{}% cross_domain_scatter_pct={} cross_domain_sel_tight={} cross_domain_sel_sync={} cross_domain_sel_normal={} cross_domain_sel_dfl={} cross_domain_enq_t1={} cross_domain_enq_t2={} cross_domain_steal={} cross_domain_step5={}",
+                "[KNOBS] regime=BPF slice_ns={} batch_ns={} preempt_ns={} l2_hit=B:{}%/I:{}% cross_domain_scatter_pct={} cross_domain_sel_tight={} cross_domain_sel_sync={} cross_domain_sel_normal={} cross_domain_sel_dfl={} cross_domain_enq_t1={} cross_domain_enq_t2={} cross_domain_steal={} cross_domain_step5={} steal={} dispatches={}",
                 knobs.slice_ns, knobs.batch_slice_ns,
                 knobs.preempt_thresh_ns,
                 l2_cum_b, l2_cum_i,
                 x_scatter_pct, x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7],
+                final_stats.nr_steal, final_stats.nr_dispatches,
             );
 
             sched.read_exit_info()

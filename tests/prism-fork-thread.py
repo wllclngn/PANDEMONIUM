@@ -25,6 +25,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.resolve()))
 from pandemonium_common import (
     start_and_wait, stop_and_wait, find_scheduler, trace_workload, stop_systemd_scheduler,
+    parse_knobs_line,
     LOG_DIR, ARCHIVE_DIR, BINARY,
     get_version, get_git_info,
     log, log_info, log_warn, log_error,
@@ -194,12 +195,34 @@ def _spread_stats(xs):
     }
 
 
-def write_prometheus(version, git, stamp, ncpus, cells_data, loops):
+def write_prometheus(version, git, stamp, ncpus, cells_data, loops,
+                     steal_by_sched=None):
     pb = PrometheusBuilder("fork_thread")
     pb.info(ts=int(datetime.strptime(stamp, "%Y%m%d-%H%M%S").timestamp()),
             version=version, git_commit=git["commit"], git_dirty=git["dirty"])
     pb.gauge("cpus", ncpus, help="CPUs available")
     pb.gauge("loops", loops, help="loops per sender per receiver")
+
+    # THE DRAIN SIDE'S SHARE OF THE MIGRATION COUNT, which no other series here
+    # can state. The cross_domain_* family counts CROSS-domain landings only and
+    # the locality tiers put ~97% of moves inside L2/L3, so a steal share read
+    # from those is a share of the minority. nr_steal is every successful STEP 1
+    # peer move_to_local, cross or not, and it is per-scheduler rather than
+    # per-cell because the scheduler is torn down once per arm.
+    for _sn, (_st, _sp, _di) in (steal_by_sched or {}).items():
+        pb.gauge("steal_total", _st, help="successful STEP 1 peer steals",
+                 labels={"scheduler": _sn})
+        pb.gauge("spill_total", _sp, help="sibling spills (placement side)",
+                 labels={"scheduler": _sn})
+        pb.gauge("dispatches_total", _di, help="total dispatches",
+                 labels={"scheduler": _sn})
+        if _di > 0:
+            pb.gauge("steal_share_pct", f"{100.0 * _st / _di:.4f}",
+                     help="steals as a percent of dispatches",
+                     labels={"scheduler": _sn})
+            pb.gauge("spill_share_pct", f"{100.0 * _sp / _di:.4f}",
+                     help="spills as a percent of dispatches",
+                     labels={"scheduler": _sn})
 
     # One cell = one workload shape (mode x groups). Every series carries mode and
     # groups labels, so the archive holds the whole sweep -- a population run can
@@ -495,7 +518,8 @@ def _cell_block(report, cell, loops, all_results, all_spreads, trace_results):
             report.append("")
 
 
-def write_report(version, git, stamp, ncpus, cells_data, loops):
+def write_report(version, git, stamp, ncpus, cells_data, loops,
+                 steal_by_sched=None):
     report = []
     report.append(f"prism-fork-thread v{version} [{git['commit']}]")
     report.append(f"cpus: {ncpus}  cells: {len(cells_data)}  loops: {loops}")
@@ -509,6 +533,33 @@ def write_report(version, git, stamp, ncpus, cells_data, loops):
 
     for cell, all_results, all_spreads, trace_results in cells_data:
         _cell_block(report, cell, loops, all_results, all_spreads, trace_results)
+
+    # THE DRAIN SIDE'S SHARE OF THE MIGRATION COUNT. Per ARM rather than per
+    # cell, because the scheduler is torn down once per arm and the [KNOBS] line
+    # it prints on the way out is cumulative over every cell it served.
+    # STEP 1's steal is the only migration path that charges a base fare before
+    # it moves anything -- codel_target_ns plus the R_eff distance price. Every
+    # other path charges nothing. A share near zero says the cpu-migrations
+    # count above is placement, and that tuning the steal cannot reach it.
+    if steal_by_sched:
+        report.append("MIGRATION ORIGIN  (cumulative per arm)")
+        report.append(table_header("SCHEDULER", ["STEALS", "SPILLS",
+                                                 "DISPATCHES", "STEAL %",
+                                                 "SPILL %"]))
+        for sn, (st, sp, di) in steal_by_sched.items():
+            report.append(table_row(sn, [
+                f"{st}", f"{sp}", f"{di}",
+                f"{100.0 * st / di:.3f}%" if di else "-",
+                f"{100.0 * sp / di:.3f}%" if di else "-"]))
+        report.append("  STEALS are the drain side, STEP 1's peer "
+                      "move_to_local -- the only migration path charging a base "
+                      "fare before it moves. SPILLS are the placement side, a "
+                      "wakee seated on a peer instead of its own source CPU, "
+                      "gated on queue depth alone. Both count cross- and "
+                      "same-domain moves, which the cross_domain_* paths cannot: "
+                      "those see CROSS-domain landings only and most moves stay "
+                      "inside L2/L3.")
+        report.append("")
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     path = LOG_DIR / f"prism-fork-thread-{stamp}.log"
@@ -917,6 +968,14 @@ def main():
                          "0 = Phi off) plus the topology default and EEVDF. Bare "
                          "--phi-sweep tests {0, default}. Isolates Phi's marginal "
                          "effect on this CPU's CCX layout.")
+    ap.add_argument("--cascade-sweep", action="store_true",
+                    help="Cascade A/B: instead of the full scx field, run "
+                         "PANDEMONIUM (BPF mode) with the migration-cascade "
+                         "forcing term ON and OFF, plus EEVDF. BOTH ARMS IN "
+                         "ONE RUN against one baseline -- the force is a "
+                         "few-percent effect and this bench's run-to-run "
+                         "spread at n=1 is larger than that, so the halves "
+                         "have to share a box state to be comparable at all.")
     ap.add_argument("--cores", type=str, default=None,
                     help="Accepted for suite uniformity; the storm runs at native width (the fork rate IS the axis)")
     args = ap.parse_args()
@@ -932,10 +991,11 @@ def main():
     # sched_ext load), so self-elevate once up front -- matches --trace and the
     # RUN-BARE convention (the bench acquires its own root; the user never sudo's).
     run_burst = (not args.no_burst and args.phi_sweep is None
-                 and montauk_available())
+                 and not args.cascade_sweep and montauk_available())
     if run_burst and os.geteuid() != 0:
         os.execvp("sudo", ["sudo", sys.executable, *sys.argv])
-    if not args.no_burst and args.phi_sweep is None and not montauk_available():
+    if (not args.no_burst and args.phi_sweep is None
+            and not args.cascade_sweep and not montauk_available()):
         log_warn("montauk not found -- skipping phase 1 (traced burst); running "
                  "cost-only. Install montauk for the wake2run + locality axes.")
 
@@ -981,6 +1041,20 @@ def main():
                 (f"PANDEMONIUM (phi={v})", [str(BINARY), "--no-adaptive", "--phi-scale", v])
             )
         log_info(f"PHI SWEEP: topology default + values {vals} (BPF mode)")
+        cells = [Cell(f"thread/g{NUM_GROUPS}", True, NUM_GROUPS)]
+    elif args.cascade_sweep:
+        # CASCADE A/B: hold everything constant, vary only the oscillator's
+        # second forcing term via the scheduler's --no-cascade override. BPF
+        # mode, matching the phi sweep and the established BPF anchor -- no
+        # adaptive loop to perturb the one knob under test. The estimator runs
+        # in BOTH arms and reports fano_q8 either way; only the force is off.
+        entries = [
+            ("EEVDF", None),
+            ("PANDEMONIUM (cascade=on)", [str(BINARY), "--no-adaptive"]),
+            ("PANDEMONIUM (cascade=off)",
+             [str(BINARY), "--no-adaptive", "--no-cascade"]),
+        ]
+        log_info("CASCADE SWEEP: forcing term on vs off (BPF mode)")
         cells = [Cell(f"thread/g{NUM_GROUPS}", True, NUM_GROUPS)]
     else:
         entries = [
@@ -1040,6 +1114,7 @@ def main():
     # scheduler per cell.
     results_by_cell = {c.label: {} for c in cells}
     spreads_by_cell = {c.label: {} for c in cells}
+    steal_by_sched = {}
 
     try:
         for sched_name, cmd in entries:
@@ -1060,7 +1135,16 @@ def main():
                     spreads_by_cell[cell.label][sched_name] = spreads
 
             if guard is not None:
-                stop_and_wait(guard)
+                # stop_and_wait RETURNS the scheduler's stdout, and the [KNOBS]
+                # shutdown line is the only place the steal total is stated.
+                # Dropping it left this bench -- the one where the migration
+                # count lives -- unable to say what fraction of those migrations
+                # the drain side produced.
+                _k = parse_knobs_line(stop_and_wait(guard) or "")
+                if "steal" in _k and _k.get("dispatches"):
+                    steal_by_sched[sched_name] = (int(_k["steal"]),
+                                                  int(_k.get("spill", 0)),
+                                                  int(_k["dispatches"]))
             time.sleep(2)
             print()
 
@@ -1078,8 +1162,10 @@ def main():
                   for cell in cells]
     if any(results_by_cell[c.label] for c in cells):
         print()
-        prom_path = write_prometheus(ver, git, stamp, ncpus, cells_data, NR_LOOPS)
-        report_path = write_report(ver, git, stamp, ncpus, cells_data, NR_LOOPS)
+        prom_path = write_prometheus(ver, git, stamp, ncpus, cells_data, NR_LOOPS,
+                                     steal_by_sched)
+        report_path = write_report(ver, git, stamp, ncpus, cells_data, NR_LOOPS,
+                                   steal_by_sched)
 
         log.report(report_path.read_text())
         log_info(f"REPORT: {report_path}")

@@ -38,7 +38,7 @@ from pandemonium_common import (  # noqa: E402
     TRACE_DIR, LOG_DIR, get_online_cpus, get_possible_cpus,
     is_scx_active, scx_scheduler_name, wait_for_deactivation,
     stall_susceptibility, median, restore_all_cpus,
-    eject_scheduler, install_exit_guard,
+    eject_scheduler, install_exit_guard, note_scheduler_activated,
 )
 
 TESTS_DIR = Path(__file__).resolve().parent
@@ -440,10 +440,18 @@ def run_profile(schedulers: str, all_scx: bool, ultra: bool = False,
     py = sys.executable
     ncpus = get_online_cpus()
     ensure_trace_dir()
+    # OWNERSHIP, AND WHY IT IS DECLARED HERE. eject_scheduler() refuses to touch a
+    # scheduler this PROCESS did not activate, so a user's own scheduler survives a
+    # prism run. The profile activates through CHILD benches, each of which sets the
+    # flag in its own interpreter -- prism's copy stayed False, so main's Ctrl+C
+    # handler called eject_scheduler() and it returned having done nothing, leaving
+    # the scheduler registered on every interrupt. The profile owns what its children
+    # activate; trace mode still short-circuits one line earlier and never ejects.
+    note_scheduler_activated()
     start = datetime.now().timestamp()
     # Default pins the width benches to native width (one capture each); --ultra
     # drops the pin so they fall to the suite's full compute_core_counts() sweep.
-    width_flags = [] if ultra else ["--core-counts", str(ncpus)]
+    width_flags = [] if ultra else ["--cores", str(ncpus)]
     benches = [
         ("cachyos", [py, str(TESTS_DIR / "prism-cachyos.py"),
                      "--trace", "--iterations", "1",
@@ -452,7 +460,7 @@ def run_profile(schedulers: str, all_scx: bool, ultra: bool = False,
                          "--quick",
                          "--iterations", str(PROFILE_ITERATIONS)]),
         ("ipc", [py, str(TESTS_DIR / "prism-ipc.py"),
-                 "--trace", "--core-counts", str(ncpus)]),
+                 "--trace", "--cores", str(ncpus)]),
         # The two width-specific faults: burst-starvation (prism-pcpu's per-CPU
         # DSQ "probe during burst") bites at 2C, sojourn-pressure (prism-
         # contention's deep-batch rescue phase) blows up at 8C. Native width by
@@ -617,7 +625,7 @@ def write_stability_markers(rec_dir: Path, dmesg: "DmesgMonitor",
         log_warn(f"could not write stability markers to {rec_dir.name}: {e}")
 
 
-def digest_envelope(analyze: str, rec_dir: Path) -> tuple[dict | None, str]:
+def digest_envelope(analyze: list[str], rec_dir: Path) -> tuple[dict | None, str]:
     """(envelope, text) for one recording's montauk digest.
 
     The ENVELOPE (`--digest --redact --json`) is what prism reads; the text is
@@ -627,9 +635,9 @@ def digest_envelope(analyze: str, rec_dir: Path) -> tuple[dict | None, str]:
     one typed result, so parsing the prose was scraping a rendering when the data
     was one flag away."""
     import json as _json
-    text = subprocess.run([analyze, str(rec_dir), "--digest", "--redact"],
+    text = subprocess.run([*analyze, str(rec_dir), "--digest", "--redact"],
                           capture_output=True, text=True).stdout
-    r = subprocess.run([analyze, str(rec_dir), "--digest", "--redact", "--json"],
+    r = subprocess.run([*analyze, str(rec_dir), "--digest", "--redact", "--json"],
                        capture_output=True, text=True)
     if r.returncode != 0 or not r.stdout.strip():
         log_warn(f"montauk --analyze --digest --json produced nothing for "
@@ -939,7 +947,7 @@ def read_prom_gauges(path: Path) -> list[tuple[str, dict, float]]:
     return out
 
 
-def _build_population(analyze: str, prom: Path | None) -> str:
+def _build_population(analyze: list[str], prom: Path | None) -> str:
     """Run montauk's population comparison over every prism-pop .prom on the box
     and render its verdict. The whole set is the population: one run is N=1 and
     montauk says so rather than pretending otherwise."""
@@ -948,7 +956,7 @@ def _build_population(analyze: str, prom: Path | None) -> str:
     proms = sorted(LOG_DIR.glob("prism-pop-*.prom"))
     if not proms:
         return ""
-    r = subprocess.run([analyze, *[str(p) for p in proms],
+    r = subprocess.run([*analyze, *[str(p) for p in proms],
                         "--by", "scheduler", "--pairs", "all",
                         "--metric", _POP_METRIC],
                        capture_output=True, text=True)
@@ -1297,6 +1305,10 @@ def main() -> int:
                     help="force a montauk capture for --dev workloads (trace-capable "
                          "ones capture anyway; this also forces the longrun/mixed probe "
                          "capture in scale)")
+    ap.add_argument("--cascade-sweep", action="store_true",
+                    help="fork-thread only: run the migration-cascade forcing "
+                         "term ON and OFF as two arms of ONE run, against a "
+                         "shared EEVDF baseline.")
     ap.add_argument("--pandemonium-only", action="store_true",
                     help="skip the EEVDF baseline (and any external schedulers) -- run "
                          "only the PANDEMONIUM arms. Propagates to the default profile "
@@ -1428,6 +1440,8 @@ def main() -> int:
             # Unified contract: pass the standard flags straight through. Every
             # implementer accepts them (real or documented no-op); no dispatcher
             # membership table to fall out of date.
+            if args.cascade_sweep and n == "fork-thread":
+                dev_cmd.append("--cascade-sweep")
             if args.pandemonium_only:
                 dev_cmd.append("--pandemonium-only")
             elif args.schedulers or args.all_scx:
@@ -1492,6 +1506,7 @@ def main() -> int:
         log_warn(f"CLEAN-ROOM: NOISY ({cleanroom['detail']}). Single-run tails "
                  "are background-contaminated; a reboot gives trustworthy numbers.")
     reports: list[Path] = []
+    report_built = False
     try:
         for it in range(iters):
             if iters > 1:
@@ -1537,6 +1552,7 @@ def main() -> int:
         else:
             log_info(f"{len(reports)} reports written -- each small, redacted, and "
                      "self-contained.")
+        report_built = True
     except KeyboardInterrupt:
         # Respect Ctrl+C: the profile activates its own schedulers, so eject
         # whatever is registered and leave the box on stock EEVDF. Trace mode
@@ -1553,7 +1569,18 @@ def main() -> int:
         eject_scheduler(trace_mode, interrupted=True)
         raise
     finally:
-        remove_montauk_if_ours(installed_by_us, uninstall_after)
+        # THE TEARDOWN IS CONDITIONAL ON A REPORT EXISTING, AND finally WAS THE WRONG
+        # CONSTRUCT FOR IT. Removing montauk on the failure path takes the one tool
+        # that can assemble a report from the captures that survived -- the run's
+        # expensive half is on disk in TRACE_DIR, and an interrupt or a crash in
+        # assembly used to delete the analyzer on its way out, turning a retry into
+        # a clone-and-rebuild. Remove it when the report is written; otherwise keep
+        # it and name the command that finishes the job.
+        if report_built:
+            remove_montauk_if_ours(installed_by_us, uninstall_after)
+        elif installed_by_us and uninstall_after:
+            log_warn(f"no report was written -- KEEPING montauk; the captures in "
+                     f"{TRACE_DIR} are intact and assembling them needs it.")
         # BACKSTOP: the scale/contention arms offline CPUs via hotplug; the bench subprocess
         # restores them on its own SIGINT (_cleanup_on_exit), but if it was killed before that
         # could run, restore here so the box is NEVER left stuck on a subset of cores. Idempotent.

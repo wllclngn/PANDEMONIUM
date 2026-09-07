@@ -1,6 +1,6 @@
 [package]
 name = "pandemonium"
-version = "5.20.0"
+version = "5.21.0"
 edition = "2021"
 description = "An adaptive sched_ext scheduler: CoDel sojourn ordering, effective-resistance distance pricing and knobs derived each second from measured per-CPU queue behaviour"
 license = "GPL-2.0-only"

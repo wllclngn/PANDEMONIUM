@@ -800,14 +800,15 @@ pub fn monitor_loop(
     }
 
     println!(
-        "[KNOBS] regime={} slice_ns={} batch_ns={} preempt_ns={} mwu={:.3} ticks=L:{}/M:{}/H:{} frozen={} l2_hit=B:{}%/I:{}% cross_domain_scatter_pct={} cross_domain_sel_tight={} cross_domain_sel_sync={} cross_domain_sel_normal={} cross_domain_sel_dfl={} cross_domain_enq_t1={} cross_domain_enq_t2={} cross_domain_steal={} cross_domain_step5={} osc_park={}",
+        "[KNOBS] regime={} slice_ns={} batch_ns={} preempt_ns={} mwu={:.3} ticks=L:{}/M:{}/H:{} frozen={} l2_hit=B:{}%/I:{}% cross_domain_scatter_pct={} cross_domain_sel_tight={} cross_domain_sel_sync={} cross_domain_sel_normal={} cross_domain_sel_dfl={} cross_domain_enq_t1={} cross_domain_enq_t2={} cross_domain_steal={} cross_domain_step5={} osc_park={} steal={} dispatches={}",
         regime.label(), final_knobs.slice_ns, final_knobs.batch_slice_ns,
         final_knobs.preempt_thresh_ns,
         0.0f64,
         light_ticks, mixed_ticks, heavy_ticks, frozen_ticks,
         l2_cum_b, l2_cum_i,
         x_scatter_pct, x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7],
-        final_stats.nr_osc_park,
+        final_stats.nr_osc_park, final_stats.nr_steal,
+        final_stats.nr_dispatches,
     );
 
     // READ UEI EXIT REASON

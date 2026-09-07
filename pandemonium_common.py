@@ -36,6 +36,7 @@ ARCHIVE_DIR = LOG_DIR
 # Keep them in /tmp per the project log convention, off the home cache.
 TRACE_DIR = Path("/tmp/pandemonium")
 BINARY = TARGET_DIR / "release" / "pandemonium"
+
 VMLINUX_CACHE = ARCHIVE_DIR / "vmlinux.h"
 MIN_KERNEL = (6, 12)
 
@@ -398,17 +399,35 @@ def ensure_build():
 # per measurement cell (post-collection), NEVER on a per-sample hot path, so the
 # subprocess cost is immaterial and never perturbs a live latency probe.
 
-_SUBLIMATION = shutil.which("sublimation")
+_SUBLIMATION: str | None = None
+
+
+def _sublimation_bin() -> str | None:
+    """Resolve sublimation LAZILY and cache only a HIT.
+
+    This was a module-level shutil.which(), which froze the answer at import.
+    prism imports this module before ensure_montauk() has run, so on any box
+    where the previous run uninstalled the pair the lookup cached None -- and
+    stayed None for the life of the process even though the install landed
+    seconds later. The benches never noticed, because they invoke montauk by
+    absolute path; report assembly did, twenty minutes downstream, by which
+    point the run was over and the failure read as a missing dependency that
+    was in fact sitting in /usr/local/bin. Cache the hit, never the miss."""
+    global _SUBLIMATION
+    if not _SUBLIMATION:
+        _SUBLIMATION = shutil.which("sublimation")
+    return _SUBLIMATION
 
 
 def _sub_numeric(values: list[float], args: list[str]):
     """Pipe `values` to `sublimation <args>` and return the parsed result (int when
     integral, else float). montauk/sublimation are a HARD dependency -- there is no
     Python fallback; a failure raises rather than silently diverge from the tool."""
-    if not _SUBLIMATION:
+    sub = _sublimation_bin()
+    if not sub:
         raise RuntimeError("sublimation is required (it ships with montauk) -- install montauk")
     r = subprocess.run(
-        [_SUBLIMATION, *args],
+        [sub, *args],
         input="\n".join(repr(v) for v in values),
         capture_output=True, text=True, timeout=10,
     )

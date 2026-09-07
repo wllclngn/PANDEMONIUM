@@ -1597,6 +1597,20 @@ def write_prometheus(data: dict, stamp: str) -> Path:
                               knobs[key],
                               {**telem_labels, "path": xk})
 
+                # TOTAL STEALS AND DISPATCHES, WHICH THE cross_domain_* FAMILY
+                # CANNOT SEE. Those count only the CROSS-domain half, and on a
+                # two-domain box most moves are same-domain -- so a steal share
+                # read from them alone is a share of the minority. nr_steal is
+                # every successful STEP 1 peer move_to_local, cross or not, and
+                # against nr_dispatches it is the drain side's actual share of
+                # the migration count.
+                for tk, tdesc in (("steal", "Total STEP 1 peer steals"),
+                                  ("spill", "Total sibling spills"),
+                                  ("dispatches", "Total dispatches")):
+                    if tk in knobs:
+                        gauge(f"pandemonium_bench_{tk}_total", tdesc,
+                              knobs[tk], telem_labels)
+
                 # OSCILLATOR ENVELOPE PARKS: the idle-quiescence collapse
                 # detector. Zero after an idle-heavy arm means the envelope
                 # never parked, so the control effort kept recomputing through

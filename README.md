@@ -4,7 +4,7 @@ A Linux kernel scheduler for sched_ext, built in Rust and C23, PANDEMONIUM assig
 
 Overflow sojourn rescue, longrun detection, sleep-informed batch tuning, tier-gated DSQ routing, a migration-potential-gated R_eff work steal, a Φ-priced placement spill, a Φ-priced warm-stay home anchor, a sojourn selector whose warp is bounded by the live CoDel target, a slice quantum priced in the same unit, an off-tick unified sojourn bound, an RT-policy latency floor and hard starvation rescue.
 
-See the [New User Guide](NEW-USER-GUIDE.md) for an introduction — the ideas behind PANDEMONIUM in plain language.
+See the [New User Guide](https://github.com/wllclngn/PANDEMONIUM/blob/main/NEW-USER-GUIDE.md) for an introduction — the ideas behind PANDEMONIUM in plain language.
 
 PANDEMONIUM is included in the [sched-ext/scx](https://github.com/sched-ext/scx) project alongside scx_rusty, scx_lavd, scx_cosmos and the rest of the sched_ext family. Thank you to Piotr Gorski and the sched-ext team. PANDEMONIUM is made possible by contributions from the sched_ext, CachyOS, Gentoo, OpenSUSE, Arch, Ubuntu and NixOS communities within the Linux ecosystem.
 
@@ -188,7 +188,7 @@ There is no burst detector, and nothing needs one: A burst is already answered b
 
 ### Sojourn Selector: The CoDel-bounded warp
 
-There is no weighted virtual-time engine. `task_deadline()` returns `now − warp` — the enqueue timestamp back-dated by a bounded per-tier warp — so every DSQ is ordered oldest-first (largest sojourn served first). Sojourn IS the selector; no second fairness clock runs parallel to the sojourn + R_eff/CoDel layer.
+There is no weighted virtual-time engine. `task_deadline()` returns `now − warp` — the enqueue timestamp back-dated by a bounded warp, with no tier term — so every DSQ is ordered oldest-first (largest sojourn served first). Sojourn IS the selector; no second fairness clock runs parallel to the sojourn + R_eff/CoDel layer.
 
 **The ordering bound and the starvation bound are separate numbers.** The warp is the share of one live CoDel target a task left unconsumed on its last run — `codel_target_ns − last_run_ns`, floored at zero. A task that blocked immediately earns a full target; one that held the CPU for a target or longer earns nothing; everything between is continuous, with no classifier, no maturity gate and no fixed steps (THE FLAG). It is bounded by the target by construction, so a task that has waited past one target out-sorts any fresh claim.
 
@@ -198,7 +198,7 @@ Starvation-freedom is therefore structural rather than clamped: A task older tha
 
 ### Hard Starvation Rescue
 
-Two bounds sit under the dispatch waterfall, the tighter one first. `sweep_bound_preempt` runs off-tick and NO_HZ_FULL-immune: It rotates through CPUs and forces one back into `dispatch()` whenever an overflow head ages past `lag_cap_ns` (see Warp above, ~13ms at 12C). Beneath it, `codel_starve_ns` — `clamp(K_STARVATION_RESCUE × τ, 20ms, 500ms)`, ~167ms at the 12C reference — is the last-resort threshold in dispatch: Past it, the older overflow side is serviced unconditionally. The off-tick bound catches the common case; the starve threshold is the floor under everything, including a CPU the sweep has not yet rotated to. A pinned single-CPU task (per-CPU kworker, IRQ thread, cpuset) is a separate hazard: It can only run on its one CPU, and if that CPU is idle it never ticks, so the in-tick rescue scan never fires and the task strands until the 30s scx watchdog disables the scheduler. A tick-independent guard on the enqueue path seats a pinned task on its own CPU and `SCX_KICK_PREEMPT`s it at enqueue (an event scx guarantees runs), closing the watchdog-disable the tick-driven rescue cannot reach.
+Two bounds sit under the dispatch waterfall, the tighter one first. `sweep_bound_preempt` runs off-tick and NO_HZ_FULL-immune: It rotates through CPUs and forces one back into `dispatch()` whenever an overflow head ages past `lag_cap_ns` — `clamp(K_LAG_CAP × τ, 8ms, 80ms)`, ~13.3ms at the 12C reference, and the starvation bound rather than the warp ceiling. Beneath it, `codel_starve_ns` — `clamp(K_STARVATION_RESCUE × τ, 20ms, 500ms)`, ~55.6ms at the 12C reference — is the last-resort threshold in dispatch: Past it, the older overflow side is serviced unconditionally. The off-tick bound catches the common case; the starve threshold is the floor under everything, including a CPU the sweep has not yet rotated to. A pinned single-CPU task (per-CPU kworker, IRQ thread, cpuset) is a separate hazard: It can only run on its one CPU, and if that CPU is idle it never ticks, so the in-tick rescue scan never fires and the task strands until the 30s scx watchdog disables the scheduler. A tick-independent guard on the enqueue path seats a pinned task on its own CPU and `SCX_KICK_PREEMPT`s it at enqueue (an event scx guarantees runs), closing the watchdog-disable the tick-driven rescue cannot reach.
 
 ### Topology-Aware Placement
 
@@ -268,7 +268,7 @@ Every knob derives from one sensor, and the mapping is the design:
 
 All timing constants scale from `tau_ns = TAU_SCALE_NS / √(λ₂ · N)` — capacity-aware (the geometric mean of connectivity `1/λ₂` and capacity `1/√N`, so a well-connected but core-starved topology loosens instead of tightening), with safety-rail clamps. 12C reference: τ≈13.3ms (λ₂=12, N=12). Cardinality decisions (per-CPU DSQ depth, wake_wide threshold, tick scan budget) use `nr_cpus` directly — counts are not tau-derived. **The per-column τ values and derived cells below are an approximate reference; the live values are derived at runtime from the capacity-aware τ law.**
 
-Every constant in that law is derived at runtime and none is tabulated here: The sojourn interval, the starvation rescue, the CoDel floor/ceiling/equilibrium, the warp bound, the spill and idle-search budgets, the per-CPU DSQ depth and the longrun preempt shift all fall out of τ with safety-rail clamps. A machine with a different topology gets different numbers by construction, which is the point.
+Every constant in that law is derived at runtime and none is tabulated here: The sojourn interval, the starvation rescue, the CoDel floor/ceiling/equilibrium, the warp bound, the spill and idle-search budgets, the per-CPU DSQ depth and the longrun preempt shift all fall out of τ with safety-rail clamps. One exception, stated because the claim is otherwise exact: The sojourn interval lands on its own clamp floor at 12C, so on this topology it is a constant rather than a τ-derived value. A machine with a different topology gets different numbers by construction, which is the point.
 
 - **Low-core slice discipline**: τ is largest at low core count (λ₂ shrinks as cores drop), so the tau slice cap runs loosest exactly where a wide batch slice hurts most — a 4ms slice on 2–4 cores denies a latency-sensitive probe across many consecutive slices, the low-core tail. The slice is capped to 1ms at `nr_cpus ≤ 4`, where a wide slice buys no throughput; 8C/12C keep the tau-scaled width, where it earns it.
 - **CPU Hotplug**: `cpu_online`/`cpu_offline` callbacks clear per-CPU timestamps and oscillator state (velocity, rescue count) to prevent stale oscillation after suspend/resume
@@ -579,6 +579,12 @@ Copies source into `scheds/rust/scx_pandemonium/`, renames the crate, replaces `
 [14] N. Marwan, M.C. Romano, M. Thiel, J. Kurths. "Recurrence Plots for the Analysis of Complex Systems." *Physics Reports* 438(5-6), 237-329, 2007. [doi:10.1016/j.physrep.2006.11.001](https://doi.org/10.1016/j.physrep.2006.11.001)
 
 [15] S. Butterworth. "On the Theory of Filter Amplifiers." *Experimental Wireless and the Wireless Engineer* 7, 536-541, 1930.
+
+[16] A.G. Hawkes. "Spectra of Some Self-Exciting and Mutually Exciting Point Processes." *Biometrika* 58(1), 83-90, 1971. [doi:10.1093/biomet/58.1.83](https://doi.org/10.1093/biomet/58.1.83)
+
+[17] S.J. Hardiman, J.-P. Bouchaud. "Branching Ratio Approximation for the Self-Exciting Hawkes Process." *Physical Review E* 90(6), 062807, 2014. [arXiv:1403.5227](https://arxiv.org/abs/1403.5227)
+
+[18] V. Filimonov, D. Sornette. "Apparent Criticality and Calibration Issues in the Hawkes Self-Excited Point Process Model: Application to High-Frequency Financial Data." *Quantitative Finance* 15(8), 1293-1314, 2015. [arXiv:1308.6756](https://arxiv.org/abs/1308.6756)
 
 ## License
 
