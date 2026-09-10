@@ -491,7 +491,10 @@ def envelope_report(envelope, name: str) -> dict:
 
 
 def montauk_envelope(target, *, digest: bool | None = None,
-                     report: str | None = None):
+                     report: str | None = None,
+                     tid: int | None = None, pid: int | None = None,
+                     floor_us: float | None = None,
+                     window_s: float | None = None):
     """The montauk --json envelope for a capture, or None.
 
     THE ONE PLACE THE SUITE OPENS AN ENVELOPE. montauk publishes a typed result
@@ -510,12 +513,31 @@ def montauk_envelope(target, *, digest: bool | None = None,
 
     `digest` reads the digest envelope, which carries capture completeness.
     `report` reads one named report over an event stream and never digests.
+
+    ROW QUALIFIERS NARROW WHAT THE REPORT IS ABOUT, and without them every
+    per-event report pools every task in the capture. On a traced ipc cell that
+    is the pair, the stress workers AND montauk itself -- and montauk is the top
+    CPU holder in those captures, 67.8ms at 12C. Narrowed to the two tids the
+    `waits` report names, the pair is 40k of 225k wake2run samples: 18%. A number
+    read without a qualifier is 82% other tasks and nothing in the output says
+    so. `tid`/`pid` narrow sched, locality, dispatch-stall, wakers and fractal;
+    `floor_us` moves the stall floor off its one-tick default, which is what
+    makes those reports describe a median rather than a tail; `window_s` bounds
+    the trailing capture-teardown split.
     """
     import json as _json
     if digest is None:
         digest = Path(target).is_dir()
     argv = [*montauk_analyze_argv(), str(target)]
     argv += ["--report", report] if report else (["--digest"] if digest else [])
+    if tid is not None:
+        argv += ["--tid", str(tid)]
+    if pid is not None:
+        argv += ["--pid", str(pid)]
+    if floor_us is not None:
+        argv += ["--floor-us", str(floor_us)]
+    if window_s is not None:
+        argv += ["--window", str(window_s)]
     rc, so, se = run_cmd_capture(argv + ["--json"])
     if rc != 0 or not so.strip():
         log_warn(f"montauk --analyze produced no envelope for {target} "
@@ -1068,7 +1090,8 @@ MONTAUK = "/usr/local/bin/montauk"
 #
 # montauk v8.10.0 folded both into montauk itself as modes: montauk_analyze and
 # montauk_trace_decode are GONE, not renamed and not symlinked. Every tool flag
-# after the mode word is unchanged; only the invocation moved.
+# after the mode word is unchanged; only the invocation moved. v8.13.0 added a
+# third mode beside them, `--static`, which no call site here reaches.
 #
 # The resolved value is an ARGV PREFIX, never a path, because a path string
 # cannot carry a mode word. Call sites splat it: [*montauk_analyze_argv(), ...].
@@ -1251,6 +1274,7 @@ class MontaukTrace:
                  interval_ms=MONTAUK_LOG_INTERVAL_MS, baseline_s=0.0,
                  attach_timeout=MONTAUK_ATTACH_TIMEOUT, events=False,
                  pin_cpu=None, sched_detail=False, scx_dsq=False,
+                 scx_storm=False,
                  trace_classes=None, quiesce_s=MONTAUK_QUIESCE_S):
         # quiesce_s: the mirror of baseline_s. baseline_s records quiet BEFORE
         # the workload; this records quiet AFTER it, so a strand still open when
@@ -1281,6 +1305,7 @@ class MontaukTrace:
         # placement-versus-drain split asks for it here rather than by exporting
         # a variable that every other capture would inherit.
         self.scx_dsq = scx_dsq
+        self.scx_storm = scx_storm
         # pin_cpu: taskset montauk to a dedicated CPU so it always drains its
         # ring buffer -- under a saturated workload an unpinned montauk gets
         # starved and DROPS events (400ms+ capture holes), making a per-event
@@ -1329,6 +1354,8 @@ class MontaukTrace:
         env = {k: v for k, v in os.environ.items() if k not in scx_probe_env}
         if self.scx_dsq:
             env["MONTAUK_SCX_DSQ"] = "1"
+        if self.scx_storm:
+            env["MONTAUK_SCX_STORM"] = "1"
         self.proc = subprocess.Popen(cmd, stdout=self._out,
                                      stderr=subprocess.STDOUT, env=env)
         if not self._wait_for_attach():
@@ -1777,9 +1804,13 @@ def _write_cross_domain_marker_text(output, rec_dir):
         return
     knobs = parse_knobs_line(output)
     mig = parse_migration_line(output)
+    enq = parse_enqueue_stream(output)
     have_xdom = any(f"cross_domain_{p}" in knobs for p in _XDOM_PATHS)
     have_mig = any(p in mig for p in _XDOM_PATHS)
-    if not have_xdom and not have_mig:
+    # THE ENQUEUE SPLIT IS ITS OWN REASON TO WRITE THIS FILE. It is read from the
+    # per-second verbose lines, not [KNOBS], so an arm that printed the stream but
+    # carried no cross-domain fields would have returned here and lost it.
+    if not have_xdom and not have_mig and not enq["samples"]:
         return
     lines = []
     if "cross_domain_scatter_pct" in knobs:
@@ -1794,6 +1825,18 @@ def _write_cross_domain_marker_text(output, rec_dir):
     for p in _XDOM_PATHS:
         if p in mig:
             lines.append(f'montauk_migration_path{{path="{p}"}} {mig[p]}')
+    # THE ENQUEUE SPLIT RIDES THE SAME MARKER. It comes from the per-second
+    # verbose lines rather than [KNOBS], but it has the same problem the markers
+    # exist to solve: the scheduler's stdout is a scratch buffer that
+    # SchedulerProcess.cleanup() unlinks when the guard is collected, so anything
+    # not extracted here is gone before the report is assembled.
+    if enq["samples"]:
+        lines.append(f"montauk_enqueue_arrivals{{kind=\"wakeup\"}} {enq['enq_wakeup']}")
+        lines.append(f"montauk_enqueue_arrivals{{kind=\"requeue\"}} {enq['enq_requeue']}")
+        lines.append(f"montauk_enqueue_kicks{{kind=\"hard\"}} {enq['hard_kicks']}")
+        lines.append(f"montauk_enqueue_kicks{{kind=\"soft\"}} {enq['soft_kicks']}")
+        lines.append(f"montauk_enqueue_reenqueue_total {enq['reenq']}")
+        lines.append(f"montauk_enqueue_samples {enq['samples']}")
     try:
         (Path(rec_dir) / "cross_domain.prom").write_text("\n".join(lines) + "\n")
     except OSError:
@@ -1919,6 +1962,40 @@ def _write_chaos_markers(guard, rec_dir):
     except Exception:
         return
     _write_chaos_markers_text(output, rec_dir)
+
+
+def parse_enqueue_stream(stdout_text: str) -> dict:
+    """Fold the per-second `d/s:` verbose lines into enqueue-tier totals.
+
+    THE ONLY SURFACE FOR THE ENQUEUE SPLIT. nr_enq_wakeup / nr_enq_requeue live in
+    pandemonium_stats, are read across the boundary by both the BPF and adaptive
+    monitor loops, and reach no .prom -- the verbose line is where they are
+    printed and nowhere else. [KNOBS] carries the run's closing totals but not
+    these, so parse_knobs_line() cannot answer how a run's arrivals SPLIT.
+
+    A SUM RATHER THAN A LAST READING, because these are per-interval deltas.
+    Taking the final line would report one second of a multi-minute run. reenq is
+    summed beside them: it is the kernel-side re-enqueue flood (cpu_release ->
+    scx_bpf_reenqueue_local) that PRODUCES requeues, so the pair says whether the
+    arrivals a run saw were driven from outside the scheduler or from inside it.
+    """
+    out = {"enq_wakeup": 0, "enq_requeue": 0, "reenq": 0,
+           "hard_kicks": 0, "soft_kicks": 0, "samples": 0}
+    for line in stdout_text.splitlines():
+        m = re.search(r"enq: W=(\d+)\s+R=(\d+)", line)
+        if not m:
+            continue
+        out["enq_wakeup"] += int(m.group(1))
+        out["enq_requeue"] += int(m.group(2))
+        out["samples"] += 1
+        k = re.search(r"kick: H=(\d+)\s+S=(\d+)", line)
+        if k:
+            out["hard_kicks"] += int(k.group(1))
+            out["soft_kicks"] += int(k.group(2))
+        r = re.search(r"reenq: (\d+)", line)
+        if r:
+            out["reenq"] += int(r.group(1))
+    return out
 
 
 def parse_knobs_line(stdout_text: str) -> dict:

@@ -45,7 +45,17 @@ TESTS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = TESTS_DIR.parent
 
 # The tracer and the analyzer are ONE binary as of montauk v8.10.0 -- the
-# analyzer is a mode (`--analyze`), not a separate file to check for.
+# analyzer is a mode (`--analyze`), not a separate file to check for. As of
+# v8.13.0 there is a fourth mode, `--static`, which reads SOURCE rather than a
+# capture; PRISM does not invoke it and does not need to. It is named here so
+# the arrangement this file assumes is the whole arrangement.
+#
+# v8.13.0 ALSO REMOVED --golden, AND PRISM'S USE OF IT WENT WITH IT. The
+# behavioral golden froze each report's categorical CLASS as a proxy for the
+# mechanism behind it, and that correlation did not hold: a class survives
+# changes that matter and flips on changes that do not. `--dev golden` is gone
+# from the bench list. tests/fixtures/baseline_gate.golden is unrelated and
+# stays -- it is a byte-exact output diff, which is a different instrument.
 MONTAUK_INSTALLED = Path(MONTAUK)
 # sublimation does every stream and numeric step in this file. The ephemeral
 # install used to place only the two binaries above, so a run that opted to
@@ -1305,6 +1315,16 @@ def main() -> int:
                     help="force a montauk capture for --dev workloads (trace-capable "
                          "ones capture anyway; this also forces the longrun/mixed probe "
                          "capture in scale)")
+    ap.add_argument("--scx-storm", action="store_true",
+                    help="arm montauk's scx storm probes for the capture "
+                         "(fentry/scx_bpf_kick_cpu, fexit/"
+                         "scx_bpf_reenqueue_local, fentry/resched_curr). Without "
+                         "them kick-latency reads NONE and an issued kick cannot "
+                         "be paired against the resched that should answer it. "
+                         "HAZARD: sched-ext/scx#3687 Bug 1 faults on the two "
+                         "KFUNC probes under a live scx load; filed against "
+                         "7.1.2, and this is the 7.2+ arm that note gated on. "
+                         "Implies --trace.")
     ap.add_argument("--cascade-sweep", action="store_true",
                     help="fork-thread only: run the migration-cascade forcing "
                          "term ON and OFF as two arms of ONE run, against a "
@@ -1348,7 +1368,6 @@ def main() -> int:
         "contention":  [_pt, "prism-contention"],
         "scale":       [_pt, "prism-scale"],
         "ipc":         [str(TESTS_DIR / "prism-ipc.py")],
-        "golden":      [str(TESTS_DIR / "prism-golden.py")],
         "power":       [str(TESTS_DIR / "prism-power.py")],
         "cachyos":     [str(TESTS_DIR / "prism-cachyos.py")],
         "scx":         [_pt, "prism-scx"],
@@ -1363,13 +1382,13 @@ def main() -> int:
     # SEMANTIC differences, not argument-surface differences:
     # Children that need root REGARDLESS of --trace: the unconditional tracers
     # (capture is what they are, and montauk's eBPF attach needs it).
-    PRISM_DEV_ROOT = {"strand", "golden"}
+    PRISM_DEV_ROOT = {"strand"}
     # PROBE children measure whatever scheduler is LIVE -- they load nothing
     # themselves. The pre-flight _stop_running_scheduler before every child
     # guaranteed a probe always measured EEVDF/none (its target stopped moments
     # before the window opened). A probe instead gets the pandemonium service
     # ENSURED running, matching how pandemonium-tests starts arms.
-    PRISM_DEV_PROBE = {"golden"}
+    PRISM_DEV_PROBE = set()
     if args.list or args.dev == []:
         log_info("PRISM -- shine the system through it, read the spectrum:")
         log_info("  (no flag)         the end-user pass: short profile + forensics scrape, one report")
@@ -1404,6 +1423,8 @@ def main() -> int:
         # under sudo rather than make the user type it -- ONE standard across every
         # --dev name, no child left to error out with its own "re-run under sudo".
         # A captureless --dev run stays pre-elevation, no re-exec.
+        if args.scx_storm:
+            args.trace = True
         if os.geteuid() != 0 and (args.trace
                                   or any(n in PRISM_DEV_ROOT for n in names)):
             os.execvp("sudo", ["sudo", sys.executable, *sys.argv])
@@ -1452,6 +1473,8 @@ def main() -> int:
                 dev_cmd += ["--cores", args.cores]
             if args.trace:
                 dev_cmd.append("--trace")
+            if args.scx_storm:
+                dev_cmd.append("--scx-storm")
             # Child-private flags last, so a child mode can override a uniform
             # default it also accepts.
             dev_cmd += args.passthrough

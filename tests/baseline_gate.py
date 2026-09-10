@@ -296,6 +296,49 @@ def self_test(update: bool) -> int:
     return 1
 
 
+def trajectory(args) -> int:
+    """WHICH RELEASE A METRIC CHANGED AT, from the archive alone.
+
+    The gate below answers "is this candidate worse than the baseline". It cannot
+    answer "when did this start", which is the question every regression on this
+    project has actually needed -- and answering it by hand meant reading 78
+    prism-scx .prom files one at a time to find that scx stress had passed every
+    run from 2026-04-27 to 2026-09-05 and failed on 09-09.
+
+    montauk already owns the scan: `--by version --trajectory` is a change-point
+    detector over the ordered axis, with the same permutation machinery the
+    pairwise lane uses. This wires it to the archive and nothing else. A metric
+    with no change point is as much a result as one with: it says the thing you
+    just shipped did not move it.
+    """
+    analyzer = resolve_analyzer()
+    if not args.archive.exists():
+        sys.exit(f"baseline_gate: archive not found: {args.archive}")
+    proms = sorted(args.archive.glob(f"{args.bench}-*.prom"))
+    if len(proms) < 3:
+        sys.exit(f"baseline_gate: need >=3 {args.bench} .prom in {args.archive} "
+                 f"for a trajectory (found {len(proms)})")
+    print(f"[gate] analyzer: {analyzer}")
+    print(f"[gate] trajectory: {len(proms)} {args.bench} capture(s), "
+          f"axis '{args.axis}'")
+    r = subprocess.run([*analyzer, *[str(f) for f in proms],
+                        "--by", args.axis, "--trajectory"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        print(r.stderr.strip()[:400])
+        return 1
+    changed = [ln for ln in r.stdout.split("\n")
+               if ln.strip() and "no change point" not in ln
+               and not ln.startswith("[")]
+    # A trajectory over 20+ metrics is mostly nulls; print the movers and say how
+    # many held, rather than paging the full scan into a terminal.
+    held = r.stdout.count("no change point")
+    for ln in changed:
+        print(ln)
+    print(f"[gate] {held} metric(s) with no change point at alpha 0.05")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -315,10 +358,24 @@ def main() -> int:
                          "(no archive, no montauk, no hardware)")
     ap.add_argument("--update", action="store_true",
                     help="with --self-test: refreeze the golden, showing the diff")
+    ap.add_argument("--trajectory", action="store_true",
+                    help="version-ordered change-point scan over the archive "
+                         "instead of a two-group comparison: which release a "
+                         "metric CHANGED at, rather than whether a candidate "
+                         "beats a baseline. This is the automated form of the "
+                         "hand bisect -- montauk owns the scan, --by version.")
+    ap.add_argument("--axis", default="version",
+                    help="trajectory axis: version, commit or capture "
+                         "(default: version)")
+    ap.add_argument("--bench", default="prism-ipc",
+                    help="archive prefix to scan for --trajectory "
+                         "(default: prism-ipc)")
     args = ap.parse_args()
 
     if args.self_test:
         return self_test(args.update)
+    if args.trajectory:
+        return trajectory(args)
     if args.update:
         sys.exit("baseline_gate: --update only applies with --self-test")
 

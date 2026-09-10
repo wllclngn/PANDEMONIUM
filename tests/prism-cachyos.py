@@ -865,8 +865,15 @@ def main() -> int:
     _named = ({s.strip().lower() for s in args.schedulers.split(",")}
               if args.schedulers else set())
     if (not _field_only) or (_named & {"pandemonium", "scx_pandemonium"}):
-        entries.append(("PANDEMONIUM (BPF)", [str(BINARY), "--no-adaptive"]))
-        entries.append(("PANDEMONIUM (ADAPTIVE)", [str(BINARY)]))
+        # --verbose IS THE MEASUREMENT, NOT A DEBUG AID. The per-second line
+        # carries `enq: W= R=` (wakeup vs requeue arrivals), `kick: H= S=`
+        # and `reenq:` -- the enqueue-tier split that nothing else surfaces,
+        # since these counters live in pandemonium_stats and reach no .prom.
+        # start_scheduler already writes the stream to a FILE, so the 64KB
+        # pipe deadlock that shaped this call path does not apply. The arms
+        # disagreed with each other about this flag; that was the defect.
+        entries.append(("PANDEMONIUM (BPF)", [str(BINARY), "--verbose", "--no-adaptive"]))
+        entries.append(("PANDEMONIUM (ADAPTIVE)", [str(BINARY), "--verbose"]))
     if not args.pandemonium_only:
         # --all-scx runs the full installed production scx field (same set as
         # prism-fork-thread). scx_chaos is excluded (fault-injection test

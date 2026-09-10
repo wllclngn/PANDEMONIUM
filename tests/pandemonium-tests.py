@@ -878,6 +878,207 @@ def _med(vals):
     return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
 
 
+def ipc_pair_from_recording(rec) -> dict:
+    """The ipc pair's OWN wake2run, not the capture's.
+
+    EVERY PER-EVENT REPORT POOLS EVERY TASK IN THE CAPTURE, and on a traced ipc
+    cell that is the round-trip pair, the stress workers, and montauk -- which is
+    the top CPU holder in those captures (67.8ms, 20.3ms, 19.3ms at 12C, three of
+    the top six held_by entries). Narrowed to the two tids the `waits` report
+    names as the semaphore pair:
+
+        aggregate   225k wake2run   p50 6us  p99 12us  p999 902us  worst 1994us
+        tid 12081    20.4k          p50 6us  p99 14us  p999 865us  worst 1944us
+        tid 12078    20.0k          p50 6us  p99 10us  p999 651us  worst 1646us
+
+    THE PAIR IS 18% OF THE SAMPLES. Here it happens to track the aggregate, and
+    nothing guaranteed that -- the whole week's wake2run figures were quoted
+    without anyone knowing whether they described the workload or the tracer.
+    Both go in the result so the divergence is visible rather than assumed.
+
+    The pair is identified from the capture, not configured: `waits` publishes
+    completions per (tid,obj) and the two busiest are the two sides.
+    """
+    out = {}
+    if rec is None:
+        return out
+    target = getattr(rec, "events_path", None)
+    if not target:
+        return out
+    env = montauk_envelope(target, report="waits")
+    if env is None:
+        return out
+    wt = envelope_report(env, "waits")
+    if not wt:
+        return out
+    by = envelope_gauge_by_label(wt, "montauk_analysis_waits_total", "tid")
+    pair = sorted(((float(v), t) for t, v in by.items() if v is not None),
+                  reverse=True)[:2]
+    if not pair:
+        return out
+    out["pair_tids"] = ",".join(t for _, t in pair)
+    tot_n = tot_p50 = 0.0
+    worst = 0.0
+    for _, t in pair:
+        try:
+            e = montauk_envelope(target, report="sched", tid=int(t))
+        except (TypeError, ValueError):
+            continue
+        if e is None:
+            continue
+        sched = envelope_report(e, "sched")
+        w = sched.get("wake2run") or {}
+        n = w.get("count")
+        if not n:
+            continue
+        tot_n += float(n)
+        tot_p50 += float(w.get("p50_us") or 0.0) * float(n)
+        worst = max(worst, float(w.get("worst_us") or 0.0))
+    if tot_n:
+        out["pair_wake2run_n"] = tot_n
+        out["pair_wake2run_p50_us"] = tot_p50 / tot_n
+        out["pair_wake2run_worst_us"] = worst
+    return out
+
+
+def ipc_contention_from_recording(rec) -> dict:
+    """The four reports that name the sem defect, none of which the suite read.
+
+    THE BOARD'S OWN CONSTRAINT SAYS THE sem GAP IS A FUTEX LIVELOCK, and it was
+    established by running montauk BY HAND on two captures. `futex`, `spins`,
+    `waits` and `wakers` have never been folded into a result, so no .prom in the
+    78-run archive carries them and the history that would show WHEN the mode
+    flips does not exist. Every reading of it has been a one-off.
+
+    THEY DISCRIMINATE. On one traced run, ipc, BPF arm:
+
+        2C  futex NO-FUTEX-BLOCKED  spins NONE      waits 20.9k
+        4C  futex FUTEX-SPIN        spins NONE      waits 22.2k
+        8C  futex FUTEX-SPIN        spins LIVELOCK  waits 39.9k
+       12C  futex FUTEX-SPIN        spins LIVELOCK  waits 39.9k
+
+    39.9k is 2 x 19.9k, the full round-trip count -- every sem_wait blocked into
+    the futex, the userspace fast path dead. ~21k is that path firing. `spins` is
+    the binary form of the same thing. Which cells sit where MOVES between runs,
+    which is exactly why it needs to be in the archive rather than in a terminal
+    scrollback.
+    """
+    out = {}
+    if rec is None:
+        return out
+    target = getattr(rec, "events_path", None)
+    if not target:
+        return out
+    env = montauk_envelope(target, report="futex,spins,waits,wakers")
+    if env is None:
+        return out
+
+    fx = envelope_report(env, "futex")
+    if fx:
+        klass, _ = envelope_verdict(fx)
+        out["futex_class"] = klass
+        g = envelope_gauges(fx)
+        v = g.get("montauk_analysis_futex_blocked_threads")
+        if v is not None:
+            out["futex_blocked_threads"] = float(v)
+
+    sp = envelope_report(env, "spins")
+    if sp:
+        klass, _ = envelope_verdict(sp)
+        out["spins_class"] = klass
+        # The binary the mode split reads as: LIVELOCK or not.
+        out["spin_livelock"] = 1.0 if klass == "LIVELOCK" else 0.0
+
+    wt = envelope_report(env, "waits")
+    if wt:
+        # waits_total is published PER (tid,obj), so the sum is the workload's
+        # blocked-wait count and the max is the dominant side of the pair.
+        by = envelope_gauge_by_label(wt, "montauk_analysis_waits_total", "tid")
+        vals = [float(v) for v in by.values() if v is not None]
+        if vals:
+            out["waits_total"] = sum(vals)
+            out["waits_dominant"] = max(vals)
+
+    wk = envelope_report(env, "wakers")
+    if wk:
+        klass, _ = envelope_verdict(wk)
+        out["wakers_class"] = klass
+        g = envelope_gauges(wk)
+        for src, dst in (("waker_pids", "waker_pids"),
+                         ("waker_hot_pids", "waker_hot_pids"),
+                         ("waker_monogamy_ratio", "waker_monogamy")):
+            v = g.get(f"montauk_analysis_{src}")
+            if v is not None:
+                out[dst] = float(v)
+        q = envelope_gauge_by_label(wk, "montauk_analysis_waker_run_length",
+                                    "quantile")
+        if q.get("0.99") is not None:
+            out["waker_run_p99"] = float(q["0.99"])
+    return out
+
+
+def ipc_kick_from_recording(rec) -> dict:
+    """Was the kick answered, or did the wakee wait for the tick?
+
+    THE ONE QUESTION NO PERCENTILE CAN HOLD. A wake that misses its kick emits no
+    SWITCH_IN and no WAKE2RUN until something else happens to wake the CPU, so it
+    is absent from p50, p99, p99.9 and WORST by construction rather than merely
+    rare in them. montauk's kick-latency report pairs each issued kick against the
+    resched that should answer it and counts the ones that never got a resched
+    before the next kick -- plus the subset that raced a fresh tick-stop, which is
+    a CPU going tickless with a kick already in flight.
+
+    IT READS NONE UNLESS THE PROBES ARE ARMED, which is what --scx-storm does and
+    what every archived run so far has lacked: kick_captured=0 means no
+    measurement, NOT a measured zero, so the caller must be able to tell those
+    apart. That is why the availability bit is folded in beside the counts.
+    """
+    out = {}
+    if rec is None:
+        return out
+    # THE EVENT STREAM, NOT THE DIRECTORY. montauk_envelope's `report` mode reads
+    # one named report over an EVENT STREAM and never digests, so aiming it at a
+    # recording directory is "short read on header" and an rc=1 warn per cell.
+    # The hop reader above passes no report and gets --digest, which is why it
+    # takes the dir and this cannot.
+    target = getattr(rec, "events_path", None)
+    if not target:
+        return out
+    env = montauk_envelope(target, report="kick-latency")
+    if env is None:
+        return out
+    kl = envelope_report(env, "kick-latency")
+    if not kl:
+        return out
+    # THE COUNTS ARE GAUGES, NOT REPORT KEYS. A report dict carries verdict and
+    # class at the top level and everything numeric under `gauges`, so reading
+    # kl["kicks_total"] silently yields None and the whole row disappears rather
+    # than erroring -- which is exactly how the first run produced captures full
+    # of kick data and a log with no kick line in it.
+    g = envelope_gauges(kl)
+    for name in ("kick_captured", "kicks_total", "kicks_unanswered",
+                 "kicks_tickless_raced", "kick_unanswered_pct",
+                 "kicks_self", "kicks_self_preempt",
+                 "kick_self_pct", "kick_self_preempt_pct"):
+        v = g.get(f"montauk_analysis_{name}")
+        if v is not None:
+            out[name] = float(v)
+    # kick_resched_us is ONE gauge repeated across a quantile label, so
+    # envelope_gauges() keeps the first and drops the rest. This is the delivery
+    # cost itself -- what it actually costs to reach a CPU that is not the one
+    # already executing -- so it is read by label or not at all.
+    q = envelope_gauge_by_label(kl, "montauk_analysis_kick_resched_us", "quantile")
+    for lbl, key in (("0.5", "kick_resched_p50_us"),
+                     ("0.99", "kick_resched_p99_us"),
+                     ("worst", "kick_resched_worst_us")):
+        if q.get(lbl) is not None:
+            out[key] = float(q[lbl])
+    klass, _ = envelope_verdict(kl)
+    if klass:
+        out["kick_class"] = klass
+    return out
+
+
 def ipc_hop_from_recording(rec) -> dict:
     """Read the scheduler-side half of one IPC hop back out of the recording the
     --trace path already writes.
@@ -908,6 +1109,11 @@ def ipc_hop_from_recording(rec) -> dict:
     w = sched.get("wake2run") or {}
     if w.get("p50_us") is not None:
         out["wake2run_p50_us"] = float(w["p50_us"])
+    # The denominator for the pair share below: how many of the capture's
+    # wake2run samples exist at all, so "the pair is 18% of them" is a number
+    # rather than an assertion.
+    if w.get("count") is not None:
+        out["wake2run_n"] = float(w["count"])
     klass, _ = envelope_verdict(sched)
     if klass:
         out["sched_class"] = klass
@@ -1479,6 +1685,63 @@ def write_prometheus(data: dict, stamp: str) -> Path:
                     gauge("pandemonium_bench_ipc_rtt_samples",
                           "IPC round-trip samples", d["n"], pl)
 
+                # KICK PAIRING. Only present when --scx-storm armed the probes;
+                # kick_captured is the availability bit so a consumer never reads
+                # absence as a measured zero.
+                if ipc.get("kick_captured") is not None:
+                    gauge("pandemonium_bench_ipc_kick_captured",
+                          "1 = scx kick probes were armed for this cell",
+                          ipc["kick_captured"], labels)
+                for _k, _help in (
+                        ("kicks_total", "Kicks issued (scx_bpf_kick_cpu)"),
+                        ("kicks_unanswered",
+                         "Kicks with no resched before the next kick"),
+                        ("kicks_tickless_raced",
+                         "Unanswered kicks that raced a fresh tick-stop"),
+                        ("kick_unanswered_pct", "Unanswered kicks, percent"),
+                        ("kicks_self", "Kicks whose issuer was the target CPU"),
+                        ("kicks_self_preempt",
+                         "Self-kicks carrying SCX_KICK_PREEMPT"),
+                        ("kick_self_pct", "Self-kicks, percent of all kicks"),
+                        ("kick_self_preempt_pct",
+                         "Self-preempts, percent of all kicks"),
+                        ("kick_resched_p50_us",
+                         "Median kick-to-resched delivery latency (us)"),
+                        ("kick_resched_p99_us",
+                         "P99 kick-to-resched delivery latency (us)"),
+                        ("kick_resched_worst_us",
+                         "Worst kick-to-resched delivery latency (us)"),
+                        ("spin_livelock",
+                         "1 = montauk's spins report read LIVELOCK"),
+                        ("futex_blocked_threads",
+                         "Threads blocked on a futex at trace end"),
+                        ("waits_total",
+                         "Blocked wait completions summed over (tid,obj)"),
+                        ("waits_dominant",
+                         "Blocked wait completions on the dominant tid/obj"),
+                        ("waker_pids", "Distinct waker pids"),
+                        ("waker_monogamy",
+                         "Fraction of wakes that extend a same-waker run"),
+                        ("waker_run_p99",
+                         "P99 consecutive wakes by one waker"),
+                        ("pair_wake2run_n",
+                         "wake2run samples belonging to the ipc pair alone"),
+                        ("pair_wake2run_p50_us",
+                         "Median wake2run of the ipc pair alone (us)"),
+                        ("pair_wake2run_worst_us",
+                         "Worst wake2run of the ipc pair alone (us)"),
+                        # CAPTURE QUALITY. envelope_capture has folded these
+                        # since it was written and nothing published them, so a
+                        # cell whose capture LOST events looked exactly like one
+                        # that did not. montauk reports absence rather than zero
+                        # when a capture predates drop accounting, so a missing
+                        # gauge here means unknown loss, not proven clean.
+                        ("dropped", "Events the capture ring dropped"),
+                        ("observed", "Events the capture observed")):
+                    if ipc.get(_k) is not None:
+                        gauge(f"pandemonium_bench_ipc_{_k}", _help,
+                              ipc[_k], labels)
+
             # Launch metrics
             lnch = sched_data.get("launch", {})
             if lnch and lnch.get("launches", 0) > 0:
@@ -1606,6 +1869,12 @@ def write_prometheus(data: dict, stamp: str) -> Path:
                 # the migration count.
                 for tk, tdesc in (("steal", "Total STEP 1 peer steals"),
                                   ("spill", "Total sibling spills"),
+                                  ("kick_declined",
+                                   "Requeue kicks the price refused outright"),
+                                  ("stay_fare_held",
+                                   "anchor->target moves the base fare refused"),
+                                  ("stay_move_taken",
+                                   "anchor->target moves the base fare admitted"),
                                   ("dispatches", "Total dispatches")):
                     if tk in knobs:
                         gauge(f"pandemonium_bench_{tk}_total", tdesc,
@@ -1639,7 +1908,7 @@ def write_prometheus(data: dict, stamp: str) -> Path:
     version = data.get("version", "unknown")
     slug = bench_slug(data)
     # prism-scale keeps the bare "{version}-{stamp}" archive name it has always
-    # had -- baseline_gate and prism-golden select on it. Every other mode takes
+    # had -- baseline_gate selects on it. Every other mode takes
     # the prism-<bench>-<version>-<stamp> form the other prism-* benches use.
     path = ARCHIVE_DIR / (f"{version}-{stamp}.prom" if slug == "prism-scale"
                           else f"{slug}-{version}-{stamp}.prom")
@@ -1856,9 +2125,8 @@ def gauge_rr(per_sched_times):
 # prism-scale's --ipc/--deadline/--launch/--mixed/--longrun/--burst modes are
 # separate benches to anyone reading the cache, so they get separate filenames.
 # Sharing prism-scale's was not only confusing, it was wrong: the archive prom
-# is named "{version}-{stamp}.prom", and baseline_gate globs "[0-9]*.prom" while
-# prism-golden globs "{version}-*.prom", so an IPC-only run dropped a file both
-# of them read as that version's full scale run. The metric FAMILY stays
+# is named "{version}-{stamp}.prom", and baseline_gate globs "[0-9]*.prom", so
+# an IPC-only run dropped a file it read as that version's full scale run. The metric FAMILY stays
 # pandemonium_scale_* -- one schema, and renaming it would orphan every archived
 # run -- only the file is named for the bench that produced it.
 _BENCH_SLUGS = (
@@ -2116,6 +2384,74 @@ def format_report(data: dict) -> str:
                         f"{'  wake2run ' + f'{_w2r:.1f}us':>20}"
                         f"{'  rest ' + f'{_rest:.1f}us':>16}"
                         f"   (iter 1; rest = waker-side + run)")
+                # THE KICK ROW. An unanswered kick is a wake that got no resched
+                # before the next kick, so the wakee had nothing behind it but the
+                # tick -- and that wake is in no latency distribution at all,
+                # because it emits neither SWITCH_IN nor WAKE2RUN while it waits.
+                # Silent unless --scx-storm armed the probes; kick_captured==0 is
+                # "not measured", never a measured zero.
+                if ipc.get("kick_captured"):
+                    _kt = ipc.get("kicks_total") or 0.0
+                    _ku = ipc.get("kicks_unanswered") or 0.0
+                    _kr = ipc.get("kicks_tickless_raced") or 0.0
+                    _pct = ipc.get("kick_unanswered_pct")
+                    if _pct is None:
+                        _pct = (100.0 * _ku / _kt) if _kt else 0.0
+                    _d50 = ipc.get("kick_resched_p50_us")
+                    _d99 = ipc.get("kick_resched_p99_us")
+                    lines.append(
+                        f"{'':<28} {'':>8} {'kick':>8} "
+                        f"{'issued ' + f'{_kt:.0f}':>18}"
+                        f"{'  unanswered ' + f'{_ku:.0f} ({_pct:.2f}%)':>22}"
+                        f"{'  tickless ' + f'{_kr:.0f}':>14}"
+                        + (f"{'  resched ' + f'{_d50:.1f}/{_d99:.1f}us':>22}"
+                           if _d50 is not None and _d99 is not None else "")
+                        + f"   {ipc.get('kick_class', '')}")
+                    # THE SELF ROW. A kick whose issuer is its own target buys
+                    # nothing a return from the callback would not already do,
+                    # and a self-kick carrying PREEMPT is the scheduler telling
+                    # a CPU to displace the task it just chose. EEVDF issues
+                    # none of either, so any nonzero share here is ours.
+                    _sp = ipc.get("kick_self_preempt_pct")
+                    if _sp is not None:
+                        _sk = ipc.get("kicks_self") or 0.0
+                        _spn = ipc.get("kicks_self_preempt") or 0.0
+                        _skp = ipc.get("kick_self_pct") or 0.0
+                        lines.append(
+                            f"{'':<28} {'':>8} {'self':>8} "
+                            f"{'kicks ' + f'{_sk:.0f} ({_skp:.2f}%)':>18}"
+                            f"{'  preempt ' + f'{_spn:.0f} ({_sp:.2f}%)':>22}")
+                # THE PAIR ROW. The aggregate above pools every task in the
+                # capture -- the pair, the stress workers and montauk, which is
+                # the top CPU holder in these recordings. This is the pair alone,
+                # and the sample share says how much of the aggregate was ever
+                # about the workload.
+                _pn = ipc.get("pair_wake2run_n")
+                _pp50 = ipc.get("pair_wake2run_p50_us")
+                if _pn and _pp50 is not None:
+                    _all = ipc.get("wake2run_n")
+                    _share = (f" ({100.0 * _pn / _all:.0f}% of capture)"
+                              if _all else "")
+                    lines.append(
+                        f"{'':<28} {'':>8} {'pair':>8} "
+                        f"{'tids ' + str(ipc.get('pair_tids', '-')):>18}"
+                        f"{'  wake2run ' + f'{_pp50:.2f}us':>20}"
+                        f"{'  n ' + f'{_pn:.0f}' + _share:>28}")
+                # THE CONTENTION ROW. The sem fast path either fires or it does
+                # not, and waits_total says which: 2 x the round-trip count means
+                # every sem_wait blocked into the futex. Silent without --trace.
+                if ipc.get("waits_total") or ipc.get("spins_class"):
+                    _wt = ipc.get("waits_total") or 0.0
+                    _fx = ipc.get("futex_class", "-")
+                    _sp = ipc.get("spins_class", "-")
+                    _mono = ipc.get("waker_monogamy")
+                    lines.append(
+                        f"{'':<28} {'':>8} {'sem':>8} "
+                        f"{'waits ' + f'{_wt:.0f}':>18}"
+                        f"{'  futex ' + _fx:>26}"
+                        f"{'  spins ' + _sp:>18}"
+                        + (f"{'  monogamy ' + f'{_mono:.3f}':>20}"
+                           if _mono is not None else ""))
                 elif _thru and ipc.get("completeness") is not None:
                     # A recording was read and it carried no wake2run. Absence of a
                     # recording is silent by design -- a run without --trace owes
@@ -3573,7 +3909,7 @@ def trace_storm_cycle(stamp, n_cpus, duration, busy_per_cpu=4,
         arms = [a for a in field_arms(n_cpus, schedulers, all_scx,
                                       pandemonium_only) if a[1] is not None]
     else:
-        arms = [("PANDEMONIUM (BPF)", [str(BINARY), "--no-adaptive"]),
+        arms = [("PANDEMONIUM (BPF)", [str(BINARY), "--verbose", "--no-adaptive"]),
                 ("PANDEMONIUM (ADAPTIVE)", [str(BINARY)])]
     if not arms:
         log_error("[storm] no scx arm to score (EEVDF cannot storm)")
@@ -4247,9 +4583,19 @@ def cmd_bench_scale(args) -> int:
                                 and montauk_available()):
                             safe = (sched_name.replace(" ", "-")
                                     .replace("(", "").replace(")", ""))
+                            # THE OPT-IN IS THE CONSTRUCTOR ARG, NOT THE ENV.
+                            # MontaukTrace scrubs MONTAUK_SCX_STORM from every
+                            # child env on purpose -- an ambient export is the
+                            # documented route to both of this box's hard locks --
+                            # so a bench asks for the probes explicitly or does
+                            # not get them. Attach order is still the launcher's:
+                            # it waits for the first .prom before returning, so
+                            # the trampoline patch lands while scx is quiescent.
                             with montauk_trace(IPC_COMM, f"ipc-{safe}-{n}c",
                                                stamp, events=True,
-                                               sched_detail=True) as _rec:
+                                               sched_detail=True,
+                                               scx_storm=getattr(
+                                                   args, "scx_storm", False)) as _rec:
                                 _r = measure_ipc(BINARY, n)
                             _ipc_rec = _rec
                             _r["events"] = (str(_rec.events_path)
@@ -4264,6 +4610,9 @@ def cmd_bench_scale(args) -> int:
                     # scheduler-side half of the hop in beside the RTT so the table
                     # can say WHERE the microseconds go, not only how many.
                     _hop = ipc_hop_from_recording(_ipc_rec)
+                    _hop.update(ipc_kick_from_recording(_ipc_rec))
+                    _hop.update(ipc_contention_from_recording(_ipc_rec))
+                    _hop.update(ipc_pair_from_recording(_ipc_rec))
                     if _hop and _runs:
                         # SAME SAMPLE OR NO SAMPLE. wake2run comes from the
                         # recording, and only the FIRST iteration records -- so the
@@ -5973,6 +6322,16 @@ def main() -> int:
                             "/tmp/pandemonium -- resolves individual RTTs at the "
                             "tick floor. Diagnostic; latency numbers are "
                             "contaminated. Pairs with --ipc (also via prism-ipc).")
+    bench.add_argument("--scx-storm", action="store_true",
+                       help="Arm montauk's scx storm probes for the --trace "
+                            "recording (fentry/scx_bpf_kick_cpu, fexit/"
+                            "scx_bpf_reenqueue_local, fentry/resched_curr). "
+                            "Without them kick-latency reads NONE and a kick "
+                            "cannot be paired against the resched that should "
+                            "answer it. HAZARD: sched-ext/scx#3687 Bug 1 faults "
+                            "on the two KFUNC probes under a live scx load; it "
+                            "was filed against 7.1.2 and this is the 7.2+ arm "
+                            "the note gated on. Implies --trace.")
 
 
     contention_bench = sub.add_parser("prism-contention",
@@ -6103,6 +6462,11 @@ def main() -> int:
                      help="Max allowed miss ratio (default: 0.10 = 10%%)")
 
     args = parser.parse_args()
+    # --scx-storm arms probes around the --trace recording, so it implies it.
+    # Stated here rather than in the help alone: a user who passes only
+    # --scx-storm gets the capture, not a silent no-op.
+    if getattr(args, "scx_storm", False) and not getattr(args, "trace", False):
+        args.trace = True
 
     if args.command is None:
         parser.print_help()

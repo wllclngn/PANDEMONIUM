@@ -150,18 +150,37 @@ def run_perf_bench(groups=NUM_GROUPS, threaded=True, loops=None):
         return None, None
 
     counters = {}
+    # PERF'S TRAILER IS NOT A COUNTER, AND IT WAS BEING READ AS ONE. `perf stat`
+    # closes with "<n> seconds time elapsed", "<n> seconds user" and "<n> seconds
+    # sys", all three of which match a "<value> <name>" shape and all three of
+    # which parsed as a counter literally named `seconds` -- the last one winning.
+    # That value was then published under the same gauge name and labels as the
+    # real elapsed time, so pandemonium_fork_thread_seconds appeared TWICE per
+    # cell with one of them being user CPU time. Only requested events are kept
+    # now, which also means an unrecognised trailer can never invent a series.
+    wanted = {e.replace("-", "_"): e for e in PERF_EVENTS}
     for line in result.stderr.splitlines():
         line = line.strip()
         if not line or line.startswith("#") or line.startswith("Performance"):
             continue
         m = re.match(r'^([\d,\.]+)\s+(?:msec\s+)?(\S+)', line)
-        if m:
-            val_str = m.group(1).replace(",", "")
-            name = m.group(2).rstrip(":u").rstrip(":k")
-            try:
-                counters[name] = float(val_str)
-            except ValueError:
-                pass
+        if not m:
+            continue
+        val_str = m.group(1).replace(",", "")
+        # STRIP THE :u/:k MODIFIER AS A SUFFIX, NOT AS A CHARACTER SET. rstrip
+        # takes a set, so `rstrip(":k")` ate the trailing k of `task-clock` and
+        # every capture in the archive carries it as `task_cloc`.
+        name = m.group(2)
+        for mod in (":u", ":k"):
+            if name.endswith(mod):
+                name = name[: -len(mod)]
+        key = name.replace("-", "_")
+        if key not in wanted:
+            continue
+        try:
+            counters[wanted[key]] = float(val_str)
+        except ValueError:
+            pass
 
     return elapsed, counters
 
@@ -209,7 +228,7 @@ def write_prometheus(version, git, stamp, ncpus, cells_data, loops,
     # from those is a share of the minority. nr_steal is every successful STEP 1
     # peer move_to_local, cross or not, and it is per-scheduler rather than
     # per-cell because the scheduler is torn down once per arm.
-    for _sn, (_st, _sp, _di) in (steal_by_sched or {}).items():
+    for _sn, (_st, _sp, _di, _fh, _mt, _kd) in (steal_by_sched or {}).items():
         pb.gauge("steal_total", _st, help="successful STEP 1 peer steals",
                  labels={"scheduler": _sn})
         pb.gauge("spill_total", _sp, help="sibling spills (placement side)",
@@ -222,6 +241,25 @@ def write_prometheus(version, git, stamp, ncpus, cells_data, loops,
                      labels={"scheduler": _sn})
             pb.gauge("spill_share_pct", f"{100.0 * _sp / _di:.4f}",
                      help="spills as a percent of dispatches",
+                     labels={"scheduler": _sn})
+        # THE FARE'S HIT RATE, WHICH A BARE COUNT CANNOT GIVE. Held and taken
+        # together are every anchor->target decision the wake path made, so the
+        # denominator is the fare's own population rather than dispatches.
+        pb.gauge("stay_fare_held_total", _fh,
+                 help="anchor->target moves the base fare refused",
+                 labels={"scheduler": _sn})
+        pb.gauge("stay_move_taken_total", _mt,
+                 help="anchor->target moves the base fare admitted",
+                 labels={"scheduler": _sn})
+        # THE BOTTOM RUNG'S OWN NUMBER. This is the bench where the dispatch count
+        # lives, so a refusal that cannot be read here cannot be scored against the
+        # quantity it exists to reduce.
+        pb.gauge("kick_declined_total", _kd,
+                 help="requeue kicks the price refused outright",
+                 labels={"scheduler": _sn})
+        if _fh + _mt > 0:
+            pb.gauge("stay_fare_held_pct", f"{100.0 * _fh / (_fh + _mt):.4f}",
+                     help="share of priced anchor->target edges held home",
                      labels={"scheduler": _sn})
 
     # One cell = one workload shape (mode x groups). Every series carries mode and
@@ -252,6 +290,17 @@ def write_prometheus(version, git, stamp, ncpus, cells_data, loops,
                     pb.gauge("cache_miss_rate", f"{cm / cr:.6f}",
                              help="cache miss rate", labels=sl)
             sp = (all_spreads or {}).get(sched_name)
+            ss = sp.get("seconds") if sp else None
+            if ss:
+                # Distinct names, never a second value under `seconds` itself --
+                # a repeated name with identical labels is what a scrape keeps
+                # one of, silently.
+                for k in ("mean", "stddev", "min", "max"):
+                    pb.gauge(f"seconds_{k}", f"{ss[k]:.4f}",
+                             help=f"elapsed {k} across iterations", labels=sl)
+                pb.gauge("seconds_n", ss["n"],
+                         help="iterations contributing to the elapsed spread",
+                         labels=sl)
             cs = sp.get("cache_miss_rate") if sp else None
             if cs:
                 for k in ("mean", "stddev", "min", "max"):
@@ -326,14 +375,25 @@ def _cell_block(report, cell, loops, all_results, all_spreads, trace_results):
         return miss, ipc
 
     def _time_vs(sched_name, elapsed):
+        # THE WALL-CLOCK SPREAD WAS COMPUTED AND RENDERED NOWHERE, WHICH IS WHAT
+        # MADE --iterations LOOK BROKEN. _measure returns spreads["seconds"] on
+        # every run and only the cache-miss half was ever read, so an N=3 run
+        # reported a median with no indication of the variance it existed to
+        # measure -- and this bench's process arm swings several seconds on
+        # identical code, so the median alone cannot separate a regression from
+        # the mode the run happened to land in.
         if elapsed is None:
             return "FAILED", ""
+        sp = (all_spreads or {}).get(sched_name)
+        ss = sp.get("seconds") if sp else None
+        ts = (f"{elapsed:.3f}±{ss['stddev']:.3f}s"
+              if ss and ss.get("n", 1) > 1 else f"{elapsed:.3f}s")
         if sched_name == "EEVDF":
-            return f"{elapsed:.3f}s", "baseline"
+            return ts, "baseline"
         if eevdf_elapsed and eevdf_elapsed > 0:
             d = (elapsed - eevdf_elapsed) / eevdf_elapsed * 100
-            return f"{elapsed:.3f}s", f"{'+' if d > 0 else ''}{d:.1f}%"
-        return f"{elapsed:.3f}s", ""
+            return ts, f"{'+' if d > 0 else ''}{d:.1f}%"
+        return ts, ""
 
     if has_trace:
         report.append("TRADEOFF  (latency | cause | cost -- lower time/miss%, higher IPC is better)")
@@ -545,12 +605,16 @@ def write_report(version, git, stamp, ncpus, cells_data, loops,
         report.append("MIGRATION ORIGIN  (cumulative per arm)")
         report.append(table_header("SCHEDULER", ["STEALS", "SPILLS",
                                                  "DISPATCHES", "STEAL %",
-                                                 "SPILL %"]))
-        for sn, (st, sp, di) in steal_by_sched.items():
+                                                 "SPILL %", "FARE HELD",
+                                                 "HELD %", "KICKS DECLINED"]))
+        for sn, (st, sp, di, fh, mt, kd) in steal_by_sched.items():
             report.append(table_row(sn, [
                 f"{st}", f"{sp}", f"{di}",
                 f"{100.0 * st / di:.3f}%" if di else "-",
-                f"{100.0 * sp / di:.3f}%" if di else "-"]))
+                f"{100.0 * sp / di:.3f}%" if di else "-",
+                f"{fh}",
+                f"{100.0 * fh / (fh + mt):.1f}%" if (fh + mt) else "-",
+                f"{kd}"]))
         report.append("  STEALS are the drain side, STEP 1's peer "
                       "move_to_local -- the only migration path charging a base "
                       "fare before it moves. SPILLS are the placement side, a "
@@ -559,6 +623,13 @@ def write_report(version, git, stamp, ncpus, cells_data, loops,
                       "same-domain moves, which the cross_domain_* paths cannot: "
                       "those see CROSS-domain landings only and most moves stay "
                       "inside L2/L3.")
+        report.append("  FARE HELD is the wake path's own priced edge: "
+                      "anchor -> target refused because the wait on the warm "
+                      "anchor came in under the base fare plus the R_eff "
+                      "distance. HELD % is against every anchor -> target "
+                      "decision, not against dispatches, so a low count with a "
+                      "high share means the path is rare and a low share means "
+                      "the fare is not binding.")
         report.append("")
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -913,8 +984,13 @@ def _measure(sched_name, cell, iterations):
     cyc, ins = counters.get("cycles", 0), counters.get("instructions", 0)
     ipc = ins / cyc if cyc > 0 else 0
     cs = spreads["cache_miss_rate"]
-    spread_msg = (f"  miss%={cs['mean'] * 100:.2f}±{cs['stddev'] * 100:.2f}"
-                  if cs else "")
+    ss = spreads["seconds"]
+    spread_msg = ""
+    if ss and ss.get("n", 1) > 1:
+        spread_msg += (f"  wall={ss['mean']:.3f}±{ss['stddev']:.3f}s"
+                       f" [{ss['min']:.3f}-{ss['max']:.3f}]")
+    if cs:
+        spread_msg += f"  miss%={cs['mean'] * 100:.2f}±{cs['stddev'] * 100:.2f}"
     log_info(f"[{sched_name}] {cell.label} MEDIAN {elapsed:.3f}s  IPC={ipc:.3f}  "
              f"cache-misses={_fmt_count(counters.get('cache-misses', 0))}  "
              f"(n={len(samples)}/{iterations}){spread_msg}")
@@ -1034,11 +1110,12 @@ def main():
         vals = [v.strip() for v in args.phi_sweep.split(",") if v.strip() != ""]
         entries = [
             ("EEVDF", None),
-            ("PANDEMONIUM (phi=default)", [str(BINARY), "--no-adaptive"]),
+            ("PANDEMONIUM (phi=default)", [str(BINARY), "--verbose", "--no-adaptive"]),
         ]
         for v in vals:
             entries.append(
-                (f"PANDEMONIUM (phi={v})", [str(BINARY), "--no-adaptive", "--phi-scale", v])
+                (f"PANDEMONIUM (phi={v})",
+                 [str(BINARY), "--verbose", "--no-adaptive", "--phi-scale", v])
             )
         log_info(f"PHI SWEEP: topology default + values {vals} (BPF mode)")
         cells = [Cell(f"thread/g{NUM_GROUPS}", True, NUM_GROUPS)]
@@ -1050,16 +1127,16 @@ def main():
         # in BOTH arms and reports fano_q8 either way; only the force is off.
         entries = [
             ("EEVDF", None),
-            ("PANDEMONIUM (cascade=on)", [str(BINARY), "--no-adaptive"]),
+            ("PANDEMONIUM (cascade=on)", [str(BINARY), "--verbose", "--no-adaptive"]),
             ("PANDEMONIUM (cascade=off)",
-             [str(BINARY), "--no-adaptive", "--no-cascade"]),
+             [str(BINARY), "--verbose", "--no-adaptive", "--no-cascade"]),
         ]
         log_info("CASCADE SWEEP: forcing term on vs off (BPF mode)")
         cells = [Cell(f"thread/g{NUM_GROUPS}", True, NUM_GROUPS)]
     else:
         entries = [
             ("EEVDF", None),
-            ("PANDEMONIUM (BPF)", [str(BINARY), "--no-adaptive"]),
+            ("PANDEMONIUM (BPF)", [str(BINARY), "--verbose", "--no-adaptive"]),
             ("PANDEMONIUM (ADAPTIVE)", [str(BINARY)]),
         ]
 
@@ -1144,7 +1221,10 @@ def main():
                 if "steal" in _k and _k.get("dispatches"):
                     steal_by_sched[sched_name] = (int(_k["steal"]),
                                                   int(_k.get("spill", 0)),
-                                                  int(_k["dispatches"]))
+                                                  int(_k["dispatches"]),
+                                                  int(_k.get("stay_fare_held", 0)),
+                                                  int(_k.get("stay_move_taken", 0)),
+                                                  int(_k.get("kick_declined", 0)))
             time.sleep(2)
             print()
 

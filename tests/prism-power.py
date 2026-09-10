@@ -773,6 +773,12 @@ def build_entries(args, has_schbench: bool) -> list[tuple[str, list[str] | None]
     if not args.no_pandemonium:
         # Production-realistic activation: no --verbose, the periodic
         # logging would itself contaminate idle-floor measurements.
+        # NO --verbose HERE, AND THAT IS DELIBERATE. Every other bench passes it
+        # because its per-second line is the only surface for the enqueue-tier
+        # counters. This bench measures WATTS, so it is the one arm where the
+        # cost of a per-second print is the quantity under test rather than a
+        # rounding error. If the enqueue split is ever wanted here, it is worth
+        # measuring the flag's own draw first.
         entries.append(("PANDEMONIUM (BPF)", [str(BINARY), "--no-adaptive"]))
         entries.append(("PANDEMONIUM (ADAPTIVE)", [str(BINARY)]))
     if not args.pandemonium_only:
