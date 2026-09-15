@@ -215,7 +215,7 @@ def _spread_stats(xs):
 
 
 def write_prometheus(version, git, stamp, ncpus, cells_data, loops,
-                     steal_by_sched=None):
+                     steal_by_sched=None, knobs_by_sched=None):
     pb = PrometheusBuilder("fork_thread")
     pb.info(ts=int(datetime.strptime(stamp, "%Y%m%d-%H%M%S").timestamp()),
             version=version, git_commit=git["commit"], git_dirty=git["dirty"])
@@ -228,6 +228,27 @@ def write_prometheus(version, git, stamp, ncpus, cells_data, loops,
     # from those is a share of the minority. nr_steal is every successful STEP 1
     # peer move_to_local, cross or not, and it is per-scheduler rather than
     # per-cell because the scheduler is torn down once per arm.
+    # CROSS-DOMAIN LANDINGS BY PATH. The scheduler already prints these on the
+    # [KNOBS] shutdown line and prism already parses that line; it kept six
+    # fields and dropped this family, which is the only per-path attribution of
+    # a cross-domain move that exists. On a two-L3 box with SMT off the tiers
+    # put ~59% of moves ACROSS L3, so this is the majority of the migration
+    # count here, not the minority it is at 12C.
+    _XDOM = ("sel_tight", "sel_sync", "sel_normal", "sel_dfl",
+             "enq_t1", "enq_t2", "steal", "step5")
+    for _sn, _k in (knobs_by_sched or {}).items():
+        for _lane in _XDOM:
+            _v = _k.get(f"cross_domain_{_lane}")
+            if _v is not None:
+                pb.gauge("cross_domain_total", _v,
+                         help="cross-domain landings by originating path",
+                         labels={"scheduler": _sn, "path": _lane})
+        _sp = _k.get("cross_domain_scatter_pct")
+        if _sp is not None:
+            pb.gauge("cross_domain_scatter_pct", _sp,
+                     help="placement-side cross-domain landings as % of dispatches",
+                     labels={"scheduler": _sn})
+
     for _sn, (_st, _sp, _di, _fh, _mt, _kd) in (steal_by_sched or {}).items():
         pb.gauge("steal_total", _st, help="successful STEP 1 peer steals",
                  labels={"scheduler": _sn})
@@ -242,14 +263,14 @@ def write_prometheus(version, git, stamp, ncpus, cells_data, loops,
             pb.gauge("spill_share_pct", f"{100.0 * _sp / _di:.4f}",
                      help="spills as a percent of dispatches",
                      labels={"scheduler": _sn})
-        # THE FARE'S HIT RATE, WHICH A BARE COUNT CANNOT GIVE. Held and taken
+        # THE COST'S HIT RATE, WHICH A BARE COUNT CANNOT GIVE. Held and taken
         # together are every anchor->target decision the wake path made, so the
-        # denominator is the fare's own population rather than dispatches.
-        pb.gauge("stay_fare_held_total", _fh,
-                 help="anchor->target moves the base fare refused",
+        # denominator is the cost's own population rather than dispatches.
+        pb.gauge("stay_cost_held_total", _fh,
+                 help="anchor->target moves the base cost refused",
                  labels={"scheduler": _sn})
         pb.gauge("stay_move_taken_total", _mt,
-                 help="anchor->target moves the base fare admitted",
+                 help="anchor->target moves the base cost admitted",
                  labels={"scheduler": _sn})
         # THE BOTTOM RUNG'S OWN NUMBER. This is the bench where the dispatch count
         # lives, so a refusal that cannot be read here cannot be scored against the
@@ -258,7 +279,7 @@ def write_prometheus(version, git, stamp, ncpus, cells_data, loops,
                  help="requeue kicks the price refused outright",
                  labels={"scheduler": _sn})
         if _fh + _mt > 0:
-            pb.gauge("stay_fare_held_pct", f"{100.0 * _fh / (_fh + _mt):.4f}",
+            pb.gauge("stay_cost_held_pct", f"{100.0 * _fh / (_fh + _mt):.4f}",
                      help="share of priced anchor->target edges held home",
                      labels={"scheduler": _sn})
 
@@ -597,7 +618,7 @@ def write_report(version, git, stamp, ncpus, cells_data, loops,
     # THE DRAIN SIDE'S SHARE OF THE MIGRATION COUNT. Per ARM rather than per
     # cell, because the scheduler is torn down once per arm and the [KNOBS] line
     # it prints on the way out is cumulative over every cell it served.
-    # STEP 1's steal is the only migration path that charges a base fare before
+    # STEP 1's steal is the only migration path that charges a base cost before
     # it moves anything -- codel_target_ns plus the R_eff distance price. Every
     # other path charges nothing. A share near zero says the cpu-migrations
     # count above is placement, and that tuning the steal cannot reach it.
@@ -605,7 +626,7 @@ def write_report(version, git, stamp, ncpus, cells_data, loops,
         report.append("MIGRATION ORIGIN  (cumulative per arm)")
         report.append(table_header("SCHEDULER", ["STEALS", "SPILLS",
                                                  "DISPATCHES", "STEAL %",
-                                                 "SPILL %", "FARE HELD",
+                                                 "SPILL %", "COST HELD",
                                                  "HELD %", "KICKS DECLINED"]))
         for sn, (st, sp, di, fh, mt, kd) in steal_by_sched.items():
             report.append(table_row(sn, [
@@ -617,19 +638,19 @@ def write_report(version, git, stamp, ncpus, cells_data, loops,
                 f"{kd}"]))
         report.append("  STEALS are the drain side, STEP 1's peer "
                       "move_to_local -- the only migration path charging a base "
-                      "fare before it moves. SPILLS are the placement side, a "
+                      "cost before it moves. SPILLS are the placement side, a "
                       "wakee seated on a peer instead of its own source CPU, "
                       "gated on queue depth alone. Both count cross- and "
                       "same-domain moves, which the cross_domain_* paths cannot: "
                       "those see CROSS-domain landings only and most moves stay "
                       "inside L2/L3.")
-        report.append("  FARE HELD is the wake path's own priced edge: "
+        report.append("  COST HELD is the wake path's own priced edge: "
                       "anchor -> target refused because the wait on the warm "
-                      "anchor came in under the base fare plus the R_eff "
+                      "anchor came in under the base cost plus the R_eff "
                       "distance. HELD % is against every anchor -> target "
                       "decision, not against dispatches, so a low count with a "
                       "high share means the path is rare and a low share means "
-                      "the fare is not binding.")
+                      "the cost is not binding.")
         report.append("")
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -1192,6 +1213,7 @@ def main():
     results_by_cell = {c.label: {} for c in cells}
     spreads_by_cell = {c.label: {} for c in cells}
     steal_by_sched = {}
+    knobs_by_sched = {}
 
     try:
         for sched_name, cmd in entries:
@@ -1218,11 +1240,13 @@ def main():
                 # count lives -- unable to say what fraction of those migrations
                 # the drain side produced.
                 _k = parse_knobs_line(stop_and_wait(guard) or "")
+                if _k:
+                    knobs_by_sched[sched_name] = _k
                 if "steal" in _k and _k.get("dispatches"):
                     steal_by_sched[sched_name] = (int(_k["steal"]),
                                                   int(_k.get("spill", 0)),
                                                   int(_k["dispatches"]),
-                                                  int(_k.get("stay_fare_held", 0)),
+                                                  int(_k.get("stay_cost_held", 0)),
                                                   int(_k.get("stay_move_taken", 0)),
                                                   int(_k.get("kick_declined", 0)))
             time.sleep(2)
@@ -1243,7 +1267,7 @@ def main():
     if any(results_by_cell[c.label] for c in cells):
         print()
         prom_path = write_prometheus(ver, git, stamp, ncpus, cells_data, NR_LOOPS,
-                                     steal_by_sched)
+                                     steal_by_sched, knobs_by_sched)
         report_path = write_report(ver, git, stamp, ncpus, cells_data, NR_LOOPS,
                                    steal_by_sched)
 

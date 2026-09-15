@@ -1339,23 +1339,39 @@ class MontaukTrace:
             cmd += ["--trace-classes", self.trace_classes]
         if self.pin_cpu is not None:
             cmd = ["taskset", "-c", str(self.pin_cpu)] + cmd
-        # SCRUB THE SCX PROBES FROM EVERY CAPTURE THAT DID NOT ASK FOR THEM.
-        # Both sets arm fentry trampolines on sched_ext kfuncs: MONTAUK_SCX_STORM
-        # on scx_bpf_kick_cpu / scx_bpf_reenqueue_local, MONTAUK_SCX_DSQ on
-        # scx_bpf_dsq_insert{,_vtime} / scx_bpf_dsq_move_to_local. Each has
-        # hard-locked this box under a live scx load -- the storm set on
-        # 2026-07-14, the dsq set on 2026-08-25 -- and an ambient export in the
-        # caller's shell is the documented route both times, because every
-        # capture here inherits the environment. So the guard belongs on the
-        # shared launcher, and a bench that wants either set opts in explicitly.
-        # The list is the enforcement: a third probe set added to montauk and not
+        # KICK CADENCE, AND EVERY CAPTURE STARTS AT THE CHEAP END.
+        # The kick set (fentry/scx_bpf_kick_cpu, fexit/scx_bpf_reenqueue_local,
+        # fentry/resched_curr) is not a safety hazard any more -- the 7.1.x
+        # trampoline freeze is fixed upstream and the set has run 14.6M kicks on
+        # 7.2.3 without a lock. It is a COST hazard. resched_curr fires on every
+        # kick, preemption and wakeup, and arming the set took one fork-thread
+        # capture from 159k events/s to 451k, 3.6M events to 10.5M, with the
+        # analysis time to match. Left ambient it silently triples every bench.
+        #
+        #   off      no kick probes. The default, and what a timing run wants.
+        #   resched  resched_curr alone -- the cheap half. Answers whether a
+        #            kick was ANSWERED, which is the usual question, without the
+        #            two kfunc trampolines.
+        #   full     the whole set. StormReport and KickLatencyReport populated.
+        #
+        # MONTAUK_SCX_DSQ is separate and harder: scx_bpf_dsq_insert{,_vtime}
+        # fires on EVERY enqueue, so a saturated arm offers the ring far more
+        # than it drains and the loss is BIASED -- whichever arm finishes fastest
+        # overruns hardest and ends up least sampled, which reads as though the
+        # winning arm had the worst locality. It stays per-capture opt-in.
+        #
+        # The scrub list is the enforcement: a probe set added to montauk and not
         # added here inherits silently, which is how this rule came to be needed.
-        scx_probe_env = ("MONTAUK_SCX_STORM", "MONTAUK_SCX_DSQ")
+        kick_mode = os.environ.get("PANDEMONIUM_KICK_MODE", "off").strip().lower()
+        scx_probe_env = ("MONTAUK_SCX_DSQ", "MONTAUK_SCX_STORM",
+                         "MONTAUK_SCX_RESCHED")
         env = {k: v for k, v in os.environ.items() if k not in scx_probe_env}
+        if self.scx_storm or kick_mode == "full":
+            env["MONTAUK_SCX_STORM"] = "1"
+        elif kick_mode == "resched":
+            env["MONTAUK_SCX_RESCHED"] = "1"
         if self.scx_dsq:
             env["MONTAUK_SCX_DSQ"] = "1"
-        if self.scx_storm:
-            env["MONTAUK_SCX_STORM"] = "1"
         self.proc = subprocess.Popen(cmd, stdout=self._out,
                                      stderr=subprocess.STDOUT, env=env)
         if not self._wait_for_attach():

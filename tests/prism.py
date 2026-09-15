@@ -1311,6 +1311,14 @@ def main() -> int:
                          "child's suite, where a bare --workload would bind to prism's.")
     ap.add_argument("--list", action="store_true",
                     help="list the PRISM workloads (default + dev tiers) and exit")
+    ap.add_argument("--kick-mode", choices=("off", "resched", "full"),
+                    default="off", metavar="CADENCE",
+                    help="montauk kick-probe cadence for every capture this run "
+                         "takes. off (default) attaches none and keeps the trace "
+                         "at its base rate; resched arms resched_curr alone, the "
+                         "cheap half that still says whether a kick was answered; "
+                         "full arms the kfunc set too and populates StormReport "
+                         "and kick-latency, at roughly 3x the events")
     ap.add_argument("--trace", action="store_true",
                     help="force a montauk capture for --dev workloads (trace-capable "
                          "ones capture anyway; this also forces the longrun/mixed probe "
@@ -1346,6 +1354,13 @@ def main() -> int:
         argv, passthrough = argv[:cut], argv[cut + 1:]
     args = ap.parse_args(argv)
     args.passthrough = passthrough
+
+    # CARRIED BY ENV SO EVERY BENCH INHERITS IT, including one invoked directly
+    # rather than through this dispatcher. The launcher in pandemonium_common
+    # reads it when it builds montauk's child environment, and scrubs the probe
+    # vars it does not select -- so an ambient export cannot quietly raise the
+    # cadence behind a run's back.
+    os.environ["PANDEMONIUM_KICK_MODE"] = args.kick_mode
 
     # --schedulers and --all-scx are two ways to pick the SAME thing (the
     # external field); running both is ambiguous. Warn with a usage hint rather

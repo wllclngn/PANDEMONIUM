@@ -1092,7 +1092,7 @@ def ipc_hop_from_recording(rec) -> dict:
     minus the run leaves the waker-side path cost as a residual, and the two
     halves have completely different suspects. Dispatch-side is the waterfall,
     the kick and the DSQ pop; waker-side is the map-lookup walk through
-    warm_stay_anchor, phi_warm_target and pick_pcpu_dsq_with_spill.
+    warm_seat_pick, phi_warm_target and pick_pcpu_dsq_with_spill.
 
     The capture was already being written and analysed by nothing -- the same gap
     fork-thread had, where the recording existed and the report read three
@@ -1871,10 +1871,10 @@ def write_prometheus(data: dict, stamp: str) -> Path:
                                   ("spill", "Total sibling spills"),
                                   ("kick_declined",
                                    "Requeue kicks the price refused outright"),
-                                  ("stay_fare_held",
-                                   "anchor->target moves the base fare refused"),
+                                  ("stay_cost_held",
+                                   "anchor->target moves the base cost refused"),
                                   ("stay_move_taken",
-                                   "anchor->target moves the base fare admitted"),
+                                   "anchor->target moves the base cost admitted"),
                                   ("dispatches", "Total dispatches")):
                     if tk in knobs:
                         gauge(f"pandemonium_bench_{tk}_total", tdesc,
@@ -2364,7 +2364,7 @@ def format_report(data: dict) -> str:
                 # kick, then the target CPU's dispatch, then the wakee running.
                 # WAKE2RUN fires after enqueue, so it covers the SECOND half only,
                 # and RTT/2 minus it is the waker-side path -- the map-lookup walk
-                # through warm_stay_anchor, phi_warm_target and
+                # through warm_seat_pick, phi_warm_target and
                 # pick_pcpu_dsq_with_spill. The two halves have different suspects,
                 # which is the whole reason to split them.
                 _w2r = ipc.get("wake2run_p50_us")
