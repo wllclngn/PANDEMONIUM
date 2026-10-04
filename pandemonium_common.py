@@ -1370,7 +1370,7 @@ class MontaukTrace:
             env["MONTAUK_SCX_STORM"] = "1"
         elif kick_mode == "resched":
             env["MONTAUK_SCX_RESCHED"] = "1"
-        if self.scx_dsq:
+        if self.scx_dsq or os.environ.get("PANDEMONIUM_SCX_DSQ") == "1":
             env["MONTAUK_SCX_DSQ"] = "1"
         self.proc = subprocess.Popen(cmd, stdout=self._out,
                                      stderr=subprocess.STDOUT, env=env)

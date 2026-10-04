@@ -1058,13 +1058,6 @@ def main():
     ap.add_argument("--pandemonium-only", action="store_true",
                     help="Run only PANDEMONIUM entries -- drop EEVDF and any "
                          "external scx schedulers from the field.")
-    ap.add_argument("--phi-sweep", type=str, nargs="?", const="0", default=None,
-                    metavar="VALUES",
-                    help="Phi A/B: instead of the full scx field, run PANDEMONIUM "
-                         "(BPF mode) across phi_dist_scale_q16 values (comma list; "
-                         "0 = Phi off) plus the topology default and EEVDF. Bare "
-                         "--phi-sweep tests {0, default}. Isolates Phi's marginal "
-                         "effect on this CPU's CCX layout.")
     ap.add_argument("--cascade-sweep", action="store_true",
                     help="Cascade A/B: instead of the full scx field, run "
                          "PANDEMONIUM (BPF mode) with the migration-cascade "
@@ -1083,16 +1076,16 @@ def main():
     NR_LOOPS = NR_LOOPS_QUICK if args.quick else NR_LOOPS_FULL
 
     # PHASE 1 gate: the traced burst (wake2run latency + placement locality) runs
-    # by default, but not for --phi-sweep (a focused cost A/B), not under --no-burst,
+    # by default, but not for --cascade-sweep (a focused cost A/B), not under --no-burst,
     # and not without montauk. It needs root end-to-end (montauk eBPF attach +
     # sched_ext load), so self-elevate once up front -- matches --trace and the
     # RUN-BARE convention (the bench acquires its own root; the user never sudo's).
-    run_burst = (not args.no_burst and args.phi_sweep is None
-                 and not args.cascade_sweep and montauk_available())
+    run_burst = (not args.no_burst and not args.cascade_sweep
+                 and montauk_available())
     if run_burst and os.geteuid() != 0:
         os.execvp("sudo", ["sudo", sys.executable, *sys.argv])
-    if (not args.no_burst and args.phi_sweep is None
-            and not args.cascade_sweep and not montauk_available()):
+    if (not args.no_burst and not args.cascade_sweep
+            and not montauk_available()):
         log_warn("montauk not found -- skipping phase 1 (traced burst); running "
                  "cost-only. Install montauk for the wake2run + locality axes.")
 
@@ -1122,28 +1115,10 @@ def main():
             return 1
     time.sleep(1)
 
-    if args.phi_sweep is not None:
-        # PHI A/B: hold everything constant, vary only phi_dist_scale_q16 via the
-        # scheduler's --phi-scale override. BPF mode (matches the established BPF
-        # anchor; no adaptive loop to perturb). EEVDF for the VS-EEVDF column, the
-        # topology default (no override), then one run per requested value (0 = off).
-        # Single-shape cost A/B -- the threaded default cell, no sweep.
-        vals = [v.strip() for v in args.phi_sweep.split(",") if v.strip() != ""]
-        entries = [
-            ("EEVDF", None),
-            ("PANDEMONIUM (phi=default)", [str(BINARY), "--verbose", "--no-adaptive"]),
-        ]
-        for v in vals:
-            entries.append(
-                (f"PANDEMONIUM (phi={v})",
-                 [str(BINARY), "--verbose", "--no-adaptive", "--phi-scale", v])
-            )
-        log_info(f"PHI SWEEP: topology default + values {vals} (BPF mode)")
-        cells = [Cell(f"thread/g{NUM_GROUPS}", True, NUM_GROUPS)]
-    elif args.cascade_sweep:
+    if args.cascade_sweep:
         # CASCADE A/B: hold everything constant, vary only the oscillator's
         # second forcing term via the scheduler's --no-cascade override. BPF
-        # mode, matching the phi sweep and the established BPF anchor -- no
+        # mode, matching the established BPF anchor -- no
         # adaptive loop to perturb the one knob under test. The estimator runs
         # in BOTH arms and reports fano_q8 either way; only the force is off.
         entries = [

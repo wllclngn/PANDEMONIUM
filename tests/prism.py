@@ -403,9 +403,9 @@ def _sched_flags(bench: str, schedulers: str, all_scx: bool) -> list[str]:
       cachyos / fork-thread / burst-starvation / sojourn-pressure : --all-scx | --schedulers
       ipc (-> prism-scale)                                        : --schedulers"""
     takes_all = bench in ("cachyos", "fork-thread", "burst-starvation",
-                          "sojourn-pressure", "cold-wake", "power")
+                          "sojourn-pressure", "cold-wake", "power", "frame")
     takes_list = bench in ("cachyos", "fork-thread", "ipc", "scale", "burst-starvation",
-                           "sojourn-pressure", "cold-wake", "power")
+                           "sojourn-pressure", "cold-wake", "power", "frame")
     if all_scx and takes_all:
         return ["--all-scx"]
     if schedulers and takes_list:
@@ -1319,6 +1319,12 @@ def main() -> int:
                          "cheap half that still says whether a kick was answered; "
                          "full arms the kfunc set too and populates StormReport "
                          "and kick-latency, at roughly 3x the events")
+    ap.add_argument("--scx-dsq", action="store_true",
+                    help="arm montauk's scx_bpf_dsq_insert{,_vtime} probes for every "
+                         "capture this run takes, so each enqueue records the DSQ it "
+                         "went to. Fires on EVERY enqueue: a saturated arm overruns "
+                         "the ring and the loss is biased toward the fastest arm, so "
+                         "read it for where tasks went, never to compare arms")
     ap.add_argument("--trace", action="store_true",
                     help="force a montauk capture for --dev workloads (trace-capable "
                          "ones capture anyway; this also forces the longrun/mixed probe "
@@ -1361,6 +1367,7 @@ def main() -> int:
     # vars it does not select -- so an ambient export cannot quietly raise the
     # cadence behind a run's back.
     os.environ["PANDEMONIUM_KICK_MODE"] = args.kick_mode
+    os.environ["PANDEMONIUM_SCX_DSQ"] = "1" if args.scx_dsq else "0"
 
     # --schedulers and --all-scx are two ways to pick the SAME thing (the
     # external field); running both is ambiguous. Warn with a usage hint rather
@@ -1385,6 +1392,7 @@ def main() -> int:
         "ipc":         [str(TESTS_DIR / "prism-ipc.py")],
         "power":       [str(TESTS_DIR / "prism-power.py")],
         "cachyos":     [str(TESTS_DIR / "prism-cachyos.py")],
+        "frame":       [str(TESTS_DIR / "prism-frame.py")],
         "scx":         [_pt, "prism-scx"],
     }
     # THE UNIFIED --dev CONTRACT (v5.17.0): every implementer accepts the
