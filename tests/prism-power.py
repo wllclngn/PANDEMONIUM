@@ -832,8 +832,9 @@ def main() -> int:
     ap.add_argument("--schedulers", default=",".join(DEFAULT_EXTERNALS),
                     help="Comma-separated external scx schedulers")
     ap.add_argument("--trace", action="store_true",
-                    help="Accepted for suite uniformity; prism-power has no "
-                         "capture mode (RAPL counters, not traces)")
+                    help="Also run the cold-wake arm, a montauk capture of "
+                         "idle-exit latency. Without it the run is RAPL counters "
+                         "alone")
     ap.add_argument("--pandemonium-only", action="store_true",
                     help="Only test PANDEMONIUM (BPF + ADAPTIVE), no EEVDF or external scx")
     ap.add_argument("--no-eevdf", action="store_true",
@@ -849,7 +850,8 @@ def main() -> int:
     # these were never two benches. prism-coldwake keeps its own entry point
     # because --dev storm shares that implementation.
     ap.add_argument("--no-cold-wake", action="store_true",
-                    help="Skip the cold-wake arm (energy workloads only)")
+                    help="Skip the cold-wake arm that --trace adds (energy "
+                         "workloads only)")
     ap.add_argument("--cold-wake-duration", type=int, default=60,
                     help="Cold-wake cycle window per scheduler arm (default 60)")
     ap.add_argument("--cores", type=str, default=None,
@@ -976,7 +978,7 @@ def main() -> int:
             wait_for_deactivation(5.0)
 
     cold = None
-    if not args.no_cold_wake:
+    if args.trace and not args.no_cold_wake:
         print()
         log_info("COLD-WAKE ARM: idle-exit latency, the cost side of the idle win")
         _cw = [sys.executable, str(Path(__file__).parent / "pandemonium-tests.py"),

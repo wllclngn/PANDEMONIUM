@@ -1,0 +1,114 @@
+# pandemonium_select_cpu and pandemonium_enqueue both fail veristat on the
+# bpf-next and for-next CI kernels ("The sequence of 8193 jumps is too
+# complex"); both inline the same two search loops. The fix moves the loops in
+# find_idle_by_affinity and find_spill_seat onto bpf_for.
+
+[ticket]
+id = "sched-ext/scx#3966"
+url = "https://github.com/sched-ext/scx/issues/3966"
+title = "scx_pandemonium: BPF verifier error on the bpf-next and for-next trees"
+
+[run]
+smp = 8
+mem = "4G"
+duration = 20
+reps = 1
+
+[[kernel]]
+label = "bpf-next"
+kind = "git"
+url = "https://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf-next.git"
+ref = "master"
+sha = "d346f59069676eda84b3313cbd2c2ab21045d3ee"
+mirrors = ["https://github.com/kernel-patches/bpf"]
+note = "veristat-dev failure, job 126624645425"
+
+[[kernel]]
+label = "for-next"
+kind = "git"
+url = "https://git.kernel.org/pub/scm/linux/kernel/git/tj/sched_ext.git"
+ref = "for-next"
+sha = "f7008fb94ee033c8de9f42ae2bf2911db73c17f9"
+mirrors = ["https://github.com/torvalds/linux"]
+note = "veristat-dev failure, job 126624645050"
+
+[[kernel]]
+label = "bpf-next-pass"
+kind = "git"
+url = "https://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf-next.git"
+ref = "master"
+sha = "7101b10cf281f629ac58c99697ca6f6d082b99a7"
+mirrors = ["https://github.com/kernel-patches/bpf"]
+note = "control: the last bpf-next veristat-dev passed on, job 124063963295"
+
+[[kernel]]
+label = "mainline-7.4-rc1"
+kind = "git"
+url = "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"
+ref = "v7.4-rc1"
+sha = "6628e7d4c6b25c8d18f1345e3a20d21829aae7e4"
+mirrors = ["https://github.com/torvalds/linux"]
+note = "Linus's 7.4-rc1: its kernel/bpf/verifier.c is the same blob as the first failing CI kernel's"
+
+[[scheduler]]
+label = "upstream"
+kind = "cargo"
+repo = "/tmp/PANDEMONIUM-build/vm-matrix/scx"
+url = "https://github.com/sched-ext/scx"
+commit = "b0efa3f614c0187df4cb3202d7b514d401f77d2a"
+path = "."
+package = "scx_pandemonium"
+binary = "scx_pandemonium"
+note = "sched-ext/scx exactly as both failing CI jobs built it (SCX_GIT_SHA); calibration"
+[scheduler.sha256]
+"scheds/rust/scx_pandemonium/src/bpf/main.bpf.c" = "de8b50bf0f110b4f3c662df6bc45060eff2be847ac977c01e3a6532733ad4d44"
+
+[[scheduler]]
+label = "baseline"
+kind = "cargo"
+repo = "~/personal"
+commit = "44e2d858abc320684828272456a6ed9abe123951"
+path = "PROGRAMMING/SYSTEM PROGRAMS/LINUX/PANDEMONIUM"
+binary = "pandemonium"
+ops = "pandemonium"
+inputs = ["~/.cache/pandemonium/vmlinux.h"]
+note = "the tree before the fix"
+[scheduler.sha256]
+"src/bpf/main.bpf.c" = "7bc2c7375985875eee9a16e428688950634158ff09be3eadb579b6f226d07981"
+
+[[scheduler]]
+label = "bpf_for"
+kind = "cargo"
+repo = "~/personal"
+commit = "d1b064b03023ab67daf6b8111b928d9f73d2d8e6"
+path = "PROGRAMMING/SYSTEM PROGRAMS/LINUX/PANDEMONIUM"
+binary = "pandemonium"
+ops = "pandemonium"
+inputs = ["~/.cache/pandemonium/vmlinux.h"]
+note = "the committed fix: both loops on bpf_for"
+[scheduler.sha256]
+"src/bpf/main.bpf.c" = "0caffe2ff30475246c4b931b60293cb5baf8767d9846fc0050e0a761dcc2a712"
+
+[[expect]]
+kernels = ["bpf-next", "for-next", "mainline-7.4-rc1"]
+schedulers = ["upstream", "baseline"]
+veristat = "failure"
+fail_progs = ["pandemonium_select_cpu", "pandemonium_enqueue"]
+error = "The sequence of 8193 jumps is too complex"
+attach = "fail"
+
+[[expect]]
+kernels = ["bpf-next-pass"]
+schedulers = ["upstream", "baseline"]
+veristat = "success"
+attach = "ok"
+phases = "ok"
+detach = "ok"
+
+[[expect]]
+kernels = ["*"]
+schedulers = ["bpf_for"]
+veristat = "success"
+attach = "ok"
+phases = "ok"
+detach = "ok"

@@ -23,6 +23,15 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 _sudo_user = os.environ.get("SUDO_USER")
+# sudo FROM A ROOT SHELL SETS SUDO_USER=root, WHICH NAMES NO HOME; THE TTY'S
+# LOGIN NAME IS THE INVOKER THEN, AND root'S OWN HOME ONLY WHEN THAT FAILS TOO.
+if not _sudo_user or _sudo_user == "root":
+    try:
+        _sudo_user = os.getlogin()
+    except OSError:
+        _sudo_user = None
+    if _sudo_user == "root":
+        _sudo_user = None
 _real_home = Path(f"/home/{_sudo_user}") if _sudo_user else Path.home()
 # CARGO_TARGET_DIR LIVES UNDER THE INVOKING USER'S HOME, NOT /tmp. /tmp IS
 # WORLD-WRITABLE WITH STICKY BIT, AND A SHARED BUILD TREE THERE OPENED A
@@ -572,10 +581,9 @@ def envelope_verdict(report_dict: dict) -> tuple[str, str]:
     """(klass, verdict) for one report. klass is the COMPARABLE half.
 
     montauk keeps these separate on purpose: The verdict sentence carries numbers
-    and therefore drifts, while klass is a short token from a small fixed set --
-    "what a behavioral golden can compare EXACTLY, which is the whole reason it
-    exists separately rather than being parsed back out of the prose". The suite
-    had never compared one, so a class flipping between two arms of the same run
+    and therefore drifts, while klass is a short token from a small fixed set
+    that two arms can compare exactly, which is why it is not parsed back out of
+    the prose. The suite had never compared one, so a class flipping between two arms of the same run
     (SATURATED vs PLACEMENT-MISS, ORDER-STARVED vs PREEMPT-STARVED) went unread.
     """
     return (report_dict.get("class") or "",
@@ -725,11 +733,11 @@ def table_row(label: str, cells: list[str],
 # PROMETHEUS
 # UNIFIED METRIC SCHEMA (ratified -- all emitters follow it, no exceptions):
 #   name:       pandemonium_<bench>_<metric>   (bench in: scale, contention,
-#               pcpu, scx, fork_thread, cachyos, power, prism)
+#               pcpu, scx, fork_thread, power, prism)
 #   metadata:   exactly ONE pandemonium_<bench>_info{version,git_commit,
 #               git_dirty,...} gauge = 1, plus ONE pandemonium_<bench>_
 #               timestamp_seconds gauge. NEVER repeat version/commit per metric
-#               line (prism-cachyos did; that is removed).
+#               line.
 #   labels:     scheduler=, cores= or cpus=, workload=, phase= -- lowercase,
 #               quoted. Numeric scope (core count) is a label, not part of name.
 #   HELP/TYPE:  emitted once per distinct metric name, before its first sample.
@@ -1140,10 +1148,130 @@ def montauk_available() -> bool:
     return Path(MONTAUK).exists()
 
 
+# PANDEMONIUM's CUSTOM PROFILES FOR scx's SCHEDULER CATALOG (VERSION 2), WHICH
+# scxcli AND scxtui START SCHEDULERS FROM. THE INSTALLER OFFERS THEM AND THE
+# EXPORT SHIPS THEM IN THE CRATE; BOTH READ THIS ONE FILE.
+SCX_PROFILES = SCRIPT_DIR / "catalog" / "profiles.json"
+_PROFILE_KEYS = {"id", "label", "description", "sched", "args"}
+_PROFILE_ID = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
+_PROFILE_ARG = re.compile(r"[A-Za-z0-9_=.,:/+-]{1,256}")
+
+
+def scx_profiles() -> list[dict]:
+    """The profiles in catalog/profiles.json, held to scx's rules for a custom
+    profile. Raises ValueError naming the first entry that breaks one."""
+    import json as _json
+    profiles = _json.loads(SCX_PROFILES.read_text())
+    if not isinstance(profiles, list) or not profiles:
+        raise ValueError("catalog/profiles.json is not a non-empty list")
+    ids = set()
+    for p in profiles:
+        pid = p.get("id", "")
+        def bad(why: str) -> ValueError:
+            return ValueError(f"catalog/profiles.json: profile '{pid}' {why}")
+        if set(p) - _PROFILE_KEYS:
+            raise bad(f"has unknown keys {sorted(set(p) - _PROFILE_KEYS)}")
+        if (not _PROFILE_ID.fullmatch(pid) or pid == "default"
+                or pid.startswith("scx_")):
+            raise bad("has an id scx would read as a scheduler or an option")
+        if pid in ids:
+            raise bad("is listed twice")
+        ids.add(pid)
+        if p.get("sched") != "scx_pandemonium":
+            raise bad("does not start scx_pandemonium")
+        args = p.get("args", [])
+        if (not isinstance(args, list) or len(args) > 32
+                or not all(isinstance(a, str) and _PROFILE_ARG.fullmatch(a)
+                           for a in args)):
+            raise bad("has options outside scx's allowlist")
+        if not 1 <= len(p.get("label", "")) <= 64:
+            raise bad("needs a label of 1 to 64 characters")
+        if len(p.get("description", "")) > 256:
+            raise bad("has a description over 256 characters")
+    return profiles
+
+
+PROBE_SRC = SCRIPT_DIR / "tests" / "probe.c"
+PROBE_TOOL = TARGET_DIR / "tests" / "probe"
+
+
+def probe_tool() -> Path:
+    """The suite's wake probe and stress worker, tests/probe.c, built on first
+    use and again whenever the source is newer than the binary."""
+    if (not PROBE_TOOL.exists()
+            or PROBE_TOOL.stat().st_mtime < PROBE_SRC.stat().st_mtime):
+        PROBE_TOOL.parent.mkdir(parents=True, exist_ok=True)
+        r = subprocess.run(["gcc", "-std=c23", "-O2", "-march=native", "-pthread",
+                            "-Wall", "-Wextra", "-o", str(PROBE_TOOL), str(PROBE_SRC)],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"tests/probe.c did not build:\n{r.stderr.strip()}")
+        _chown_to_invoking_user(PROBE_TOOL.parent)
+    return PROBE_TOOL
+
+
+def cpu_max_c() -> float | None:
+    """The package's hottest reading, from montauk's live snapshot."""
+    import json as _json
+    rc, so, _se = run_cmd_capture([MONTAUK, "--json"])
+    if rc != 0 or not so.strip():
+        return None
+    try:
+        v = _json.loads(so).get("thermal", {}).get("cpu_max_c")
+        return float(v) if v is not None else None
+    except (ValueError, AttributeError):
+        return None
+
+
+def box_uptime_s() -> float:
+    try:
+        return float(Path("/proc/uptime").read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        return 0.0
+
+
+def box_governor() -> str:
+    try:
+        return Path("/sys/devices/system/cpu/cpu0/cpufreq/"
+                    "scaling_governor").read_text().strip()
+    except OSError:
+        return "?"
+
+
+# THE BENCH'S OWN NAMES. ANYTHING ELSE montauk RANKS AS BUSY IS THE BOX'S LOAD.
+BENCH_OWN = ("pand-", "pandemonium", "python3", "montauk", "perf", "taskset")
+
+
+def box_outsiders(n: int = 5, own: tuple = BENCH_OWN) -> tuple[float, str]:
+    """(cpu_pct, names) of the busiest processes montauk ranks right now that
+    are not the bench's own: The box's load beside the arm, by its anomaly lane."""
+    import json as _json
+    rc, so, _se = run_cmd_capture([MONTAUK, "--anomalies", str(n)])
+    if rc != 0 or not so.strip():
+        return 0.0, ""
+    try:
+        rows = _json.loads(so).get("anomalies", [])
+    except ValueError:
+        return 0.0, ""
+    out = []
+    for r in rows:
+        comm = str(r.get("comm", ""))
+        if any(comm.startswith(p) for p in own):
+            continue
+        cpu = float(r.get("cpu_pct", 0.0))
+        if cpu >= 1.0:
+            out.append((cpu, comm))
+    out.sort(reverse=True)
+    return (sum(c for c, _ in out),
+            " ".join(f"{comm} {cpu:.0f}%" for cpu, comm in out[:3]))
+
+
 def _chown_to_invoking_user(*paths) -> None:
     """Hand root-owned montauk recordings back to the sudo invoker so they are
-    viewable without sudo. No-op when not running under sudo."""
-    user = os.environ.get("SUDO_USER")
+    viewable without sudo. No-op when not running under sudo. The invoker is the
+    one _real_home resolved, so a file lands in a home and is owned by its user
+    even when sudo ran from a root shell."""
+    user = _sudo_user
     if not user or os.geteuid() != 0:
         return
     for path in paths:
@@ -1273,9 +1401,8 @@ class MontaukTrace:
     def __init__(self, pattern, label, stamp, log_dir=TRACE_DIR,
                  interval_ms=MONTAUK_LOG_INTERVAL_MS, baseline_s=0.0,
                  attach_timeout=MONTAUK_ATTACH_TIMEOUT, events=False,
-                 pin_cpu=None, sched_detail=False, scx_dsq=False,
-                 scx_storm=False,
-                 trace_classes=None, quiesce_s=MONTAUK_QUIESCE_S):
+                 pin_cpu=None, sched_detail=False, scx_storm=False,
+                 scx_dsq=False, trace_classes=None, quiesce_s=MONTAUK_QUIESCE_S):
         # quiesce_s: the mirror of baseline_s. baseline_s records quiet BEFORE
         # the workload; this records quiet AFTER it, so a strand still open when
         # the workload stopped is observed against an idle system rather than
@@ -1299,13 +1426,14 @@ class MontaukTrace:
         # cost rather than moving it. Declare what the bench READS; a report that
         # goes quiet after a change here is a class that was load-bearing.
         self.trace_classes = trace_classes
-        # scx_dsq: arm montauk's placement/drain attribution probes for THIS
-        # capture (MONTAUK_SCX_DSQ). Same hazard class as the storm probes and
-        # scrubbed by the same rule below, so a bench that wants the
-        # placement-versus-drain split asks for it here rather than by exporting
-        # a variable that every other capture would inherit.
-        self.scx_dsq = scx_dsq
+        # scx_storm: arm montauk's kick-probe set (MONTAUK_SCX_STORM) for THIS
+        # capture. The storm bench asks for it because the kicks are what it
+        # measures; no other capture arms a probe set.
         self.scx_storm = scx_storm
+        # scx_dsq: arm montauk's DSQ insert and drain probes (MONTAUK_SCX_DSQ), one
+        # event per enqueue, so a capture says which queue a wake went to. The
+        # probe bench asks for it; its question is where a floored wake sat.
+        self.scx_dsq = scx_dsq
         # pin_cpu: taskset montauk to a dedicated CPU so it always drains its
         # ring buffer -- under a saturated workload an unpinned montauk gets
         # starved and DROPS events (400ms+ capture holes), making a per-event
@@ -1339,38 +1467,25 @@ class MontaukTrace:
             cmd += ["--trace-classes", self.trace_classes]
         if self.pin_cpu is not None:
             cmd = ["taskset", "-c", str(self.pin_cpu)] + cmd
-        # KICK CADENCE, AND EVERY CAPTURE STARTS AT THE CHEAP END.
-        # The kick set (fentry/scx_bpf_kick_cpu, fexit/scx_bpf_reenqueue_local,
-        # fentry/resched_curr) is not a safety hazard any more -- the 7.1.x
-        # trampoline freeze is fixed upstream and the set has run 14.6M kicks on
-        # 7.2.3 without a lock. It is a COST hazard. resched_curr fires on every
-        # kick, preemption and wakeup, and arming the set took one fork-thread
-        # capture from 159k events/s to 451k, 3.6M events to 10.5M, with the
-        # analysis time to match. Left ambient it silently triples every bench.
-        #
-        #   off      no kick probes. The default, and what a timing run wants.
-        #   resched  resched_curr alone -- the cheap half. Answers whether a
-        #            kick was ANSWERED, which is the usual question, without the
-        #            two kfunc trampolines.
-        #   full     the whole set. StormReport and KickLatencyReport populated.
-        #
-        # MONTAUK_SCX_DSQ is separate and harder: scx_bpf_dsq_insert{,_vtime}
-        # fires on EVERY enqueue, so a saturated arm offers the ring far more
-        # than it drains and the loss is BIASED -- whichever arm finishes fastest
-        # overruns hardest and ends up least sampled, which reads as though the
-        # winning arm had the worst locality. It stays per-capture opt-in.
+        # EVERY CAPTURE RUNS AT montauk's BASE RATE unless the bench asks for a
+        # probe set. The kick set (fentry/scx_bpf_kick_cpu,
+        # fexit/scx_bpf_reenqueue_local, fentry/resched_curr) is a COST hazard:
+        # resched_curr fires on every kick, preemption and wakeup, and arming the
+        # set took one fork-thread capture from 159k events/s to 451k, 3.6M
+        # events to 10.5M, with the analysis time to match. MONTAUK_SCX_DSQ fires
+        # on EVERY enqueue, and its loss under saturation is BIASED toward the
+        # fastest arm. So the probe variables are scrubbed from montauk's
+        # environment and only scx_storm arms one: an ambient export cannot raise
+        # a capture's cost behind a run's back.
         #
         # The scrub list is the enforcement: a probe set added to montauk and not
         # added here inherits silently, which is how this rule came to be needed.
-        kick_mode = os.environ.get("PANDEMONIUM_KICK_MODE", "off").strip().lower()
         scx_probe_env = ("MONTAUK_SCX_DSQ", "MONTAUK_SCX_STORM",
                          "MONTAUK_SCX_RESCHED")
         env = {k: v for k, v in os.environ.items() if k not in scx_probe_env}
-        if self.scx_storm or kick_mode == "full":
+        if self.scx_storm:
             env["MONTAUK_SCX_STORM"] = "1"
-        elif kick_mode == "resched":
-            env["MONTAUK_SCX_RESCHED"] = "1"
-        if self.scx_dsq or os.environ.get("PANDEMONIUM_SCX_DSQ") == "1":
+        if self.scx_dsq:
             env["MONTAUK_SCX_DSQ"] = "1"
         self.proc = subprocess.Popen(cmd, stdout=self._out,
                                      stderr=subprocess.STDOUT, env=env)
@@ -1681,6 +1796,11 @@ def start_scheduler(cmd: list[str], name: str) -> SchedulerProcess | None:
     return SchedulerProcess(proc, name, stdout_path, stderr_path)
 
 
+# WHAT THE LAST SCHEDULER THAT FAILED TO ACTIVATE SAID ON STDERR (ITS TAIL), FOR
+# A REPORT TO CARRY; THE STDERR FILE ITSELF IS UNLINKED WITH THE GUARD.
+last_activation_failure = ""
+
+
 def start_and_wait(cmd: list[str], name: str,
                    settle_secs: float = 2.0) -> SchedulerProcess | None:
     """Start a scheduler, wait for sched_ext activation. Returns None on failure."""
@@ -1705,10 +1825,14 @@ def start_and_wait(cmd: list[str], name: str,
             log_error(f"{name} process exited early (code {guard.proc.returncode})")
         else:
             log_warn(f"{name} process still running but sched_ext not active")
-        stderr = guard.read_stderr()
-        if stderr.strip():
-            for line in stderr.strip().splitlines()[:30]:
-                log_error(f"  {line}")
+        # THE TAIL, NOT THE HEAD: A VERIFIER REJECTION ENDS WITH ITS VERDICT
+        # AFTER THOUSANDS OF LOG LINES, AND THE HEAD IS THE LOADER'S PREAMBLE.
+        stderr = guard.read_stderr(limit=1 << 20)
+        tail = stderr.strip().splitlines()[-30:]
+        for line in tail:
+            log_error(f"  {line}")
+        global last_activation_failure
+        last_activation_failure = "\n".join(tail)
         guard.stop()
         wait_for_deactivation(5.0)
         return None
@@ -2077,7 +2201,7 @@ _XDOM_PATHS = ["sel_tight", "sel_sync", "sel_normal", "sel_dfl",
 def trace_workload(sched_name, activate_cmd, pattern, label, stamp, body_fn, *,
                    baseline_s=0.0, events=False, pin_cpu=None,
                    trace_activation=False, sched_detail=False,
-                   trace_classes=None):
+                   trace_classes=None, scx_dsq=False):
     """Record `montauk --trace pattern` around a scheduler workload.
 
     Default: activate `sched_name` via start_and_wait(activate_cmd), record while
@@ -2098,7 +2222,7 @@ def trace_workload(sched_name, activate_cmd, pattern, label, stamp, body_fn, *,
     if trace_activation:
         with montauk_trace(pattern, rlabel, stamp, baseline_s=baseline_s,
                            events=events, pin_cpu=pin_cpu,
-                           sched_detail=sched_detail,
+                           sched_detail=sched_detail, scx_dsq=scx_dsq,
                            trace_classes=trace_classes) as rec:
             guard = start_and_wait(activate_cmd, sched_name) if activate_cmd else None
             if activate_cmd is not None and guard is None:
@@ -2124,7 +2248,7 @@ def trace_workload(sched_name, activate_cmd, pattern, label, stamp, body_fn, *,
     try:
         with montauk_trace(pattern, rlabel, stamp, baseline_s=baseline_s,
                            events=events, pin_cpu=pin_cpu,
-                           sched_detail=sched_detail,
+                           sched_detail=sched_detail, scx_dsq=scx_dsq,
                            trace_classes=trace_classes) as rec:
             rec_dir = rec.dir
             return rec.dir, body_fn(rec.dir)

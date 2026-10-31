@@ -16,7 +16,6 @@ Two styles:
 import argparse
 import os
 import re
-import subprocess
 import sys
 from pathlib import Path
 
@@ -100,26 +99,6 @@ def short_name(s):
     if is_pande(s) and "BPF" in s:
         return "scx_pandemonium (bpf)"
     return s
-
-
-def sched_version(s, meta):
-    """Version string for a scheduler label, so the chart is self-documenting.
-    EEVDF -> kernel release; scx_pandemonium -> the run's version from the .prom;
-    scx_* -> the installed binary's --version."""
-    if "EEVDF" in s:
-        try:
-            return os.uname().release
-        except Exception:
-            return ""
-    if is_pande(s):
-        return f"v{meta.get('version', '')}"
-    try:
-        out = subprocess.run([s, "--version"], capture_output=True,
-                             text=True, timeout=3).stdout
-        m = re.search(r"\b(\d+\.\d+\.\d+)\b", out)
-        return m.group(1) if m else ""
-    except Exception:
-        return ""
 
 
 def sched_order(s):
@@ -270,93 +249,10 @@ def render_cachyos(path, args):
     return fig, out, f"{nsched} schedulers at {cores}C, {nrows} workloads"
 
 
-def parse_cachyos_suite(path):
-    # prism-cachyos suite .prom: pandemonium_bench_cachyos_seconds{scheduler,
-    # workload,stat="mean"|"stdev"}. Returns {scheduler: {workload: mean_s}}, meta.
-    data, meta = {}, {"version": "?"}
-    for raw in Path(path).read_text().splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        m = _METRIC_RE.match(line)
-        if not m or m.group(1) != "pandemonium_bench_cachyos_seconds":
-            continue
-        labels = dict(_LABEL_RE.findall(m.group(2) or ""))
-        if labels.get("stat") != "mean":
-            continue
-        sched, wl = labels.get("scheduler"), labels.get("workload")
-        if not sched or not wl:
-            continue
-        try:
-            data.setdefault(sched, {})[wl] = float(m.group(3))
-        except ValueError:
-            continue
-        meta["version"] = labels.get("version", meta["version"])
-    return data, meta
-
-
-# STYLE: prism-cachyos suite total wall-time, one bar per scheduler, fastest on
-# top, PANDEMONIUM outlined. The full-field "dominance" chart -- lower is better.
-def render_cachyos_suite(path, args):
-    data, meta = parse_cachyos_suite(path)
-    if not data:
-        log_error("no prism-cachyos suite data (expected pandemonium_cachyos_seconds)")
-        return None
-    exclude = {x.strip() for x in args.exclude.split(",") if x.strip()}
-    nwl = max((len(w) for w in data.values()), default=0)
-    totals = {}
-    for s, wls in data.items():
-        if any(e in s for e in exclude):
-            continue
-        if len(wls) < nwl:   # only schedulers that ran the full set get a fair total
-            log_error(f"{s}: {len(wls)}/{nwl} workloads -- excluded from total")
-            continue
-        totals[s] = sum(wls.values())
-    if not totals:
-        log_error("no scheduler ran the full workload set")
-        return None
-    scheds = sorted(totals, key=lambda s: totals[s])   # fastest first
-
-    plt.style.use("default")
-    n = len(scheds)
-    fig, ax = plt.subplots(figsize=(11, max(4.5, n * 0.55)), dpi=140)
-    y = np.arange(n)[::-1]
-    fastest = totals[scheds[0]]
-    for i, s in enumerate(scheds):
-        ec, lw = ("black", 1.1) if is_pande(s) else ("none", 0)
-        ax.barh(y[i], totals[s], height=0.72, color=color_for(s, i),
-                edgecolor=ec, linewidth=lw, zorder=3)
-        mult = "" if i == 0 else f"  ({totals[s] / fastest:.2f}x)"
-        ax.text(totals[s], y[i], f" {totals[s]:.1f}s{mult}",
-                va="center", ha="left", fontsize=8)
-    ax.set_yticks(y)
-    labels = []
-    for s in scheds:
-        v = sched_version(s, meta)
-        labels.append(f"{short_name(s)}  {v}" if v else short_name(s))
-    ax.set_yticklabels(labels)
-    ax.set_xlabel(f"Total wall-time across {nwl} workloads (s).  Lower is better")
-    if args.log:
-        ax.set_xscale("log")
-    ax.grid(axis="x", color="#cccccc", linewidth=0.6, zorder=0)
-    ax.set_axisbelow(True)
-    ax.margins(x=0.14)
-    cpu = cpu_model()
-    ax.set_title(f"scx_pandemonium v{meta['version']} — CachyOS Suite Total Wall-Time\n"
-                 f"{cpu}  ·  {nwl} workloads  ·  {os.uname().release}  ·  {path.name}",
-                 fontsize=12)
-    fig.tight_layout()
-    out = args.out or f"prism-cachyos-suite-{meta['version']}.png"
-    return fig, out, f"{n} schedulers, {nwl} workloads"
-
-
 def main():
     ap = argparse.ArgumentParser(description="Render a prism-scale .prom into a PNG.")
     ap.add_argument("file", nargs="?", help="explicit .prom (default: newest in cache)")
-    ap.add_argument("--style", default="bars",
-                    choices=["bars", "cachyos", "cachyos-suite"],
-                    help="cachyos-suite: prism-cachyos total wall-time per scheduler "
-                         "(the full-field dominance chart)")
+    ap.add_argument("--style", default="bars", choices=["bars", "cachyos"])
     ap.add_argument("--metric", default="latency_p99", choices=list(METRICS),
                     help="(bars style only)")
     ap.add_argument("--cores", type=int, default=0,
@@ -369,14 +265,6 @@ def main():
 
     if args.file:
         path = Path(args.file)
-    elif args.style == "cachyos-suite":
-        # newest prism-cachyos suite .prom (not version-prefixed like prism-scale)
-        cands = sorted(Path(args.cache_dir).glob("prism-cachyos-*.prom"),
-                       key=lambda p: p.stat().st_mtime, reverse=True)
-        if not cands:
-            log_error("no prism-cachyos .prom found")
-            return 1
-        path = cands[0]
     else:
         cands = [p for p in sorted(Path(args.cache_dir).glob("*.prom"),
                                    key=lambda p: p.stat().st_mtime, reverse=True)
@@ -387,9 +275,7 @@ def main():
             return 1
         path = cands[0]
 
-    if args.style == "cachyos-suite":
-        result = render_cachyos_suite(path, args)
-    elif args.style == "cachyos":
+    if args.style == "cachyos":
         result = render_cachyos(path, args)
     else:
         result = render_bars(path, args)

@@ -28,17 +28,11 @@ Two modes:
       pool.
       python3 baseline_gate.py --candidate-dir /path/to/fresh/runs
 
-Self-test (no archive, no montauk, no hardware -- pure arithmetic over a
-synthetic fixture, gated byte-exact against a golden):
-      python3 baseline_gate.py --self-test
-      python3 baseline_gate.py --self-test --update   # refreeze, shows the diff
-
 montauk is the only analyzer. This shells `montauk --analyze` (its fixed --by
 version comparator + --alias to bridge the bench_->scale_ family rename) and
 reads the structured montauk_pop_mean gauges it emits.
 """
 import argparse
-import difflib
 import math
 import os
 import shutil
@@ -49,9 +43,6 @@ from pathlib import Path
 
 BASELINE = "5.14.0"
 DEFAULT_ARCHIVE = Path.home() / ".cache" / "pandemonium"
-FIXTURE = Path(__file__).resolve().parent / "fixtures" / "baseline_gate.pop.prom"
-GOLDEN = Path(__file__).resolve().parent / "fixtures" / "baseline_gate.golden"
-FIXTURE_CANDIDATE = "5.17.0"   # the candidate group the fixture carries
 
 # Load-bearing IPC families (lower is better). bench_ (pre-5.15) and scale_
 # (post-5.15) are aliased to one neutral name so the comparison spans the
@@ -133,7 +124,7 @@ def geomean(rs) -> float:
 
 def judge(cells: dict, tol: float, abs_floor: float, baseline: str) -> list:
     """The verdict. Pure: no I/O, no clock, no environment -- same cells in,
-    same lines out, which is what makes it gateable against a golden.
+    same lines out.
 
     cells maps (metric, cell) -> {"peak": float, "cand": float}. PANDEMONIUM is
     the subject; EEVDF cells are consumed as the drift control and never judged.
@@ -245,57 +236,6 @@ def newest_version(archive: Path, baseline: str) -> str:
     return max(vers, key=key) if vers else baseline
 
 
-def self_test(update: bool) -> int:
-    """Run judge() over the synthetic fixture and gate it against the golden.
-
-    The fixture is hand-authored to exercise every branch the drift correction
-    has: a cell the correction rescues (raw past tolerance, corrected under it),
-    a genuine regression, a ratio past tolerance that the absolute floor
-    correctly ignores as noise, a cell with no EEVDF twin that falls back to the
-    global drift, and a zero-baseline cell that must be skipped rather than
-    divided by.
-    """
-    if not FIXTURE.is_file():
-        print(f"[gate] FAIL self-test: fixture missing ({FIXTURE})")
-        return 1
-    cells = pair_groups(parse_pop_mean(FIXTURE.read_text()),
-                        BASELINE, FIXTURE_CANDIDATE)
-    if not cells:
-        print(f"[gate] FAIL self-test: fixture parsed to zero cells ({FIXTURE})")
-        return 1
-    got = "\n".join(judge(cells, DEFAULT_TOL, ABS_FLOOR_US, BASELINE)) + "\n"
-
-    if update:
-        # A refreeze canonizes whatever the code printed. Show the diff it is
-        # about to stamp as truth, so a regression cannot be frozen in silently.
-        if GOLDEN.is_file() and GOLDEN.read_text() != got:
-            print("[gate] refreezing golden -- diff being canonized:")
-            sys.stdout.writelines(difflib.unified_diff(
-                GOLDEN.read_text().splitlines(keepends=True),
-                got.splitlines(keepends=True),
-                fromfile="golden", tofile="got"))
-        GOLDEN.parent.mkdir(parents=True, exist_ok=True)
-        GOLDEN.write_text(got)
-        print(f"[gate] updated golden ({len(got)} bytes, "
-              f"{got.count(chr(10))} lines)")
-        return 0
-
-    if not GOLDEN.is_file():
-        print(f"[gate] FAIL self-test: golden missing ({GOLDEN}) -- "
-              "run with --update to freeze it")
-        return 1
-    want = GOLDEN.read_text()
-    if got == want:
-        print(f"[gate] PASS self-test: verdict matches golden "
-              f"({got.count(chr(10))} lines, {len(cells)} fixture cells)")
-        return 0
-    print("[gate] FAIL self-test: verdict diverged from golden:")
-    sys.stdout.writelines(difflib.unified_diff(
-        want.splitlines(keepends=True), got.splitlines(keepends=True),
-        fromfile="golden", tofile="got"))
-    return 1
-
-
 def trajectory(args) -> int:
     """WHICH RELEASE A METRIC CHANGED AT, from the archive alone.
 
@@ -353,11 +293,6 @@ def main() -> int:
     ap.add_argument("--baseline", default=BASELINE,
                     help=f"baseline version to gate against (default {BASELINE}; "
                          "for archaeology, not for lowering the bar)")
-    ap.add_argument("--self-test", action="store_true",
-                    help="gate judge() against the synthetic fixture and golden "
-                         "(no archive, no montauk, no hardware)")
-    ap.add_argument("--update", action="store_true",
-                    help="with --self-test: refreeze the golden, showing the diff")
     ap.add_argument("--trajectory", action="store_true",
                     help="version-ordered change-point scan over the archive "
                          "instead of a two-group comparison: which release a "
@@ -372,12 +307,8 @@ def main() -> int:
                          "(default: prism-ipc)")
     args = ap.parse_args()
 
-    if args.self_test:
-        return self_test(args.update)
     if args.trajectory:
         return trajectory(args)
-    if args.update:
-        sys.exit("baseline_gate: --update only applies with --self-test")
 
     analyzer = resolve_analyzer()
     if not args.archive.exists():

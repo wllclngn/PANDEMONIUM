@@ -353,8 +353,8 @@ def main() -> int:
     ap.add_argument("--no-build", action="store_true",
                     help="skip the source-change rebuild check")
     ap.add_argument("--trace", action="store_true",
-                    help="Accepted for suite uniformity; prism-strand traces "
-                         "unconditionally (capture is the bench)")
+                    help="Required: prism-strand is a capture (the montauk "
+                         "recording is the bench) and refuses to run without it")
     ap.add_argument("--iterations", type=int, default=1,
                     help="Accepted for suite uniformity; strand samples over a "
                          "duration window, not trials")
@@ -368,6 +368,9 @@ def main() -> int:
                     help="Accepted for suite uniformity; strand samples kthread strands at native width")
     args = ap.parse_args()
 
+    if not args.trace:
+        log_error("prism-strand is a capture: run it with --trace")
+        return 2
     if os.geteuid() != 0:
         log_error("must run as root (montauk + scheduler need CAP_SYS_ADMIN) -- "
                   "re-run under sudo")
@@ -414,7 +417,7 @@ def main() -> int:
         log_info("co-located suite: running prism-coldwake (cold-core ramp)...")
         cw = subprocess.run(
             [sys.executable, str(Path(__file__).parent / "pandemonium-tests.py"),
-             "prism-coldwake"],
+             "prism-coldwake", "--trace"],
             cwd=Path(__file__).parent.parent)
         rc = max(rc, cw.returncode)
     return rc

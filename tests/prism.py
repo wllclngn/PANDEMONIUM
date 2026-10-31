@@ -2,7 +2,7 @@
 """prism: turn a scheduler problem into one shareable file.
 
 For when the system stutters or lags under load. It runs a short fixed profile
-(cachyos + fork-thread + ipc) under your scheduler and EEVDF as a neutral
+(fork-thread, ipc and the fault probes) under your scheduler and EEVDF as a neutral
 reference, traces each with montauk, and assembles the recordings into one
 KB-scale report: your system specs, the misbehaving items ranked BY NAME (hot
 CPUs, livelocking tasks, unsignaled waiters, idle strands), then the key
@@ -49,13 +49,6 @@ REPO_ROOT = TESTS_DIR.parent
 # v8.13.0 there is a fourth mode, `--static`, which reads SOURCE rather than a
 # capture; PRISM does not invoke it and does not need to. It is named here so
 # the arrangement this file assumes is the whole arrangement.
-#
-# v8.13.0 ALSO REMOVED --golden, AND PRISM'S USE OF IT WENT WITH IT. The
-# behavioral golden froze each report's categorical CLASS as a proxy for the
-# mechanism behind it, and that correlation did not hold: a class survives
-# changes that matter and flips on changes that do not. `--dev golden` is gone
-# from the bench list. tests/fixtures/baseline_gate.golden is unrelated and
-# stays -- it is a byte-exact output diff, which is a different instrument.
 MONTAUK_INSTALLED = Path(MONTAUK)
 # sublimation does every stream and numeric step in this file. The ephemeral
 # install used to place only the two binaries above, so a run that opted to
@@ -92,17 +85,9 @@ MONTAUK_BUILD_HINTS = {
     "nixos": "nix-shell -p cmake clang llvm libbpf bpftool gnumake",
 }
 
-# Frozen profile: short, native-core, traced. Kept stable so a report compares
-# against the archived prism baseline (and across users).
-PROFILE_ITERATIONS = 3
-# Light cachyos workloads ONLY -- the suite's ffmpeg/kernel-build workloads are
-# far too heavy for an end-user report. Cache-relevant and fast.
-PROFILE_CACHYOS_WORKLOADS = "stress-ng-cpu-cache-mem,xz-compression,primes"
-
 # Display labels for the profile phases -- proper-cased names + the "TRACE" verb,
-# so the section headers read uniformly (CachyOS Benchmark: TRACE, IPC: TRACE, ...).
+# so the section headers read uniformly (fork-thread: TRACE, IPC: TRACE, ...).
 _PROFILE_LABELS = {
-    "cachyos": "CachyOS Benchmark",
     "fork-thread": "fork-thread",
     "ipc": "IPC",
     "burst-starvation": "burst-starvation",
@@ -400,12 +385,14 @@ def _sched_flags(bench: str, schedulers: str, all_scx: bool) -> list[str]:
     bench now fields. --schedulers L runs EEVDF vs EXACTLY L (PANDEMONIUM only if
     named); --all-scx runs the full installed field; neither runs EEVDF +
     PANDEMONIUM. Each bench gets only the flag form it parses:
-      cachyos / fork-thread / burst-starvation / sojourn-pressure : --all-scx | --schedulers
-      ipc (-> prism-scale)                                        : --schedulers"""
-    takes_all = bench in ("cachyos", "fork-thread", "burst-starvation",
-                          "sojourn-pressure", "cold-wake", "power", "frame")
-    takes_list = bench in ("cachyos", "fork-thread", "ipc", "scale", "burst-starvation",
-                           "sojourn-pressure", "cold-wake", "power", "frame")
+      fork-thread / burst-starvation / sojourn-pressure : --all-scx | --schedulers
+      ipc (-> prism-scale)                              : --schedulers"""
+    takes_all = bench in ("fork-thread", "burst-starvation",
+                          "sojourn-pressure", "cold-wake", "power", "frame",
+                          "gauntlet")
+    takes_list = bench in ("fork-thread", "ipc", "scale", "burst-starvation",
+                           "sojourn-pressure", "cold-wake", "power", "frame",
+                           "probe", "gauntlet")
     if all_scx and takes_all:
         return ["--all-scx"]
     if schedulers and takes_list:
@@ -438,11 +425,12 @@ def _stop_running_scheduler() -> None:
 
 
 def run_profile(schedulers: str, all_scx: bool, ultra: bool = False,
-                pandemonium_only: bool = False) -> list[Path]:
-    """Run the frozen profile, traced. Returns fresh recording dirs. With no flag
-    the field is EEVDF + PANDEMONIUM; --all-scx adds every installed scx (keeps
-    PANDEMONIUM); --schedulers L compares EEVDF vs exactly the named schedulers
-    (NO PANDEMONIUM) across every bench -- fork-thread and ipc now field too.
+                pandemonium_only: bool = False, iterations: int = 1) -> list[Path]:
+    """Run the profile, traced (the report implies its capture), every arm
+    `iterations` times inside each bench. Returns fresh recording dirs. With no
+    flag the field is EEVDF + PANDEMONIUM; --all-scx adds every installed scx
+    (keeps PANDEMONIUM); --schedulers L compares EEVDF vs exactly the named
+    schedulers (PANDEMONIUM only if named) across every bench.
 
     The two width-specific faults are pinned to native core width by default. With
     ultra=True they sweep EVERY width (2,4,8,...,max) -- more coverage, but one
@@ -463,12 +451,8 @@ def run_profile(schedulers: str, all_scx: bool, ultra: bool = False,
     # drops the pin so they fall to the suite's full compute_core_counts() sweep.
     width_flags = [] if ultra else ["--cores", str(ncpus)]
     benches = [
-        ("cachyos", [py, str(TESTS_DIR / "prism-cachyos.py"),
-                     "--trace", "--iterations", "1",
-                     "--workloads", PROFILE_CACHYOS_WORKLOADS]),
         ("fork-thread", [py, str(TESTS_DIR / "prism-fork-thread.py"),
-                         "--quick",
-                         "--iterations", str(PROFILE_ITERATIONS)]),
+                         "--quick", "--trace"]),
         ("ipc", [py, str(TESTS_DIR / "prism-ipc.py"),
                  "--trace", "--cores", str(ncpus)]),
         # The two width-specific faults: burst-starvation (prism-pcpu's per-CPU
@@ -493,7 +477,7 @@ def run_profile(schedulers: str, all_scx: bool, ultra: bool = False,
         # IDLE-churn from the scheduler tick log -- the failure mode the other
         # benches (warm, controlled) never trigger. BPF arm only.
         ("storm", [py, str(TESTS_DIR / "pandemonium-tests.py"),
-                   "prism-coldwake", "--storm", "--duration", "30"]),
+                   "prism-coldwake", "--storm", "--trace", "--duration", "30"]),
     ]
     for name, cmd in benches:
         # Stop any registered scheduler before EVERY bench, not just once: some
@@ -507,7 +491,8 @@ def run_profile(schedulers: str, all_scx: bool, ultra: bool = False,
         child_env = {**os.environ, "PANDEMONIUM_CHILD": "1"}
         sflags = (["--pandemonium-only"] if pandemonium_only
                   else _sched_flags(name, schedulers, all_scx))
-        r = subprocess.run(cmd + sflags, cwd=TESTS_DIR, env=child_env)
+        r = subprocess.run(cmd + ["--iterations", str(iterations)] + sflags,
+                           cwd=TESTS_DIR, env=child_env)
         if r.returncode != 0:
             log_warn(f"[{name}] exited {r.returncode} -- continuing")
     # Recordings created this run (montauk --trace writes dirs under TRACE_DIR).
@@ -830,13 +815,10 @@ def _render_key_metrics(env: dict) -> str:
     return "\n".join(["KEY METRICS"] + out) if out else ""
 
 
-def _render_body(env: dict, is_cachyos: bool = False) -> str:
-    """The per-workload body: thermal (dropped for cachyos -- workload heat is not
-    the runtime's), ranked offenders, then KEY METRICS."""
-    blocks = []
-    if not is_cachyos:
-        blocks.append(_render_thermal(env))
-    blocks += [_render_offenders(env), _render_capture(env), _render_key_metrics(env)]
+def _render_body(env: dict) -> str:
+    """The per-workload body: thermal, ranked offenders, then KEY METRICS."""
+    blocks = [_render_thermal(env), _render_offenders(env), _render_capture(env),
+              _render_key_metrics(env)]
     return "\n\n".join(b for b in blocks if b)
 
 
@@ -851,9 +833,9 @@ def _envelope_p99(env: dict) -> int | None:
 # Profile families and schedulers, longest-match-first so PANDEMONIUM-BPF is not
 # shadowed by PANDEMONIUM. Used to parse a clean recording label into (family,
 # scheduler) for the comparison summary.
-_FAMILIES = ["fork-thread", "sojourn-pressure", "pcpu-burst", "cachyos", "ipc"]
+_FAMILIES = ["fork-thread", "sojourn-pressure", "pcpu-burst", "ipc"]
 _SCHEDS = ["PANDEMONIUM-ADAPTIVE", "PANDEMONIUM-BPF", "PANDEMONIUM", "EEVDF"]
-# Order traced families appear in the comparison (cachyos has no trace -> absent).
+# Order traced families appear in the comparison.
 _COMPARE_ORDER = ["fork-thread", "ipc", "pcpu-burst", "sojourn-pressure"]
 
 
@@ -868,14 +850,12 @@ def _workload_cell(label: str, sched: str | None) -> str:
     """The label with the scheduler token removed: the WORKLOAD, which is what a
     scheduler comparison must hold fixed.
 
-    The family alone is too coarse to compare on. The cachyos stage runs several
-    distinct workloads (primes, xz, stress-ng) under one family name, so keying
-    the population by family pooled three different measurements into one group
-    and reported N=3 -- three unlike workloads dressed as three repeats of the
-    same one. The variance in that group is workload spread, not run-to-run
-    noise, and reading power off it would be reading it off the wrong thing.
-    Keyed per workload, each cell is N=1 until the run is actually repeated,
-    which is the truth."""
+    The family alone is too coarse to compare on. A family that runs several
+    distinct workloads under one name, keyed by family, pools unlike
+    measurements into one group and reports their count as repeats of one. The
+    variance in that group is workload spread, not run-to-run noise, and reading
+    power off it would be reading it off the wrong thing. Keyed per workload,
+    each cell is N=1 until the run is actually repeated, which is the truth."""
     cell = label
     if sched:
         cell = cell.replace(f"-{sched}-", "-").replace(f"-{sched}", "")
@@ -1048,8 +1028,8 @@ def _build_comparison(
 ) -> str:
     """Turn the per-recording (family, scheduler, p99, completeness) tuples into
     the headline the report exists to give: EEVDF vs PANDEMONIUM p99, with the
-    ratio. Only traced families (those with a p99) appear; cachyos has no trace,
-    so it is absent here. lower p99 is better, so ratio = EEVDF / PANDEMONIUM.
+    ratio. Only traced families (those with a p99) appear. lower p99 is better,
+    so ratio = EEVDF / PANDEMONIUM.
 
     EVERY traced family with a baseline is reported, wins and losses alike.
     _COMPARE_ORDER fixes the ORDER of the ones it names and nothing more -- as a
@@ -1222,7 +1202,7 @@ def build_report(recs: list[Path], tag: str, stamp: str,
         meta.append((fam, sched, p99,
                      (env.get("digest") or {}).get("capture_completeness")))
         pop.append((_workload_cell(label, sched), sched, p99))
-        cbody = _render_body(env, is_cachyos=(fam == "cachyos"))
+        cbody = _render_body(env)
         ramp = _coldwork_ramp(d)   # cold-wake recordings carry coldwork-quanta.txt
         if ramp:
             cbody = (cbody + "\n" + ramp) if cbody.strip() else ramp
@@ -1272,12 +1252,13 @@ def main() -> int:
                     "report). --dev <name> runs one sustained validation; "
                     "--dev all the full sweep; --list shows the workloads.")
     ap.add_argument("--schedulers", default="", metavar="LIST",
-                    help="comma-separated scx schedulers to add to the cachyos "
-                         "suite, e.g. scx_rusty,scx_lavd (EEVDF + PANDEMONIUM are "
-                         "always in the field). Default: none")
+                    help="comma-separated scx schedulers to run against EEVDF in "
+                         "every bench that fields them, e.g. scx_lavd. A named list "
+                         "is the whole field: PANDEMONIUM runs only if named. "
+                         "Default: EEVDF + PANDEMONIUM")
     ap.add_argument("--all-scx", action="store_true",
-                    help="add the full installed scx field to the cachyos suite "
-                         "instead of a named list. Cannot be combined with "
+                    help="run the full installed scx field against EEVDF, "
+                         "PANDEMONIUM included. Cannot be combined with "
                          "--schedulers")
     ap.add_argument("--workload", metavar="CMD",
                     help="trace YOUR isolated workload: run CMD under the live "
@@ -1289,8 +1270,10 @@ def main() -> int:
                     help="cap a --workload run / set --attach window (seconds); "
                          "default: run until the workload exits")
     ap.add_argument("--iterations", type=int, default=1, metavar="N",
-                    help="run the profile N times (one report per run), to see "
-                         "past per-run noise (default: 1)")
+                    help="run every arm N times, with one report over all N: the "
+                         "profile, every --dev workload and a --workload/--attach "
+                         "capture alike. Workloads that sample over time take it "
+                         "as a no-op (default: 1)")
     ap.add_argument("--cores", metavar="LIST", default=None,
                     help="comma-separated core widths for a --dev child that "
                          "sweeps width (scale, contention, pcpu, scx), e.g. "
@@ -1304,45 +1287,18 @@ def main() -> int:
                          "many files, sizes from KB to hundreds of MB")
     ap.add_argument("--dev", nargs="*", default=None, metavar="WORKLOAD",
                     help="run ONE OR MORE sustained dev validations by name (fork-thread, "
-                         "strand, storm, pcpu, contention, scale, ipc, power, cachyos, "
-                         "scx), or 'all' for the full sweep. Bare --dev lists them. "
+                         "strand, storm, pcpu, contention, scale, ipc, power, frame, "
+                         "probe, gauntlet, scx), or 'all' for the full sweep. Bare --dev lists them. "
                          "A CHILD'S OWN FLAGS TRAVEL AFTER `--`: "
-                         "`--dev cachyos -- --workloads primes` selects inside that "
-                         "child's suite, where a bare --workload would bind to prism's.")
+                         "`--dev fork-thread -- --modes thread` reaches that child, "
+                         "where flags before `--` are prism's.")
     ap.add_argument("--list", action="store_true",
                     help="list the PRISM workloads (default + dev tiers) and exit")
-    ap.add_argument("--kick-mode", choices=("off", "resched", "full"),
-                    default="off", metavar="CADENCE",
-                    help="montauk kick-probe cadence for every capture this run "
-                         "takes. off (default) attaches none and keeps the trace "
-                         "at its base rate; resched arms resched_curr alone, the "
-                         "cheap half that still says whether a kick was answered; "
-                         "full arms the kfunc set too and populates StormReport "
-                         "and kick-latency, at roughly 3x the events")
-    ap.add_argument("--scx-dsq", action="store_true",
-                    help="arm montauk's scx_bpf_dsq_insert{,_vtime} probes for every "
-                         "capture this run takes, so each enqueue records the DSQ it "
-                         "went to. Fires on EVERY enqueue: a saturated arm overruns "
-                         "the ring and the loss is biased toward the fastest arm, so "
-                         "read it for where tasks went, never to compare arms")
     ap.add_argument("--trace", action="store_true",
-                    help="force a montauk capture for --dev workloads (trace-capable "
-                         "ones capture anyway; this also forces the longrun/mixed probe "
-                         "capture in scale)")
-    ap.add_argument("--scx-storm", action="store_true",
-                    help="arm montauk's scx storm probes for the capture "
-                         "(fentry/scx_bpf_kick_cpu, fexit/"
-                         "scx_bpf_reenqueue_local, fentry/resched_curr). Without "
-                         "them kick-latency reads NONE and an issued kick cannot "
-                         "be paired against the resched that should answer it. "
-                         "HAZARD: sched-ext/scx#3687 Bug 1 faults on the two "
-                         "KFUNC probes under a live scx load; filed against "
-                         "7.1.2, and this is the 7.2+ arm that note gated on. "
-                         "Implies --trace.")
-    ap.add_argument("--cascade-sweep", action="store_true",
-                    help="fork-thread only: run the migration-cascade forcing "
-                         "term ON and OFF as two arms of ONE run, against a "
-                         "shared EEVDF baseline.")
+                    help="record montauk captures. Nothing else traces: a --dev "
+                         "workload runs uncaptured without it, and the capture-only "
+                         "workloads (strand, storm) refuse to run. The end-user "
+                         "report implies its own capture")
     ap.add_argument("--pandemonium-only", action="store_true",
                     help="skip the EEVDF baseline (and any external schedulers) -- run "
                          "only the PANDEMONIUM arms. Propagates to the default profile "
@@ -1360,14 +1316,6 @@ def main() -> int:
         argv, passthrough = argv[:cut], argv[cut + 1:]
     args = ap.parse_args(argv)
     args.passthrough = passthrough
-
-    # CARRIED BY ENV SO EVERY BENCH INHERITS IT, including one invoked directly
-    # rather than through this dispatcher. The launcher in pandemonium_common
-    # reads it when it builds montauk's child environment, and scrubs the probe
-    # vars it does not select -- so an ambient export cannot quietly raise the
-    # cadence behind a run's back.
-    os.environ["PANDEMONIUM_KICK_MODE"] = args.kick_mode
-    os.environ["PANDEMONIUM_SCX_DSQ"] = "1" if args.scx_dsq else "0"
 
     # --schedulers and --all-scx are two ways to pick the SAME thing (the
     # external field); running both is ambiguous. Warn with a usage hint rather
@@ -1391,8 +1339,9 @@ def main() -> int:
         "scale":       [_pt, "prism-scale"],
         "ipc":         [str(TESTS_DIR / "prism-ipc.py")],
         "power":       [str(TESTS_DIR / "prism-power.py")],
-        "cachyos":     [str(TESTS_DIR / "prism-cachyos.py")],
         "frame":       [str(TESTS_DIR / "prism-frame.py")],
+        "probe":       [str(TESTS_DIR / "prism-probe.py")],
+        "gauntlet":    [str(TESTS_DIR / "prism-gauntlet.py")],
         "scx":         [_pt, "prism-scx"],
     }
     # THE UNIFIED --dev CONTRACT (v5.17.0): every implementer accepts the
@@ -1401,11 +1350,8 @@ def main() -> int:
     # no-op where it does not (each child's own --help states which). The
     # dispatcher therefore passes the flags through UNCONDITIONALLY; the
     # membership tables that used to gate them (and whose gaps killed pcpu and
-    # locality mid-list) are gone. Two sets remain because they encode real
-    # SEMANTIC differences, not argument-surface differences:
-    # Children that need root REGARDLESS of --trace: the unconditional tracers
-    # (capture is what they are, and montauk's eBPF attach needs it).
-    PRISM_DEV_ROOT = {"strand"}
+    # locality mid-list) are gone. One set remains because it encodes a real
+    # SEMANTIC difference, not an argument-surface difference:
     # PROBE children measure whatever scheduler is LIVE -- they load nothing
     # themselves. The pre-flight _stop_running_scheduler before every child
     # guaranteed a probe always measured EEVDF/none (its target stopped moments
@@ -1425,31 +1371,25 @@ def main() -> int:
         if unknown:
             log_error(f"unknown --dev workload: {', '.join(unknown)} (try --list)")
             return 2
-        # NAME COLLISION, CAUGHT RATHER THAN SWALLOWED. prism's own --workload
-        # takes a COMMAND to trace in place of the fixed profile; several
-        # children take --workloads (plural) to SELECT from their own suite.
-        # Passed together the parent won, the child never saw it, and the run
-        # went through the full suite with no error -- the flag looked accepted
-        # and did nothing. Child-private flags travel after `--`.
+        # CAUGHT RATHER THAN SWALLOWED. prism's own --workload and --attach trace
+        # a command in place of the fixed profile and never reach a --dev child,
+        # so passed with --dev they would look accepted and do nothing.
+        # Child-private flags travel after `--`.
         if args.workload or args.attach:
             flag = "--workload" if args.workload else "--attach"
             log_error(f"{flag} is prism's own (trace a command you name) and "
                       f"does not reach a --dev child.")
-            log_error(f"  to select inside a child's suite, pass it after `--`:")
-            log_error(f"    ./pandemonium.py prism --dev {names[0]} "
-                      f"-- --workloads NAME")
-            log_error(f"  the child's own names: ./tests/prism-{names[0]}.py --help")
+            log_error(f"  a child's own flags travel after `--`:")
+            log_error(f"    ./pandemonium.py prism --dev {names[0]} -- <its flags>")
+            log_error(f"  the child's own flags: ./tests/prism-{names[0]}.py --help")
             return 2
-        # SELF-ELEVATE when the run will capture: --trace explicitly passed, OR any
-        # selected workload is an unconditional tracer (PRISM_DEV_ROOT). The montauk
-        # capture needs root (eBPF attach + a writable /tmp/pandemonium), so re-exec
-        # under sudo rather than make the user type it -- ONE standard across every
-        # --dev name, no child left to error out with its own "re-run under sudo".
-        # A captureless --dev run stays pre-elevation, no re-exec.
-        if args.scx_storm:
-            args.trace = True
-        if os.geteuid() != 0 and (args.trace
-                                  or any(n in PRISM_DEV_ROOT for n in names)):
+        # SELF-ELEVATE when the run will capture, which is --trace and nothing
+        # else. The montauk capture needs root (eBPF attach + a writable
+        # /tmp/pandemonium), so re-exec under sudo rather than make the user type
+        # it -- ONE standard across every --dev name, no child left to error out
+        # with its own "re-run under sudo". A captureless --dev run stays
+        # pre-elevation, no re-exec.
+        if os.geteuid() != 0 and args.trace:
             os.execvp("sudo", ["sudo", sys.executable, *sys.argv])
         # Canonical exit guard for the --dev path (the profile path ejects in main's
         # except/finally). On Ctrl+C: eject the benched scheduler and re-online every
@@ -1484,20 +1424,15 @@ def main() -> int:
             # Unified contract: pass the standard flags straight through. Every
             # implementer accepts them (real or documented no-op); no dispatcher
             # membership table to fall out of date.
-            if args.cascade_sweep and n == "fork-thread":
-                dev_cmd.append("--cascade-sweep")
             if args.pandemonium_only:
                 dev_cmd.append("--pandemonium-only")
             elif args.schedulers or args.all_scx:
                 dev_cmd += _sched_flags(n, args.schedulers, args.all_scx)
-            if args.iterations > 1:
-                dev_cmd += ["--iterations", str(args.iterations)]
+            dev_cmd += ["--iterations", str(max(1, args.iterations))]
             if args.cores:
                 dev_cmd += ["--cores", args.cores]
             if args.trace:
                 dev_cmd.append("--trace")
-            if args.scx_storm:
-                dev_cmd.append("--scx-storm")
             # Child-private flags last, so a child mode can override a uniform
             # default it also accepts.
             dev_cmd += args.passthrough
@@ -1551,53 +1486,46 @@ def main() -> int:
     if cleanroom["verdict"] == "NOISY":
         log_warn(f"CLEAN-ROOM: NOISY ({cleanroom['detail']}). Single-run tails "
                  "are background-contaminated; a reboot gives trustworthy numbers.")
-    reports: list[Path] = []
     report_built = False
     try:
-        for it in range(iters):
-            if iters > 1:
-                print()
-                log_info(f"iteration {it + 1}/{iters}")
-            # Per-iteration stamp; the index suffix keeps reports distinct even
-            # for sub-second --workload runs in the same wall-clock second.
-            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-            if iters > 1:
-                stamp += f"-{it + 1}"
-            dmesg = DmesgMonitor()
-            if trace_mode:
-                rec = run_workload_trace(args.workload, args.attach,
-                                         args.duration, stamp)
-                dmesg.check()
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        dmesg = DmesgMonitor()
+        if trace_mode:
+            # --iterations N: N captures of the workload, one report over all N.
+            # The index suffix keeps the recordings distinct even for sub-second
+            # runs in the same wall-clock second.
+            recs = []
+            for it in range(iters):
+                if iters > 1:
+                    print()
+                    log_info(f"run {it + 1}/{iters}")
+                rec = run_workload_trace(args.workload, args.attach, args.duration,
+                                         f"{stamp}-{it + 1}" if iters > 1 else stamp)
                 if not rec or not rec.is_dir():
                     log_error("no report: the workload was not traced")
                     return 1
-                print()
-                report = build_report([rec], tag, stamp, dmesg, cleanroom)
-            else:
-                recs = run_profile(args.schedulers, args.all_scx, args.ultra,
-                                   args.pandemonium_only)
-                dmesg.check()
-                if not recs:
-                    # No-load fallback: the scheduler never produced a recording
-                    # (it may have failed to activate). Still hand back something
-                    # actionable.
-                    log_warn("no recordings produced -- scheduler may have failed "
-                             "to activate; saving a dmesg-only report")
-                    dmesg.save(stamp)
-                    log_error("no report: nothing was traced (see dmesg above)")
-                    return 1
-                print()
-                report = build_report(recs, tag, stamp, dmesg, cleanroom)
-            # Absorb the digest into the file -- the terminal stays the progress
-            # log; the full consolidated report is the artifact the user opens and
-            # shares. No verbatim dump of the report to the terminal.
-            log_info(f"REPORT: {report}")
-            reports.append(report)
-        if len(reports) == 1:
-            log_info("Share this file -- it is small, redacted, and self-contained.")
+                recs.append(rec)
+            dmesg.check()
         else:
-            log_info(f"{len(reports)} reports written -- each small, redacted, and "
-                     "self-contained.")
+            recs = run_profile(args.schedulers, args.all_scx, args.ultra,
+                               args.pandemonium_only, iters)
+            dmesg.check()
+            if not recs:
+                # No-load fallback: the scheduler never produced a recording
+                # (it may have failed to activate). Still hand back something
+                # actionable.
+                log_warn("no recordings produced -- scheduler may have failed "
+                         "to activate; saving a dmesg-only report")
+                dmesg.save(stamp)
+                log_error("no report: nothing was traced (see dmesg above)")
+                return 1
+        print()
+        report = build_report(recs, tag, stamp, dmesg, cleanroom)
+        # Absorb the digest into the file -- the terminal stays the progress
+        # log; the full consolidated report is the artifact the user opens and
+        # shares. No verbatim dump of the report to the terminal.
+        log_info(f"REPORT: {report}")
+        log_info("Share this file -- it is small, redacted, and self-contained.")
         report_built = True
     except KeyboardInterrupt:
         # Respect Ctrl+C: the profile activates its own schedulers, so eject
@@ -2011,12 +1939,10 @@ def analyze_event(t: Tools, event: Event, window: str) -> None:
     if traces and t.montauk:
         newest = max(traces, key=os.path.getmtime)
         info(f"montauk artifact found: {newest} -- analyzing")
-        rc, out = run([*montauk_analyze_argv(t.montauk), newest,
-                       "--report", "kstrand,dispatch-stall,endstate"], timeout=45)
-        if rc == 0:
-            for ln in out.splitlines():
-                if ln.startswith("REPORT") or "VERDICT" in ln or "strand" in ln.lower():
-                    info(f"  {ln.strip()[:150]}")
+        env = montauk_envelope(newest, report="kstrand,dispatch-stall,endstate")
+        for r in (env or {}).get("reports", []):
+            klass, verdict = envelope_verdict(r)
+            info(f"  {r.get('name')} [{klass}] {(verdict or '')[:150]}")
 
     klass, guidance = classify(window)
     section("VERDICT")

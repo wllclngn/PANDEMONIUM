@@ -14,6 +14,7 @@ __pycache__/
 
 # Repo artifacts
 COMMIT_MESSAGE.txt
+ROADMAP.md
 
 # Benchmark archive (local only, dated subfolders)
 benchmark-results/
@@ -26,3 +27,10 @@ tests/pandemonium-7_1-bug/
 # notes, some referencing confidential sibling research. Local only, graduates
 # into tests/ and the tree once proven. Never shipped.
 tests/research/
+
+# Release banner generator and its renders. Local only.
+banner/
+
+# New User Guide materials: the Markdown source, generator, class and fonts.
+# The tree carries the PDF alone, in the root, at the path the README links.
+guide/

@@ -319,7 +319,7 @@ def population(proms: list[Path]) -> str:
     return "\n\n".join(t for t in text if t)
 
 
-def run_trace(fb, ipu, entries, scen, stamp, scx_storm=False) -> int:
+def run_trace(fb, ipu, entries, scen, stamp) -> int:
     if not montauk_available():
         log_error("montauk not found -- cannot --trace")
         return 1
@@ -337,10 +337,12 @@ def run_trace(fb, ipu, entries, scen, stamp, scx_storm=False) -> int:
             try:
                 for name, sargs in scen.items():
                     log_info(f"  [{sched_name}] tracing {name} (montauk on cpu{drain})")
+                    # scx_dsq: every insert and drain, so each thread's wait can
+                    # be tied to the queue it was placed on and the kick it got.
                     with montauk_trace("framebench", f"frame-{safe}-{name}", stamp,
                                        events=True, pin_cpu=drain,
-                                       sched_detail=True,
-                                       scx_storm=scx_storm) as rec:
+                                       sched_detail=True, scx_dsq=True,
+                                       scx_storm=True) as rec:
                         m = run_once(fb, ipu, sargs, TRACE_DURATION_S, 1.0,
                                      outdir, f"{safe}-{name}")
                     recs += 1
@@ -382,9 +384,6 @@ def main() -> int:
     ap.add_argument("--trace", action="store_true",
                     help="diagnostic pass: one montauk capture per (scheduler, "
                          "scenario); timings are traced and not comparable")
-    ap.add_argument("--scx-storm", action="store_true",
-                    help="with --trace: arm montauk's sched_ext kick probes, so the "
-                         "kick-latency and storm reports have data")
     ap.add_argument("--cores", type=str, default=None,
                     help="accepted for suite uniformity; runs at native width")
     args = ap.parse_args()
@@ -453,7 +452,7 @@ def main() -> int:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     if args.trace:
-        return run_trace(fb, ipu, entries, scen, stamp, args.scx_storm)
+        return run_trace(fb, ipu, entries, scen, stamp)
 
     rawdir = LOG_DIR / f"prism-frame-{stamp}"
     results: dict[str, dict[str, list[dict]]] = {n: {s: [] for s in scen} for n, _ in entries}

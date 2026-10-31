@@ -134,6 +134,14 @@ def _messaging_cmd(groups, threaded, loops):
     return cmd
 
 
+def arm_ejected(guard, expected_ops: str) -> bool:
+    """The arm's scheduler is gone: its process exited, or the kernel no longer
+    runs the ops it registered at activation. EEVDF has no guard."""
+    if guard is None:
+        return False
+    return guard.proc.poll() is not None or scx_scheduler_name() != expected_ops
+
+
 def run_perf_bench(groups=NUM_GROUPS, threaded=True, loops=None):
     """Run perf stat wrapping perf bench. Returns (elapsed_s, counters) or (None, None)."""
     nloops = loops if loops is not None else NR_LOOPS
@@ -249,7 +257,7 @@ def write_prometheus(version, git, stamp, ncpus, cells_data, loops,
                      help="placement-side cross-domain landings as % of dispatches",
                      labels={"scheduler": _sn})
 
-    for _sn, (_st, _sp, _di, _fh, _mt, _kd) in (steal_by_sched or {}).items():
+    for _sn, (_st, _sp, _di, _kd) in (steal_by_sched or {}).items():
         pb.gauge("steal_total", _st, help="successful STEP 1 peer steals",
                  labels={"scheduler": _sn})
         pb.gauge("spill_total", _sp, help="sibling spills (placement side)",
@@ -263,25 +271,12 @@ def write_prometheus(version, git, stamp, ncpus, cells_data, loops,
             pb.gauge("spill_share_pct", f"{100.0 * _sp / _di:.4f}",
                      help="spills as a percent of dispatches",
                      labels={"scheduler": _sn})
-        # THE COST'S HIT RATE, WHICH A BARE COUNT CANNOT GIVE. Held and taken
-        # together are every anchor->target decision the wake path made, so the
-        # denominator is the cost's own population rather than dispatches.
-        pb.gauge("stay_cost_held_total", _fh,
-                 help="anchor->target moves the base cost refused",
-                 labels={"scheduler": _sn})
-        pb.gauge("stay_move_taken_total", _mt,
-                 help="anchor->target moves the base cost admitted",
-                 labels={"scheduler": _sn})
         # THE BOTTOM RUNG'S OWN NUMBER. This is the bench where the dispatch count
         # lives, so a refusal that cannot be read here cannot be scored against the
         # quantity it exists to reduce.
         pb.gauge("kick_declined_total", _kd,
                  help="requeue kicks the price refused outright",
                  labels={"scheduler": _sn})
-        if _fh + _mt > 0:
-            pb.gauge("stay_cost_held_pct", f"{100.0 * _fh / (_fh + _mt):.4f}",
-                     help="share of priced anchor->target edges held home",
-                     labels={"scheduler": _sn})
 
     # One cell = one workload shape (mode x groups). Every series carries mode and
     # groups labels, so the archive holds the whole sweep -- a population run can
@@ -600,10 +595,13 @@ def _cell_block(report, cell, loops, all_results, all_spreads, trace_results):
 
 
 def write_report(version, git, stamp, ncpus, cells_data, loops,
-                 steal_by_sched=None):
+                 steal_by_sched=None, ejected_by_sched=None):
     report = []
     report.append(f"prism-fork-thread v{version} [{git['commit']}]")
     report.append(f"cpus: {ncpus}  cells: {len(cells_data)}  loops: {loops}")
+    for sched, cell in (ejected_by_sched or {}).items():
+        report.append(f"EJECTED: {sched} during {cell}; that cell and every later "
+                      "one are withheld")
     if any(td[3] for td in cells_data):
         report.append(f"burst: -l {BURST_LOOPS} traced under montauk "
                       "(wake2run latency + placement locality)")
@@ -626,15 +624,12 @@ def write_report(version, git, stamp, ncpus, cells_data, loops,
         report.append("MIGRATION ORIGIN  (cumulative per arm)")
         report.append(table_header("SCHEDULER", ["STEALS", "SPILLS",
                                                  "DISPATCHES", "STEAL %",
-                                                 "SPILL %", "COST HELD",
-                                                 "HELD %", "KICKS DECLINED"]))
-        for sn, (st, sp, di, fh, mt, kd) in steal_by_sched.items():
+                                                 "SPILL %", "KICKS DECLINED"]))
+        for sn, (st, sp, di, kd) in steal_by_sched.items():
             report.append(table_row(sn, [
                 f"{st}", f"{sp}", f"{di}",
                 f"{100.0 * st / di:.3f}%" if di else "-",
                 f"{100.0 * sp / di:.3f}%" if di else "-",
-                f"{fh}",
-                f"{100.0 * fh / (fh + mt):.1f}%" if (fh + mt) else "-",
                 f"{kd}"]))
         report.append("  STEALS are the drain side, STEP 1's peer "
                       "move_to_local -- the only migration path charging a base "
@@ -644,13 +639,6 @@ def write_report(version, git, stamp, ncpus, cells_data, loops,
                       "same-domain moves, which the cross_domain_* paths cannot: "
                       "those see CROSS-domain landings only and most moves stay "
                       "inside L2/L3.")
-        report.append("  COST HELD is the wake path's own priced edge: "
-                      "anchor -> target refused because the wait on the warm "
-                      "anchor came in under the base cost plus the R_eff "
-                      "distance. HELD % is against every anchor -> target "
-                      "decision, not against dispatches, so a low count with a "
-                      "high share means the path is rare and a low share means "
-                      "the cost is not binding.")
         report.append("")
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -726,10 +714,13 @@ def trace_capture(sched_name, cmd, stamp, duration,
     # floored wake into DARK (the CPU sat idle while the task waited elsewhere)
     # vs HELD (genuinely busy) -- which is the one reading that separates a
     # placement defect from real saturation. No prism bench passed it before.
+    # scx_dsq arms montauk's DSQ insert and drain probes, so every migration's
+    # pull can be traced to the queue it was drained from: The CPU's own, a
+    # peer's through the steal, or a domain overflow.
     rec_dir, elapsed = trace_workload(sched_name, cmd, TRACE_PATTERN, "fork-thread",
                                       stamp, body, baseline_s=BASELINE_SECONDS,
                                       events=True, pin_cpu=drain, sched_detail=True,
-                                      trace_classes=BURST_CLASSES)
+                                      scx_dsq=True, trace_classes=BURST_CLASSES)
     if rec_dir is not None:
         log_info(f"[{sched_name}] recording: {rec_dir}")
     # elapsed is None when the safety net fired. The caller DISCARDS the arm on
@@ -1036,9 +1027,9 @@ def main():
                          f"e.g. '2,8,24'. Default '{DEFAULT_GROUPS}'. modes x groups "
                          "is the cell grid; every cell is read on all three axes.")
     ap.add_argument("--trace", action="store_true",
-                    help="Accepted and ignored: PHASE 1 already records a montauk "
-                         "trace on every run. Kept because prism's unified --dev "
-                         "contract passes it to every child.")
+                    help="Run PHASE 1, the montauk-traced burst (wake2run, "
+                         "placement locality, floored wakes). Without it the run "
+                         "is the cost phase alone.")
     ap.add_argument("--iterations", type=int, default=1,
                     help="Run each scheduler N times. The MEDIAN is the headline "
                          "(robust to a poisoned outlier run); the per-iteration "
@@ -1058,14 +1049,6 @@ def main():
     ap.add_argument("--pandemonium-only", action="store_true",
                     help="Run only PANDEMONIUM entries -- drop EEVDF and any "
                          "external scx schedulers from the field.")
-    ap.add_argument("--cascade-sweep", action="store_true",
-                    help="Cascade A/B: instead of the full scx field, run "
-                         "PANDEMONIUM (BPF mode) with the migration-cascade "
-                         "forcing term ON and OFF, plus EEVDF. BOTH ARMS IN "
-                         "ONE RUN against one baseline -- the force is a "
-                         "few-percent effect and this bench's run-to-run "
-                         "spread at n=1 is larger than that, so the halves "
-                         "have to share a box state to be comparable at all.")
     ap.add_argument("--cores", type=str, default=None,
                     help="Accepted for suite uniformity; the storm runs at native width (the fork rate IS the axis)")
     args = ap.parse_args()
@@ -1076,16 +1059,13 @@ def main():
     NR_LOOPS = NR_LOOPS_QUICK if args.quick else NR_LOOPS_FULL
 
     # PHASE 1 gate: the traced burst (wake2run latency + placement locality) runs
-    # by default, but not for --cascade-sweep (a focused cost A/B), not under --no-burst,
-    # and not without montauk. It needs root end-to-end (montauk eBPF attach +
+    # by default, but not under --no-burst, and not without montauk. It needs root end-to-end (montauk eBPF attach +
     # sched_ext load), so self-elevate once up front -- matches --trace and the
     # RUN-BARE convention (the bench acquires its own root; the user never sudo's).
-    run_burst = (not args.no_burst and not args.cascade_sweep
-                 and montauk_available())
+    run_burst = args.trace and not args.no_burst and montauk_available()
     if run_burst and os.geteuid() != 0:
         os.execvp("sudo", ["sudo", sys.executable, *sys.argv])
-    if (not args.no_burst and not args.cascade_sweep
-            and not montauk_available()):
+    if args.trace and not args.no_burst and not montauk_available():
         log_warn("montauk not found -- skipping phase 1 (traced burst); running "
                  "cost-only. Install montauk for the wake2run + locality axes.")
 
@@ -1115,56 +1095,41 @@ def main():
             return 1
     time.sleep(1)
 
-    if args.cascade_sweep:
-        # CASCADE A/B: hold everything constant, vary only the oscillator's
-        # second forcing term via the scheduler's --no-cascade override. BPF
-        # mode, matching the established BPF anchor -- no
-        # adaptive loop to perturb the one knob under test. The estimator runs
-        # in BOTH arms and reports fano_q8 either way; only the force is off.
-        entries = [
-            ("EEVDF", None),
-            ("PANDEMONIUM (cascade=on)", [str(BINARY), "--verbose", "--no-adaptive"]),
-            ("PANDEMONIUM (cascade=off)",
-             [str(BINARY), "--verbose", "--no-adaptive", "--no-cascade"]),
-        ]
-        log_info("CASCADE SWEEP: forcing term on vs off (BPF mode)")
-        cells = [Cell(f"thread/g{NUM_GROUPS}", True, NUM_GROUPS)]
-    else:
-        entries = [
-            ("EEVDF", None),
-            ("PANDEMONIUM (BPF)", [str(BINARY), "--verbose", "--no-adaptive"]),
-            ("PANDEMONIUM (ADAPTIVE)", [str(BINARY)]),
-        ]
+    entries = [
+        ("EEVDF", None),
+        ("PANDEMONIUM (BPF)", [str(BINARY), "--verbose", "--no-adaptive"]),
+        ("PANDEMONIUM (ADAPTIVE)", [str(BINARY)]),
+    ]
 
-        # FULL FIELD: every installed production scx scheduler in the ring against
-        # EEVDF and PANDEMONIUM. Gated behind --all-scx (opt-in) to keep the default
-        # run fast -- the EEVDF + PANDEMONIUM (BPF + ADAPTIVE) trio is what we iterate
-        # on most. scx_chaos is excluded (fault-injection test scheduler, not a
-        # contender). scx_layered needs a layer spec and may self-skip without one.
-        if args.all_scx:
-            scx_field = [
-                "scx_bpfland", "scx_rusty", "scx_lavd", "scx_flow", "scx_rustland",
-                "scx_p2dq", "scx_tickless", "scx_cosmos", "scx_cake", "scx_flash",
-                "scx_beerland", "scx_layered",
-            ]
-            for s in scx_field:
-                if find_scheduler(s):
-                    entries.append((s, [s]))
-                else:
-                    log_warn(f"{s} not found, skipping")
+    # FULL FIELD: every installed production scx scheduler in the ring against
+    # EEVDF and PANDEMONIUM. Gated behind --all-scx (opt-in) to keep the default
+    # run fast -- the EEVDF + PANDEMONIUM (BPF + ADAPTIVE) trio is what we iterate
+    # on most. scx_chaos is excluded (fault-injection test scheduler, not a
+    # contender). scx_layered needs a layer spec and may self-skip without one.
+    if args.all_scx:
+        scx_field = [
+            "scx_bpfland", "scx_rusty", "scx_lavd", "scx_flow", "scx_rustland",
+            "scx_p2dq", "scx_tickless", "scx_cosmos", "scx_cake", "scx_flash",
+            "scx_beerland", "scx_layered",
+        ]
+        for s in scx_field:
+            if find_scheduler(s):
+                entries.append((s, [s]))
+            else:
+                log_warn(f"{s} not found, skipping")
 
-        # WORKLOAD CELLS: modes x groups. The default fork/thread split, sweepable.
-        modes = [m.strip() for m in args.modes.split(",")
-                 if m.strip() in ("thread", "process")]
-        if not modes:
-            log_warn(f"--modes '{args.modes}' has no valid mode -- using thread")
-            modes = ["thread"]
-        try:
-            groups = [int(g) for g in args.groups.split(",") if g.strip()]
-        except ValueError:
-            log_warn(f"--groups '{args.groups}' not all integers -- using {NUM_GROUPS}")
-            groups = [NUM_GROUPS]
-        cells = build_cells(modes, groups or [NUM_GROUPS])
+    # WORKLOAD CELLS: modes x groups. The default fork/thread split, sweepable.
+    modes = [m.strip() for m in args.modes.split(",")
+             if m.strip() in ("thread", "process")]
+    if not modes:
+        log_warn(f"--modes '{args.modes}' has no valid mode -- using thread")
+        modes = ["thread"]
+    try:
+        groups = [int(g) for g in args.groups.split(",") if g.strip()]
+    except ValueError:
+        log_warn(f"--groups '{args.groups}' not all integers -- using {NUM_GROUPS}")
+        groups = [NUM_GROUPS]
+    cells = build_cells(modes, groups or [NUM_GROUPS])
 
     if args.pandemonium_only:
         entries = [(n, c) for n, c in entries if "PANDEMONIUM" in n]
@@ -1189,6 +1154,7 @@ def main():
     spreads_by_cell = {c.label: {} for c in cells}
     steal_by_sched = {}
     knobs_by_sched = {}
+    ejected_by_sched = {}
 
     try:
         for sched_name, cmd in entries:
@@ -1202,8 +1168,19 @@ def main():
                         results_by_cell[c.label][sched_name] = (None, None)
                     continue
 
-            for cell in cells:
+            expected_ops = scx_scheduler_name() if guard is not None else ""
+            for i, cell in enumerate(cells):
                 res, spreads = _measure(sched_name, cell, args.iterations)
+                # A SCHEDULER THE KERNEL EJECTED MID-CELL LEAVES EEVDF RUNNING
+                # UNDER ITS NAME: THE NUMBERS ARE EEVDF's. THE CELL AND EVERY
+                # LATER ONE ARE WITHHELD AND THE ARM IS MARKED EJECTED.
+                if arm_ejected(guard, expected_ops):
+                    log_error(f"[{sched_name}] EJECTED during {cell.label} -- its "
+                              f"numbers are withheld, they would be EEVDF's")
+                    ejected_by_sched[sched_name] = cell.label
+                    for c in cells[i:]:
+                        results_by_cell[c.label][sched_name] = (None, None)
+                    break
                 results_by_cell[cell.label][sched_name] = res
                 if spreads:
                     spreads_by_cell[cell.label][sched_name] = spreads
@@ -1221,8 +1198,6 @@ def main():
                     steal_by_sched[sched_name] = (int(_k["steal"]),
                                                   int(_k.get("spill", 0)),
                                                   int(_k["dispatches"]),
-                                                  int(_k.get("stay_cost_held", 0)),
-                                                  int(_k.get("stay_move_taken", 0)),
                                                   int(_k.get("kick_declined", 0)))
             time.sleep(2)
             print()
@@ -1244,7 +1219,7 @@ def main():
         prom_path = write_prometheus(ver, git, stamp, ncpus, cells_data, NR_LOOPS,
                                      steal_by_sched, knobs_by_sched)
         report_path = write_report(ver, git, stamp, ncpus, cells_data, NR_LOOPS,
-                                   steal_by_sched)
+                                   steal_by_sched, ejected_by_sched)
 
         log.report(report_path.read_text())
         log_info(f"REPORT: {report_path}")

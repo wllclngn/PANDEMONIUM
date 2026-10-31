@@ -29,15 +29,23 @@
  *
  * scx_bpf_dispatch_from_dsq() and friends were added during v6.12 by
  * 4c30f5ce4f7a ("sched_ext: Implement scx_bpf_dispatch[_vtime]_from_dsq()").
- * Preserve __COMPAT macros until v6.15.
+ *
+ * v7.1: scx_bpf_dsq_move_to_local___v2() to add @enq_flags.
  */
 void scx_bpf_dispatch___compat(struct task_struct *p, u64 dsq_id, u64 slice, u64 enq_flags) __ksym __weak;
 void scx_bpf_dispatch_vtime___compat(struct task_struct *p, u64 dsq_id, u64 slice, u64 vtime, u64 enq_flags) __ksym __weak;
-bool scx_bpf_consume___compat(u64 dsq_id) __ksym __weak;
-void scx_bpf_dispatch_from_dsq_set_slice___compat(struct bpf_iter_scx_dsq *it__iter, u64 slice) __ksym __weak;
-void scx_bpf_dispatch_from_dsq_set_vtime___compat(struct bpf_iter_scx_dsq *it__iter, u64 vtime) __ksym __weak;
-bool scx_bpf_dispatch_from_dsq___compat(struct bpf_iter_scx_dsq *it__iter, struct task_struct *p, u64 dsq_id, u64 enq_flags) __ksym __weak;
-bool scx_bpf_dispatch_vtime_from_dsq___compat(struct bpf_iter_scx_dsq *it__iter, struct task_struct *p, u64 dsq_id, u64 enq_flags) __ksym __weak;
+bool scx_bpf_dsq_move_to_local___v2___compat(u64 dsq_id, u64 enq_flags) __ksym __weak;
+bool scx_bpf_dsq_move_to_local___v1(u64 dsq_id) __ksym __weak;
+void scx_bpf_dsq_move_set_slice___new(struct bpf_iter_scx_dsq *it__iter, u64 slice) __ksym __weak;
+void scx_bpf_dsq_move_set_vtime___new(struct bpf_iter_scx_dsq *it__iter, u64 vtime) __ksym __weak;
+bool scx_bpf_dsq_move___new(struct bpf_iter_scx_dsq *it__iter, struct task_struct *p, u64 dsq_id, u64 enq_flags) __ksym __weak;
+bool scx_bpf_dsq_move_vtime___new(struct bpf_iter_scx_dsq *it__iter, struct task_struct *p, u64 dsq_id, u64 enq_flags) __ksym __weak;
+
+bool scx_bpf_consume___old(u64 dsq_id) __ksym __weak;
+void scx_bpf_dispatch_from_dsq_set_slice___old(struct bpf_iter_scx_dsq *it__iter, u64 slice) __ksym __weak;
+void scx_bpf_dispatch_from_dsq_set_vtime___old(struct bpf_iter_scx_dsq *it__iter, u64 vtime) __ksym __weak;
+bool scx_bpf_dispatch_from_dsq___old(struct bpf_iter_scx_dsq *it__iter, struct task_struct *p, u64 dsq_id, u64 enq_flags) __ksym __weak;
+bool scx_bpf_dispatch_vtime_from_dsq___old(struct bpf_iter_scx_dsq *it__iter, struct task_struct *p, u64 dsq_id, u64 enq_flags) __ksym __weak;
 int bpf_cpumask_populate(struct cpumask *dst, void *src, size_t src__sz) __ksym __weak;
 #define scx_bpf_dsq_insert(p, dsq_id, slice, enq_flags)				\
 	(bpf_ksym_exists(scx_bpf_dsq_insert) ?					\
@@ -49,37 +57,39 @@ int bpf_cpumask_populate(struct cpumask *dst, void *src, size_t src__sz) __ksym 
 	 scx_bpf_dsq_insert_vtime((p), (dsq_id), (slice), (vtime), (enq_flags)) : \
 	 scx_bpf_dispatch_vtime___compat((p), (dsq_id), (slice), (vtime), (enq_flags)))
 
-#define scx_bpf_dsq_move_to_local(dsq_id)					\
-	(bpf_ksym_exists(scx_bpf_dsq_move_to_local) ?				\
-	 scx_bpf_dsq_move_to_local((dsq_id)) :					\
-	 scx_bpf_consume___compat((dsq_id)))
+#define scx_bpf_dsq_move_to_local(dsq_id, enq_flags)				\
+	(bpf_ksym_exists(scx_bpf_dsq_move_to_local___v2___compat) ?		\
+	 scx_bpf_dsq_move_to_local___v2___compat((dsq_id), (enq_flags)) :	\
+	 (bpf_ksym_exists(scx_bpf_dsq_move_to_local___v1) ?			\
+	  scx_bpf_dsq_move_to_local___v1((dsq_id)) :				\
+	  scx_bpf_consume___old((dsq_id))))
 
-#define __COMPAT_scx_bpf_dsq_move_set_slice(it__iter, slice)			\
-	(bpf_ksym_exists(scx_bpf_dsq_move_set_slice) ?				\
-	 scx_bpf_dsq_move_set_slice((it__iter), (slice)) :			\
-	 (bpf_ksym_exists(scx_bpf_dispatch_from_dsq_set_slice___compat) ?	\
-	  scx_bpf_dispatch_from_dsq_set_slice___compat((it__iter), (slice)) :	\
+#define scx_bpf_dsq_move_set_slice(it__iter, slice)				\
+	(bpf_ksym_exists(scx_bpf_dsq_move_set_slice___new) ?			\
+	 scx_bpf_dsq_move_set_slice___new((it__iter), (slice)) :		\
+	 (bpf_ksym_exists(scx_bpf_dispatch_from_dsq_set_slice___old) ?		\
+	  scx_bpf_dispatch_from_dsq_set_slice___old((it__iter), (slice)) :	\
 	  (void)0))
 
-#define __COMPAT_scx_bpf_dsq_move_set_vtime(it__iter, vtime)			\
-	(bpf_ksym_exists(scx_bpf_dsq_move_set_vtime) ?				\
-	 scx_bpf_dsq_move_set_vtime((it__iter), (vtime)) :			\
-	 (bpf_ksym_exists(scx_bpf_dispatch_from_dsq_set_vtime___compat) ?	\
-	  scx_bpf_dispatch_from_dsq_set_vtime___compat((it__iter), (vtime)) :	\
-	  (void) 0))
+#define scx_bpf_dsq_move_set_vtime(it__iter, vtime)				\
+	(bpf_ksym_exists(scx_bpf_dsq_move_set_vtime___new) ?			\
+	 scx_bpf_dsq_move_set_vtime___new((it__iter), (vtime)) :		\
+	 (bpf_ksym_exists(scx_bpf_dispatch_from_dsq_set_vtime___old) ?		\
+	  scx_bpf_dispatch_from_dsq_set_vtime___old((it__iter), (vtime)) :	\
+	  (void)0))
 
-#define __COMPAT_scx_bpf_dsq_move(it__iter, p, dsq_id, enq_flags)		\
-	(bpf_ksym_exists(scx_bpf_dsq_move) ?					\
-	 scx_bpf_dsq_move((it__iter), (p), (dsq_id), (enq_flags)) :		\
-	 (bpf_ksym_exists(scx_bpf_dispatch_from_dsq___compat) ?			\
-	  scx_bpf_dispatch_from_dsq___compat((it__iter), (p), (dsq_id), (enq_flags)) : \
+#define scx_bpf_dsq_move(it__iter, p, dsq_id, enq_flags)			\
+	(bpf_ksym_exists(scx_bpf_dsq_move___new) ?				\
+	 scx_bpf_dsq_move___new((it__iter), (p), (dsq_id), (enq_flags)) :	\
+	 (bpf_ksym_exists(scx_bpf_dispatch_from_dsq___old) ?			\
+	  scx_bpf_dispatch_from_dsq___old((it__iter), (p), (dsq_id), (enq_flags)) : \
 	  false))
 
-#define __COMPAT_scx_bpf_dsq_move_vtime(it__iter, p, dsq_id, enq_flags)		\
-	(bpf_ksym_exists(scx_bpf_dsq_move_vtime) ?				\
-	 scx_bpf_dsq_move_vtime((it__iter), (p), (dsq_id), (enq_flags)) :	\
-	 (bpf_ksym_exists(scx_bpf_dispatch_vtime_from_dsq___compat) ?		\
-	  scx_bpf_dispatch_vtime_from_dsq___compat((it__iter), (p), (dsq_id), (enq_flags)) : \
+#define scx_bpf_dsq_move_vtime(it__iter, p, dsq_id, enq_flags)			\
+	(bpf_ksym_exists(scx_bpf_dsq_move_vtime___new) ?			\
+	 scx_bpf_dsq_move_vtime___new((it__iter), (p), (dsq_id), (enq_flags)) : \
+	 (bpf_ksym_exists(scx_bpf_dispatch_vtime_from_dsq___old) ?		\
+	  scx_bpf_dispatch_vtime_from_dsq___old((it__iter), (p), (dsq_id), (enq_flags)) : \
 	  false))
 
 #define __COMPAT_bpf_cpumask_populate(cpumask, src, size__sz)		\

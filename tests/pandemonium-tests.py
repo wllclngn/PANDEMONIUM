@@ -26,6 +26,7 @@ from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.resolve()))
+import pandemonium_common
 from pandemonium_common import (
     SCRIPT_DIR, TARGET_DIR, LOG_DIR, ARCHIVE_DIR, BINARY, SOURCE_PATTERNS,
     get_version, get_git_info, DmesgMonitor,
@@ -42,6 +43,8 @@ from pandemonium_common import (
     install_exit_guard, note_scheduler_activated, register_exit_cleanup,
     montauk_envelope, envelope_report, envelope_capture, envelope_verdict,
     envelope_offenders, envelope_gauges, envelope_gauge_by_label, montauk_report,
+    run_cmd_capture, _chown_to_invoking_user,
+    cpu_max_c, box_uptime_s, box_governor, box_outsiders, probe_tool,
     warm_sudo, refresh_sudo,
     SchedulerProcess, find_scheduler, stop_systemd_scheduler,
     start_scheduler, start_and_wait, sched_ejected, stop_and_wait,
@@ -59,10 +62,6 @@ from ipc_workload import (
 # CONFIGURATION
 
 DEFAULT_EXTERNALS = []
-
-# montauk comm for the latency probe (run_probe sets it via prctl) -- lets montauk
-# target JUST the probe in the longrun/mixed phases, not the 16 stress workers.
-PROBE_COMM = "pand-probe"
 
 
 # BUILD HELPERS
@@ -185,25 +184,103 @@ def timed_run(cmd: str, clean_cmd: str | None = None) -> float | None:
     return elapsed
 
 
-def parse_probe_output(stdout_text: str) -> dict:
-    """Parse probe stdout (one overshoot_us per line) into latency stats."""
+def parse_probe_output(stdout_text: str, keep_values: bool = False) -> dict:
+    """Parse probe stdout (one overshoot_us per line) into latency stats.
+    keep_values leaves the raw samples under `values` for a caller that pools
+    iterations (scale's phases); every other caller stores the stats alone."""
     values = []
     for line in stdout_text.splitlines():
         line = line.strip()
         if line and line.lstrip("-").isdigit():
             values.append(float(line))
+    stats = probe_stats(values)
+    if not keep_values:
+        stats.pop("values", None)
+    return stats
+
+
+def probe_stats(values: list[float]) -> dict:
+    """Latency stats from raw probe samples. The samples ride along under
+    `values` so iterations of one phase can be pooled (pool_phase_runs) and
+    are dropped from the stored result there."""
     if not values:
-        return {"samples": 0, "median_us": 0, "p99_us": 0, "worst_us": 0}
+        return {"samples": 0, "median_us": 0, "p99_us": 0, "worst_us": 0,
+                "values": []}
     return {
         "samples": len(values),
         "median_us": int(percentile(values, 50)),
         "p99_us": int(percentile(values, 99)),
         "worst_us": int(max(values)),
         "hist": histogram(values),
+        "values": values,
     }
 
 
-def measure_latency(binary: Path, n_cpus: int, iterations: int = 1,
+def pool_phase_runs(runs: list[dict]) -> dict:
+    """One result from N iterations of a scale phase, pooled the way the
+    latency phase pools: Every probe sample set (baseline, burst, recovery,
+    latency) is concatenated and its percentiles recomputed over the pool,
+    deadline jitter and launch samples the same, work counts are listed per
+    process across all iterations with the total as the per-iteration mean,
+    and survived is true only if every iteration survived. The raw sample
+    lists do not reach the stored result."""
+    if not runs:
+        return {}
+    if len(runs) == 1:
+        return _strip_values(runs[0])
+    out = dict(runs[0])
+    out["iterations"] = len(runs)
+    out["survived"] = all(r.get("survived", True) for r in runs)
+    for key in ("baseline", "burst", "recovery", "latency"):
+        if isinstance(runs[0].get(key), dict) and "values" in runs[0][key]:
+            pooled = [v for r in runs for v in (r.get(key) or {}).get("values", [])]
+            out[key] = probe_stats(pooled)
+    if "work_per_process" in runs[0]:
+        per = [w for r in runs for w in r.get("work_per_process", [])]
+        out["work_per_process"] = per
+        out["work_total"] = int(sum(r.get("work_total", 0) for r in runs) / len(runs))
+        out["work_min"] = min(per) if per else 0
+        out["work_max"] = max(per) if per else 0
+    if "jitter_values" in runs[0]:
+        jit = [j for r in runs for j in r.get("jitter_values", [])]
+        thr = runs[0].get("threshold_us", 0)
+        missed = sum(1 for j in jit if j > thr)
+        out.update({
+            "total_frames": len(jit),
+            "missed_frames": missed,
+            "miss_ratio": round(missed / len(jit), 4) if jit else 0.0,
+            "jitter_median_us": int(percentile(jit, 50)) if jit else 0,
+            "jitter_p99_us": int(percentile(jit, 99)) if jit else 0,
+            "jitter_worst_us": int(max(jit)) if jit else 0,
+            "jitter_hist": histogram([float(j) for j in jit]),
+            "jitter_values": jit,
+        })
+    if "launch_values" in runs[0]:
+        lv = [x for r in runs for x in r.get("launch_values", [])]
+        m, _std = mean_stdev([float(x) for x in lv]) if lv else (0.0, 0.0)
+        out.update({
+            "launches": len(lv),
+            "launch_mean_us": int(m),
+            "launch_median_us": int(percentile(lv, 50)) if lv else 0,
+            "launch_p99_us": int(percentile(lv, 99)) if lv else 0,
+            "launch_worst_us": int(max(lv)) if lv else 0,
+            "hist": histogram([float(x) for x in lv]),
+            "launch_values": lv,
+        })
+    return _strip_values(out)
+
+
+def _strip_values(d: dict) -> dict:
+    """The stored result without the raw sample lists."""
+    out = {}
+    for k, v in d.items():
+        if k in ("values", "jitter_values", "launch_values"):
+            continue
+        out[k] = _strip_values(v) if isinstance(v, dict) else v
+    return out
+
+
+def measure_latency(tool: Path, n_cpus: int, iterations: int = 1,
                     duration_secs: int = 15, warmup_secs: int = 3) -> dict:
     """Spawn pinned stress workers on all cores + unpinned probe.
 
@@ -225,7 +302,7 @@ def measure_latency(binary: Path, n_cpus: int, iterations: int = 1,
     workers = []
     for cpu in stress_cpus:
         p = subprocess.Popen(
-            [str(binary), "stress-worker", "--cpu", str(cpu)],
+            [str(tool), "stress-worker", "--cpu", str(cpu)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         workers.append(p)
@@ -233,7 +310,7 @@ def measure_latency(binary: Path, n_cpus: int, iterations: int = 1,
     # Warmup probe (discard output, let scheduler classify workload)
     log_info(f"Warmup: {warmup_secs}s")
     warmup = subprocess.Popen(
-        [str(binary), "probe"],
+        [str(tool), "probe"],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
     )
     time.sleep(warmup_secs)
@@ -246,12 +323,14 @@ def measure_latency(binary: Path, n_cpus: int, iterations: int = 1,
 
     # Measurement iterations (pool all samples)
     all_values: list[float] = []
+    probe_pid = None
     for i in range(iterations):
         log_info(f"Latency iteration {i + 1}/{iterations}: {duration_secs}s")
         probe = subprocess.Popen(
-            [str(binary), "probe"],
+            [str(tool), "probe"],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         )
+        probe_pid = probe.pid
         time.sleep(duration_secs)
         probe.send_signal(signal.SIGINT)
         try:
@@ -284,6 +363,7 @@ def measure_latency(binary: Path, n_cpus: int, iterations: int = 1,
             "p99_us": int(percentile(all_values, 99)),
             "worst_us": int(max(all_values)),
             "hist": histogram(all_values),
+            "probe_pid": probe_pid,
         }
 
     log_info(f"Latency: {result['samples']} samples, "
@@ -318,7 +398,7 @@ def fire_burst(count: int, work_secs: float = 0.5) -> list[subprocess.Popen]:
     return procs
 
 
-def measure_burst(binary: Path, n_cpus: int, burst_size: int,
+def measure_burst(tool: Path, n_cpus: int, burst_size: int,
                   burst_work_secs: float = 0.5,
                   baseline_secs: int = 5,
                   burst_measure_secs: int = 10,
@@ -341,7 +421,7 @@ def measure_burst(binary: Path, n_cpus: int, burst_size: int,
     workers = []
     for cpu in stress_cpus:
         p = subprocess.Popen(
-            [str(binary), "stress-worker", "--cpu", str(cpu)],
+            [str(tool), "stress-worker", "--cpu", str(cpu)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         workers.append(p)
@@ -349,7 +429,7 @@ def measure_burst(binary: Path, n_cpus: int, burst_size: int,
     # Warmup (discard output)
     log_info(f"Warmup: {warmup_secs}s")
     warmup = subprocess.Popen(
-        [str(binary), "probe"],
+        [str(tool), "probe"],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
     )
     time.sleep(warmup_secs)
@@ -363,7 +443,7 @@ def measure_burst(binary: Path, n_cpus: int, burst_size: int,
     # Baseline measurement
     log_info(f"Baseline: {baseline_secs}s")
     baseline_probe = subprocess.Popen(
-        [str(binary), "probe"],
+        [str(tool), "probe"],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
     )
     time.sleep(baseline_secs)
@@ -373,14 +453,14 @@ def measure_burst(binary: Path, n_cpus: int, burst_size: int,
     except subprocess.TimeoutExpired:
         baseline_probe.kill()
         baseline_out, _ = baseline_probe.communicate()
-    baseline = parse_probe_output(baseline_out.decode(errors="replace"))
+    baseline = parse_probe_output(baseline_out.decode(errors="replace"), keep_values=True)
     log_info(f"Baseline: {baseline['samples']} samples, "
              f"median={baseline['median_us']}us, "
              f"p99={baseline['p99_us']}us")
 
     # Burst measurement: start probe, fire burst, measure during + after
     burst_probe = subprocess.Popen(
-        [str(binary), "probe"],
+        [str(tool), "probe"],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
     )
     time.sleep(0.5)
@@ -411,7 +491,7 @@ def measure_burst(binary: Path, n_cpus: int, burst_size: int,
     except subprocess.TimeoutExpired:
         burst_probe.kill()
         burst_out, _ = burst_probe.communicate()
-    burst_stats = parse_probe_output(burst_out.decode(errors="replace"))
+    burst_stats = parse_probe_output(burst_out.decode(errors="replace"), keep_values=True)
     log_info(f"Burst: {burst_stats['samples']} samples, "
              f"median={burst_stats['median_us']}us, "
              f"p99={burst_stats['p99_us']}us, "
@@ -424,7 +504,7 @@ def measure_burst(binary: Path, n_cpus: int, burst_size: int,
     # ARBITRARY STATE. THIS MEASURES THE SETTLING BEHAVIOR.
     log_info("Recovery: 5s")
     recovery_probe = subprocess.Popen(
-        [str(binary), "probe"],
+        [str(tool), "probe"],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
     )
     time.sleep(5)
@@ -434,7 +514,7 @@ def measure_burst(binary: Path, n_cpus: int, burst_size: int,
     except subprocess.TimeoutExpired:
         recovery_probe.kill()
         recovery_out, _ = recovery_probe.communicate()
-    recovery_stats = parse_probe_output(recovery_out.decode(errors="replace"))
+    recovery_stats = parse_probe_output(recovery_out.decode(errors="replace"), keep_values=True)
     log_info(f"Recovery: {recovery_stats['samples']} samples, "
              f"p99={recovery_stats['p99_us']}us")
 
@@ -487,7 +567,7 @@ def spawn_longrunners(count: int, duration_secs: float) -> list[subprocess.Popen
     return procs
 
 
-def measure_longrun(binary: Path, n_cpus: int,
+def measure_longrun(tool: Path, n_cpus: int,
                     longrun_count: int = 4,
                     longrun_secs: float = 20.0,
                     warmup_secs: int = 2) -> dict:
@@ -518,7 +598,7 @@ def measure_longrun(binary: Path, n_cpus: int,
     workers = []
     for cpu in stress_cpus:
         p = subprocess.Popen(
-            [str(binary), "stress-worker", "--cpu", str(cpu)],
+            [str(tool), "stress-worker", "--cpu", str(cpu)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         workers.append(p)
@@ -526,7 +606,7 @@ def measure_longrun(binary: Path, n_cpus: int,
     # Warmup
     log_info(f"Warmup: {warmup_secs}s")
     warmup = subprocess.Popen(
-        [str(binary), "probe"],
+        [str(tool), "probe"],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
     )
     time.sleep(warmup_secs)
@@ -539,7 +619,7 @@ def measure_longrun(binary: Path, n_cpus: int,
 
     # Start latency probe + long-runners simultaneously
     probe = subprocess.Popen(
-        [str(binary), "probe"],
+        [str(tool), "probe"],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
     )
     longrunners = spawn_longrunners(longrun_count, longrun_secs)
@@ -564,7 +644,7 @@ def measure_longrun(binary: Path, n_cpus: int,
     except subprocess.TimeoutExpired:
         probe.kill()
         probe_out, _ = probe.communicate()
-    latency = parse_probe_output(probe_out.decode(errors="replace"))
+    latency = parse_probe_output(probe_out.decode(errors="replace"), keep_values=True)
 
     total_work = sum(work_counts)
     min_work = min(work_counts) if work_counts else 0
@@ -593,6 +673,7 @@ def measure_longrun(binary: Path, n_cpus: int,
         "longrun_count": longrun_count,
         "longrun_secs": longrun_secs,
         "latency": latency,
+        "probe_pid": probe.pid,
         "work_total": total_work,
         "work_min": min_work,
         "work_max": max_work,
@@ -602,7 +683,7 @@ def measure_longrun(binary: Path, n_cpus: int,
 
 # MIXED WORKLOAD MEASUREMENT (BURST + LONGRUN SIMULTANEOUS)
 
-def measure_mixed(binary: Path, n_cpus: int,
+def measure_mixed(tool: Path, n_cpus: int,
                   longrun_count: int = 4,
                   longrun_secs: float = 30.0,
                   burst_size: int = 0,
@@ -638,7 +719,7 @@ def measure_mixed(binary: Path, n_cpus: int,
     workers = []
     for cpu in stress_cpus:
         p = subprocess.Popen(
-            [str(binary), "stress-worker", "--cpu", str(cpu)],
+            [str(tool), "stress-worker", "--cpu", str(cpu)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         workers.append(p)
@@ -646,7 +727,7 @@ def measure_mixed(binary: Path, n_cpus: int,
     # Warmup
     log_info(f"Warmup: {warmup_secs}s")
     warmup = subprocess.Popen(
-        [str(binary), "probe"],
+        [str(tool), "probe"],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
     )
     time.sleep(warmup_secs)
@@ -659,7 +740,7 @@ def measure_mixed(binary: Path, n_cpus: int,
 
     # Start long-runners + probe simultaneously
     probe = subprocess.Popen(
-        [str(binary), "probe"],
+        [str(tool), "probe"],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
     )
     longrunners = spawn_longrunners(longrun_count, longrun_secs)
@@ -702,7 +783,7 @@ def measure_mixed(binary: Path, n_cpus: int,
     except subprocess.TimeoutExpired:
         probe.kill()
         probe_out, _ = probe.communicate()
-    latency = parse_probe_output(probe_out.decode(errors="replace"))
+    latency = parse_probe_output(probe_out.decode(errors="replace"), keep_values=True)
 
     total_work = sum(work_counts)
     min_work = min(work_counts) if work_counts else 0
@@ -733,6 +814,7 @@ def measure_mixed(binary: Path, n_cpus: int,
         "burst_size": burst_size,
         "burst_duration_s": round(burst_duration, 1),
         "latency": latency,
+        "probe_pid": probe.pid,
         "work_total": total_work,
         "work_min": min_work,
         "work_max": max_work,
@@ -742,7 +824,7 @@ def measure_mixed(binary: Path, n_cpus: int,
 
 # PERIODIC DEADLINE MEASUREMENT
 
-def measure_deadline(binary: Path, n_cpus: int,
+def measure_deadline(tool: Path, n_cpus: int,
                      target_fps: int = 60,
                      duration_secs: int = 15,
                      warmup_secs: int = 3,
@@ -771,7 +853,7 @@ def measure_deadline(binary: Path, n_cpus: int,
     workers = []
     for cpu in range(n_cpus):
         p = subprocess.Popen(
-            [str(binary), "stress-worker", "--cpu", str(cpu)],
+            [str(tool), "stress-worker", "--cpu", str(cpu)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         workers.append(p)
@@ -859,6 +941,7 @@ def measure_deadline(binary: Path, n_cpus: int,
         "jitter_p99_us": int(percentile(all_jitter, 99)) if all_jitter else 0,
         "jitter_worst_us": int(max(all_jitter)) if all_jitter else 0,
         "jitter_hist": histogram([float(j) for j in all_jitter]),
+        "jitter_values": all_jitter,
     }
 
     log_info(f"Deadline: {total} frames, {missed} missed "
@@ -1014,68 +1097,6 @@ def ipc_contention_from_recording(rec) -> dict:
                                     "quantile")
         if q.get("0.99") is not None:
             out["waker_run_p99"] = float(q["0.99"])
-    return out
-
-
-def ipc_kick_from_recording(rec) -> dict:
-    """Was the kick answered, or did the wakee wait for the tick?
-
-    THE ONE QUESTION NO PERCENTILE CAN HOLD. A wake that misses its kick emits no
-    SWITCH_IN and no WAKE2RUN until something else happens to wake the CPU, so it
-    is absent from p50, p99, p99.9 and WORST by construction rather than merely
-    rare in them. montauk's kick-latency report pairs each issued kick against the
-    resched that should answer it and counts the ones that never got a resched
-    before the next kick -- plus the subset that raced a fresh tick-stop, which is
-    a CPU going tickless with a kick already in flight.
-
-    IT READS NONE UNLESS THE PROBES ARE ARMED, which is what --scx-storm does and
-    what every archived run so far has lacked: kick_captured=0 means no
-    measurement, NOT a measured zero, so the caller must be able to tell those
-    apart. That is why the availability bit is folded in beside the counts.
-    """
-    out = {}
-    if rec is None:
-        return out
-    # THE EVENT STREAM, NOT THE DIRECTORY. montauk_envelope's `report` mode reads
-    # one named report over an EVENT STREAM and never digests, so aiming it at a
-    # recording directory is "short read on header" and an rc=1 warn per cell.
-    # The hop reader above passes no report and gets --digest, which is why it
-    # takes the dir and this cannot.
-    target = getattr(rec, "events_path", None)
-    if not target:
-        return out
-    env = montauk_envelope(target, report="kick-latency")
-    if env is None:
-        return out
-    kl = envelope_report(env, "kick-latency")
-    if not kl:
-        return out
-    # THE COUNTS ARE GAUGES, NOT REPORT KEYS. A report dict carries verdict and
-    # class at the top level and everything numeric under `gauges`, so reading
-    # kl["kicks_total"] silently yields None and the whole row disappears rather
-    # than erroring -- which is exactly how the first run produced captures full
-    # of kick data and a log with no kick line in it.
-    g = envelope_gauges(kl)
-    for name in ("kick_captured", "kicks_total", "kicks_unanswered",
-                 "kicks_tickless_raced", "kick_unanswered_pct",
-                 "kicks_self", "kicks_self_preempt",
-                 "kick_self_pct", "kick_self_preempt_pct"):
-        v = g.get(f"montauk_analysis_{name}")
-        if v is not None:
-            out[name] = float(v)
-    # kick_resched_us is ONE gauge repeated across a quantile label, so
-    # envelope_gauges() keeps the first and drops the rest. This is the delivery
-    # cost itself -- what it actually costs to reach a CPU that is not the one
-    # already executing -- so it is read by label or not at all.
-    q = envelope_gauge_by_label(kl, "montauk_analysis_kick_resched_us", "quantile")
-    for lbl, key in (("0.5", "kick_resched_p50_us"),
-                     ("0.99", "kick_resched_p99_us"),
-                     ("worst", "kick_resched_worst_us")):
-        if q.get(lbl) is not None:
-            out[key] = float(q[lbl])
-    klass, _ = envelope_verdict(kl)
-    if klass:
-        out["kick_class"] = klass
     return out
 
 
@@ -1287,7 +1308,7 @@ def analyze_ipc_trace(events_path: str) -> dict:
 
 # APPLICATION LAUNCH MEASUREMENT
 
-def measure_launch(binary: Path, n_cpus: int,
+def measure_launch(tool: Path, n_cpus: int,
                    launch_count: int = 100,
                    warmup_secs: int = 3) -> dict:
     """Measure fork+exec latency under full CPU load.
@@ -1305,7 +1326,7 @@ def measure_launch(binary: Path, n_cpus: int,
     workers = []
     for cpu in range(n_cpus):
         p = subprocess.Popen(
-            [str(binary), "stress-worker", "--cpu", str(cpu)],
+            [str(tool), "stress-worker", "--cpu", str(cpu)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         workers.append(p)
@@ -1350,6 +1371,7 @@ def measure_launch(binary: Path, n_cpus: int,
         "launch_p99_us": int(percentile(latencies_us, 99)) if latencies_us else 0,
         "launch_worst_us": int(max(latencies_us)) if latencies_us else 0,
         "hist": histogram([float(x) for x in latencies_us]),
+        "launch_values": latencies_us,
     }
 
     log_info(f"Launch: {launch_count} runs, "
@@ -1515,6 +1537,14 @@ def write_prometheus(data: dict, stamp: str) -> Path:
 
         for sched_name, sched_data in schedulers.items():
             labels = {"scheduler": sched_name, "cores": cores}
+
+            # Package temperature at the arm's start and end
+            th = sched_data.get("thermal") or {}
+            for edge in ("start", "end"):
+                if th.get(f"{edge}_c") is not None:
+                    gauge("pandemonium_bench_cpu_max_c",
+                          "Package max temperature at the arm's edge (C)",
+                          th[f"{edge}_c"], {**labels, "edge": edge})
 
             # Latency metrics
             lat = sched_data.get("latency", {})
@@ -1685,32 +1715,7 @@ def write_prometheus(data: dict, stamp: str) -> Path:
                     gauge("pandemonium_bench_ipc_rtt_samples",
                           "IPC round-trip samples", d["n"], pl)
 
-                # KICK PAIRING. Only present when --scx-storm armed the probes;
-                # kick_captured is the availability bit so a consumer never reads
-                # absence as a measured zero.
-                if ipc.get("kick_captured") is not None:
-                    gauge("pandemonium_bench_ipc_kick_captured",
-                          "1 = scx kick probes were armed for this cell",
-                          ipc["kick_captured"], labels)
                 for _k, _help in (
-                        ("kicks_total", "Kicks issued (scx_bpf_kick_cpu)"),
-                        ("kicks_unanswered",
-                         "Kicks with no resched before the next kick"),
-                        ("kicks_tickless_raced",
-                         "Unanswered kicks that raced a fresh tick-stop"),
-                        ("kick_unanswered_pct", "Unanswered kicks, percent"),
-                        ("kicks_self", "Kicks whose issuer was the target CPU"),
-                        ("kicks_self_preempt",
-                         "Self-kicks carrying SCX_KICK_PREEMPT"),
-                        ("kick_self_pct", "Self-kicks, percent of all kicks"),
-                        ("kick_self_preempt_pct",
-                         "Self-preempts, percent of all kicks"),
-                        ("kick_resched_p50_us",
-                         "Median kick-to-resched delivery latency (us)"),
-                        ("kick_resched_p99_us",
-                         "P99 kick-to-resched delivery latency (us)"),
-                        ("kick_resched_worst_us",
-                         "Worst kick-to-resched delivery latency (us)"),
                         ("spin_livelock",
                          "1 = montauk's spins report read LIVELOCK"),
                         ("futex_blocked_threads",
@@ -1871,10 +1876,6 @@ def write_prometheus(data: dict, stamp: str) -> Path:
                                   ("spill", "Total sibling spills"),
                                   ("kick_declined",
                                    "Requeue kicks the price refused outright"),
-                                  ("stay_cost_held",
-                                   "anchor->target moves the base cost refused"),
-                                  ("stay_move_taken",
-                                   "anchor->target moves the base cost admitted"),
                                   ("dispatches", "Total dispatches")):
                     if tk in knobs:
                         gauge(f"pandemonium_bench_{tk}_total", tdesc,
@@ -2136,6 +2137,7 @@ _BENCH_SLUGS = (
     ("mixed_only",    "prism-mixed"),
     ("longrun_only",  "prism-longrun"),
     ("burst_only",    "prism-burst"),
+    ("compile_only",  "prism-compile"),
 )
 
 
@@ -2189,6 +2191,20 @@ def format_report(data: dict) -> str:
             delta_str = f"{delta:+.1f}%" if delta is not None else "(baseline)"
             lines.append(f"{sched_name:<28} {tp['mean_s']:>9.2f}s "
                         f"{tp.get('stdev_s', 0):>9.2f}s {delta_str:>12}")
+
+        # Package temperature at each arm's start and end
+        has_thermal = any((s.get("thermal") or {}).get("start_c") is not None
+                          for s in schedulers.values())
+        if has_thermal:
+            lines.append("")
+            lines.append(f"{'SCHEDULER':<28} {'START C':>8} {'END C':>8}")
+            for sched_name, sched_data in schedulers.items():
+                th = sched_data.get("thermal") or {}
+                if th.get("start_c") is None:
+                    continue
+                end = th.get("end_c")
+                lines.append(f"{sched_name:<28} {th['start_c']:>8.0f} "
+                             f"{(end if end is not None else float('nan')):>8.0f}")
 
         # Latency table
         has_latency = any(s.get("latency", {}).get("samples", 0) > 0
@@ -2384,43 +2400,6 @@ def format_report(data: dict) -> str:
                         f"{'  wake2run ' + f'{_w2r:.1f}us':>20}"
                         f"{'  rest ' + f'{_rest:.1f}us':>16}"
                         f"   (iter 1; rest = waker-side + run)")
-                # THE KICK ROW. An unanswered kick is a wake that got no resched
-                # before the next kick, so the wakee had nothing behind it but the
-                # tick -- and that wake is in no latency distribution at all,
-                # because it emits neither SWITCH_IN nor WAKE2RUN while it waits.
-                # Silent unless --scx-storm armed the probes; kick_captured==0 is
-                # "not measured", never a measured zero.
-                if ipc.get("kick_captured"):
-                    _kt = ipc.get("kicks_total") or 0.0
-                    _ku = ipc.get("kicks_unanswered") or 0.0
-                    _kr = ipc.get("kicks_tickless_raced") or 0.0
-                    _pct = ipc.get("kick_unanswered_pct")
-                    if _pct is None:
-                        _pct = (100.0 * _ku / _kt) if _kt else 0.0
-                    _d50 = ipc.get("kick_resched_p50_us")
-                    _d99 = ipc.get("kick_resched_p99_us")
-                    lines.append(
-                        f"{'':<28} {'':>8} {'kick':>8} "
-                        f"{'issued ' + f'{_kt:.0f}':>18}"
-                        f"{'  unanswered ' + f'{_ku:.0f} ({_pct:.2f}%)':>22}"
-                        f"{'  tickless ' + f'{_kr:.0f}':>14}"
-                        + (f"{'  resched ' + f'{_d50:.1f}/{_d99:.1f}us':>22}"
-                           if _d50 is not None and _d99 is not None else "")
-                        + f"   {ipc.get('kick_class', '')}")
-                    # THE SELF ROW. A kick whose issuer is its own target buys
-                    # nothing a return from the callback would not already do,
-                    # and a self-kick carrying PREEMPT is the scheduler telling
-                    # a CPU to displace the task it just chose. EEVDF issues
-                    # none of either, so any nonzero share here is ours.
-                    _sp = ipc.get("kick_self_preempt_pct")
-                    if _sp is not None:
-                        _sk = ipc.get("kicks_self") or 0.0
-                        _spn = ipc.get("kicks_self_preempt") or 0.0
-                        _skp = ipc.get("kick_self_pct") or 0.0
-                        lines.append(
-                            f"{'':<28} {'':>8} {'self':>8} "
-                            f"{'kicks ' + f'{_sk:.0f} ({_skp:.2f}%)':>18}"
-                            f"{'  preempt ' + f'{_spn:.0f} ({_sp:.2f}%)':>22}")
                 # THE PAIR ROW. The aggregate above pools every task in the
                 # capture -- the pair, the stress workers and montauk, which is
                 # the top CPU holder in these recordings. This is the pair alone,
@@ -2920,7 +2899,7 @@ def collect_burst_times(procs: list[subprocess.Popen],
     return times
 
 
-def measure_burst_starvation(binary: Path, n_cpus: int,
+def measure_burst_starvation(tool: Path, n_cpus: int,
                              burst_size: int = 300,
                              burst_work_secs: float = 0.5) -> dict:
     """Reproduce the CS2 starvation scenario that killed v5.4.1.
@@ -2943,14 +2922,14 @@ def measure_burst_starvation(binary: Path, n_cpus: int,
     workers = []
     for cpu in range(n_cpus):
         p = subprocess.Popen(
-            [str(binary), "stress-worker", "--cpu", str(cpu)],
+            [str(tool), "stress-worker", "--cpu", str(cpu)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         workers.append(p)
 
     # WARMUP: LET SCHEDULER CLASSIFY WORKLOAD
     warmup = subprocess.Popen(
-        [str(binary), "probe"],
+        [str(tool), "probe"],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
     )
     time.sleep(3)
@@ -2964,7 +2943,7 @@ def measure_burst_starvation(binary: Path, n_cpus: int,
     # BASELINE PROBE (5S)
     log_info("[burst-starvation] Baseline: 5s")
     baseline_probe = subprocess.Popen(
-        [str(binary), "probe"],
+        [str(tool), "probe"],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
     )
     time.sleep(5)
@@ -2980,7 +2959,7 @@ def measure_burst_starvation(binary: Path, n_cpus: int,
 
     # START PROBE FOR BURST MEASUREMENT
     burst_probe = subprocess.Popen(
-        [str(binary), "probe"],
+        [str(tool), "probe"],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
     )
     time.sleep(0.5)
@@ -3013,7 +2992,7 @@ def measure_burst_starvation(binary: Path, n_cpus: int,
     # RECOVERY PROBE (5S)
     log_info("[burst-starvation] Recovery: 5s")
     recovery_probe = subprocess.Popen(
-        [str(binary), "probe"],
+        [str(tool), "probe"],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
     )
     time.sleep(5)
@@ -3073,7 +3052,7 @@ def measure_burst_starvation(binary: Path, n_cpus: int,
     }
 
 
-def measure_work_stealing(binary: Path, n_cpus: int) -> dict:
+def measure_work_stealing(tool: Path, n_cpus: int) -> dict:
     """Test L2 work stealing under asymmetric load.
 
     Pin stress workers to half the CPUs (saturate them). Probe floats
@@ -3098,13 +3077,13 @@ def measure_work_stealing(binary: Path, n_cpus: int) -> dict:
     sym_workers = []
     for cpu in range(n_cpus):
         p = subprocess.Popen(
-            [str(binary), "stress-worker", "--cpu", str(cpu)],
+            [str(tool), "stress-worker", "--cpu", str(cpu)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         sym_workers.append(p)
 
     warmup = subprocess.Popen(
-        [str(binary), "probe"],
+        [str(tool), "probe"],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
     )
     time.sleep(2)
@@ -3116,7 +3095,7 @@ def measure_work_stealing(binary: Path, n_cpus: int) -> dict:
         warmup.wait()
 
     sym_probe = subprocess.Popen(
-        [str(binary), "probe"],
+        [str(tool), "probe"],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
     )
     time.sleep(10)
@@ -3147,13 +3126,13 @@ def measure_work_stealing(binary: Path, n_cpus: int) -> dict:
     asym_workers = []
     for cpu in range(half):
         p = subprocess.Popen(
-            [str(binary), "stress-worker", "--cpu", str(cpu)],
+            [str(tool), "stress-worker", "--cpu", str(cpu)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         asym_workers.append(p)
 
     warmup = subprocess.Popen(
-        [str(binary), "probe"],
+        [str(tool), "probe"],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
     )
     time.sleep(2)
@@ -3165,7 +3144,7 @@ def measure_work_stealing(binary: Path, n_cpus: int) -> dict:
         warmup.wait()
 
     asym_probe = subprocess.Popen(
-        [str(binary), "probe"],
+        [str(tool), "probe"],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
     )
     time.sleep(10)
@@ -3214,7 +3193,7 @@ def measure_work_stealing(binary: Path, n_cpus: int) -> dict:
     }
 
 
-def measure_sojourn_ceiling(binary: Path, n_cpus: int,
+def measure_sojourn_ceiling(tool: Path, n_cpus: int,
                             wave_count: int = 5,
                             tasks_per_wave: int = 50,
                             work_secs: float = 0.01) -> dict:
@@ -3238,7 +3217,7 @@ def measure_sojourn_ceiling(binary: Path, n_cpus: int,
     workers = []
     for cpu in range(n_cpus):
         p = subprocess.Popen(
-            [str(binary), "stress-worker", "--cpu", str(cpu)],
+            [str(tool), "stress-worker", "--cpu", str(cpu)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         workers.append(p)
@@ -3465,8 +3444,8 @@ def trace_pcpu_burst(stamp: str, n_cpus: int, duration: int,
     Saturates every CPU, then detonates fork/exec bursts for the window while
     montauk records the per-event wake-to-run -- so the worst burst wakeup is in
     the .events for montauk --analyze --digest. Trace IS the artifact; no
-    probe/baseline/recovery measurement here. Workers run the `pandemonium`
-    binary (stress-worker / burst tasks), so montauk targets comm `pandemonium`.
+    probe/baseline/recovery measurement here. The stress workers are the suite's
+    probe tool (comm pand-stress), so montauk targets them and the scheduler.
     montauk pins a drain core (CPUs are saturated) so it never drops events."""
     if not montauk_available():
         log_error("montauk not found -- cannot --trace")
@@ -3478,7 +3457,7 @@ def trace_pcpu_burst(stamp: str, n_cpus: int, duration: int,
     def body(rec_dir):
         end = time.monotonic() + duration
         workers = [subprocess.Popen(
-                       [str(BINARY), "stress-worker", "--cpu", str(c)],
+                       [str(probe_tool()), "stress-worker", "--cpu", str(c)],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                    for c in range(n_cpus)]
         try:
@@ -3503,8 +3482,8 @@ def trace_pcpu_burst(stamp: str, n_cpus: int, duration: int,
     # kernel baseline -- the only way to know whether a deep queueing tail is a
     # PANDEMONIUM deficiency or just the physics of 20x oversubscription. The
     # field (default EEVDF+PANDEMONIUM; widened by --schedulers/--all-scx) runs
-    # the same body. The stress-worker/burst tasks are the `pandemonium` binary
-    # under every scheduler, so montauk targets comm `pandemonium` for all arms.
+    # the same body. The stress workers are pand-stress under every scheduler,
+    # so montauk targets that comm and the scheduler's for all arms.
     arms = field_arms(n_cpus, schedulers, all_scx, pandemonium_only)
     traced = 0
     for sched_name, activate_cmd in arms:
@@ -3515,7 +3494,7 @@ def trace_pcpu_burst(stamp: str, n_cpus: int, duration: int,
         # and placement-race / kick-latency / slice return "re-capture to
         # resolve". The ~6x event cost buys the attribution this stage exists for.
         rec_dir, _ = trace_workload(sched_name, activate_cmd,
-                                    "pandemonium", f"pcpu-burst-{n_cpus}c", stamp,
+                                    "pandemonium,pand-stress", f"pcpu-burst-{n_cpus}c", stamp,
                                     body, events=True, pin_cpu=drain,
                                     sched_detail=True)
         if rec_dir is None:
@@ -3792,6 +3771,10 @@ def cmd_bench_coldwake(args) -> int:
     idle->bare-wake under powersave so montauk's COLD-WAKE block can tell a
     governor / architecture frequency-ramp apart from a scheduler dispatch delay.
     Mirrors prism-power's idle framing; the montauk trace is the artifact."""
+    if not getattr(args, "trace", False):
+        log_error("prism-coldwake is a capture, cold-wake and --storm alike: "
+                  "run it with --trace")
+        return 2
     if os.geteuid() != 0:
         # SELF-ELEVATE: cold-wake needs root end-to-end -- montauk eBPF attach,
         # sched_ext activation, governor write, /dev/cpu/N/msr -- and the trace
@@ -3934,38 +3917,24 @@ def trace_storm_cycle(stamp, n_cpus, duration, busy_per_cpu=4,
             # montauk -- not a tick-log scrape -- observes the storm: capture a trace
             # while loadgen floods, then read it back through `--report storm` (the
             # StormReport: fentry counters on scx_bpf_kick_cpu / reenqueue_local).
-            trace = f"/tmp/storm-{tag}-{stamp}.bin"
+            # The kick probes ARE the storm surface, so this capture asks the
+            # shared launcher for them; without them the StormReport has no kick
+            # counters to read and renders "not captured".
             log_info(f"[storm] {sched_name}: flooding {duration}s under montauk")
-            with open(trace + ".err", "w") as ef:
-                # Arm the fentry/fexit trampolines on sched_ext's hot kfuncs
-                # (scx_bpf_kick_cpu / scx_bpf_reenqueue_local). Without this the
-                # StormReport has no kick counters to read and the report renders
-                # "not captured" -- the storm surface is the whole point of this
-                # capture, so the probes go on explicitly rather than inheriting
-                # whatever the caller's shell happened to export.
-                storm_env = dict(os.environ, MONTAUK_SCX_STORM="1")
-                mon = subprocess.Popen([MONTAUK, "--trace", "stormwork",
-                                        "--trace-out", trace],
-                                       stdout=subprocess.DEVNULL, stderr=ef,
-                                       env=storm_env)
-                time.sleep(2.0)
-                if mon.poll() is None:
-                    subprocess.run(["sudo", swbin, "storm", str(duration),
-                                    str(busy_per_cpu), str(sleep_us), str(spin_us)],
-                                   capture_output=True, text=True)
-                    mon.send_signal(signal.SIGINT)
-                    try:
-                        mon.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        mon.kill()
-                        mon.wait()
-                else:
-                    log_warn(f"[storm] {sched_name}: montauk trace did not attach")
+            with montauk_trace("stormwork", f"storm-{tag}", stamp, events=True,
+                               scx_storm=True) as rec:
+                subprocess.run(["sudo", swbin, "storm", str(duration),
+                                str(busy_per_cpu), str(sleep_us), str(spin_us)],
+                               capture_output=True, text=True)
+            trace = rec.events_path
             guard.stop()
             wait_for_deactivation(5.0)
-            # ONE INVOCATION, BOTH FACES. montauk_report renders the text and
-            # parses the envelope from the same analyzer run; this used to spawn
-            # the analyzer twice over the same capture for the two halves.
+            # BOTH FACES: montauk_report returns the text and the envelope, one
+            # analyzer pass each, because --json replaces the text rather than
+            # adding to it. The verdict's interval counts, reenqueue p50/peak and
+            # preempt rate are text-only in montauk's StormReport, so
+            # _parse_storm_report reads the text until montauk emits them as
+            # gauges.
             _storm_text, _storm_env = montauk_report(trace, "storm")
             # v7.17.0: query the captured bit as structured data and stamp it
             # into the artifact NOW -- the trace is deleted below, so this is
@@ -4108,7 +4077,7 @@ def cmd_bench_pcpu(args) -> int:
                 try:
                     # TEST 1: BURST STARVATION
                     burst_size = max(nr_cpus * 20, 100)
-                    r = measure_burst_starvation(BINARY, nr_cpus,
+                    r = measure_burst_starvation(probe_tool(), nr_cpus,
                                                  burst_size=burst_size)
                     core_results["burst"].append(r)
                     if not r.get("pass", False) and not r.get("skip", False):
@@ -4124,7 +4093,7 @@ def cmd_bench_pcpu(args) -> int:
                     time.sleep(3)
 
                     # TEST 2: WORK STEALING
-                    r = measure_work_stealing(BINARY, nr_cpus)
+                    r = measure_work_stealing(probe_tool(), nr_cpus)
                     core_results["steal"].append(r)
                     if not r.get("pass", False) and not r.get("skip", False):
                         overall_pass = False
@@ -4139,7 +4108,7 @@ def cmd_bench_pcpu(args) -> int:
                     time.sleep(3)
 
                     # TEST 3: SOJOURN CEILING
-                    r = measure_sojourn_ceiling(BINARY, nr_cpus)
+                    r = measure_sojourn_ceiling(probe_tool(), nr_cpus)
                     core_results["sojourn"].append(r)
                     if not r.get("pass", False) and not r.get("skip", False):
                         overall_pass = False
@@ -4330,7 +4299,7 @@ def cmd_bench_scale(args) -> int:
         log_info("PANDEMONIUM-ONLY MODE: skipping EEVDF and external schedulers")
     else:
         # A named --schedulers field is EEVDF vs EXACTLY those (PANDEMONIUM only if
-        # named) -- consistent with field_arms / prism-cachyos. Default keeps
+        # named) -- consistent with field_arms. Default keeps
         # PANDEMONIUM. schedulers may arrive as a list or a comma string.
         _sl = args.schedulers or []
         if isinstance(_sl, str):
@@ -4383,6 +4352,8 @@ def cmd_bench_scale(args) -> int:
         log_info("Mode: LONG-RUN ONLY (skipping latency, throughput, burst)")
     elif args.burst:
         log_info("Mode: BURST ONLY (skipping latency + throughput)")
+    elif args.compile:
+        log_info(f"Mode: COMPILE ONLY ({workload_cmd})")
     else:
         log_info(f"Iterations: {args.iterations}")
         log_info(f"Workload: {workload_cmd}")
@@ -4405,6 +4376,7 @@ def cmd_bench_scale(args) -> int:
         "deadline_only": args.deadline,
         "ipc_only": args.ipc,
         "launch_only": args.launch,
+        "compile_only": args.compile,
         "max_cpus": max_cpus,
         "results": {},
     }
@@ -4456,19 +4428,68 @@ def cmd_bench_scale(args) -> int:
                         continue
 
                 any_single = (args.burst or args.longrun or args.mixed
-                              or args.deadline or args.ipc or args.launch)
+                              or args.deadline or args.ipc or args.launch
+                              or args.compile)
                 run_full = not any_single
+
+                # THE PACKAGE TEMPERATURE AT THE ARM's START AND END. THE BOX
+                # READS 96 C UNDER A FULL 12-THREAD LOAD, AND A CELL THAT RAN
+                # HOT IS READ WITH THAT BESIDE IT.
+                sched_result["thermal"] = {"start_c": cpu_max_c()}
+
+                # EVERY PHASE REPEATS UNDER --iterations AND POOLS ITS SAMPLES
+                # THE WAY THE LATENCY PHASE DOES. ONE DRAW CANNOT SHOW A HELD
+                # LATENCY, AND A CELL THAT READ 60us IN ONE RUN AND 959us IN
+                # THE NEXT WAS ONE DRAW EACH TIME.
+                _iters = max(1, getattr(args, "iterations", 1))
+
+                def repeat_phase(label, fn):
+                    runs = []
+                    for _it in range(_iters):
+                        if _iters > 1:
+                            log_info(f"{label} iteration {_it + 1}/{_iters} "
+                                     f"[{sched_name}] {n}C")
+                        r = fn()
+                        if sched_ejected(guard):
+                            r["survived"] = False
+                            log_error(f"{sched_name} CRASHED during {label} "
+                                      f"(exit {guard.proc.returncode})")
+                            runs.append(r)
+                            break
+                        runs.append(r)
+                    return pool_phase_runs(runs)
 
                 if run_full:
                     # Latency measurement
-                    latency = measure_latency(BINARY, n,
+                    latency = measure_latency(probe_tool(), n,
                                               iterations=args.iterations)
                     sched_result["latency"] = latency
 
-                    # Throughput measurement
+                if run_full or args.compile:
+                    # Throughput measurement. Under --compile --trace the FIRST
+                    # build of each arm records under montauk, the build's whole
+                    # process tree with the DSQ probes armed, so where the compile
+                    # spends its time can be read against EEVDF's on the same
+                    # width. The traced build's wall carries the tracing tax and
+                    # is withheld from the timing; the repeats time clean.
                     times = []
-                    for i in range(args.iterations):
-                        log_info(f"Throughput iteration {i + 1}/{args.iterations}")
+                    _traced = (args.compile and getattr(args, "trace", False)
+                               and montauk_available())
+                    for i in range(args.iterations + (1 if _traced else 0)):
+                        if _traced and i == 0:
+                            safe = (sched_name.replace(" ", "-")
+                                    .replace("(", "").replace(")", ""))
+                            with montauk_trace("cargo", f"compile-{safe}-{n}c",
+                                               stamp, events=True, scx_dsq=True,
+                                               sched_detail=True,
+                                               trace_classes=COMPILE_TRACE_CLASSES
+                                               ) as _rec:
+                                timed_run(workload_cmd, clean_cmd)
+                            log_info(f"[{sched_name}] {n}C compile montauk trace "
+                                     f"-> {_rec.dir}")
+                            continue
+                        log_info(f"Throughput iteration "
+                                 f"{i + (0 if _traced else 1)}/{args.iterations}")
                         t = timed_run(workload_cmd, clean_cmd)
                         if t is None:
                             log_warn(f"Workload failed under {sched_name}")
@@ -4494,70 +4515,31 @@ def cmd_bench_scale(args) -> int:
                     burst_size = n * 4
                     if burst_size < 8:
                         burst_size = 8
-                    burst_result = measure_burst(BINARY, n, burst_size)
-                    if sched_ejected(guard):
-                        burst_result["survived"] = False
-                        log_error(f"{sched_name} CRASHED during burst "
-                                  f"(exit {guard.proc.returncode})")
-                    sched_result["burst"] = burst_result
+                    sched_result["burst"] = repeat_phase(
+                        "burst", lambda: measure_burst(probe_tool(), n, burst_size))
 
                 if run_full or args.longrun:
-                    # Long-running process test. Capture the probe's wake-to-run
-                    # with montauk (pand-probe comm) so the interactive-stall tail
-                    # lands in .events for montauk --analyze, not just p99/worst.
+                    # Long-running process test. Its traced form is prism-probe.
                     longrun_count = max(4, n // 2)
-                    _safe = (sched_name.replace(" ", "-")
-                             .replace("(", "").replace(")", ""))
-                    if getattr(args, "trace", False) and montauk_available():
-                        with montauk_trace(PROBE_COMM, f"longrun-{_safe}-{n}c",
-                                           stamp, events=True) as _rec:
-                            longrun_result = measure_longrun(
-                                BINARY, n, longrun_count=longrun_count)
-                        log_info(f"[{sched_name}] {n}C longrun montauk -> "
-                                 f"{_rec.dir}")
-                    else:
-                        longrun_result = measure_longrun(
-                            BINARY, n, longrun_count=longrun_count)
-                    if sched_ejected(guard):
-                        longrun_result["survived"] = False
-                        log_error(f"{sched_name} CRASHED during long-run "
-                                  f"(exit {guard.proc.returncode})")
-                    sched_result["longrun"] = longrun_result
+                    sched_result["longrun"] = repeat_phase(
+                        "long-run", lambda: measure_longrun(
+                            probe_tool(), n, longrun_count=longrun_count))
 
                 if run_full or args.mixed:
-                    # Mixed workload test (burst + longrun combined). Same montauk
-                    # capture of the probe -- this phase shows the 195ms stall tail.
+                    # Mixed workload test (burst + longrun combined). Its traced
+                    # form is prism-probe.
                     mixed_burst_size = n * 4
                     if mixed_burst_size < 8:
                         mixed_burst_size = 8
-                    _safe = (sched_name.replace(" ", "-")
-                             .replace("(", "").replace(")", ""))
-                    if getattr(args, "trace", False) and montauk_available():
-                        with montauk_trace(PROBE_COMM, f"mixed-{_safe}-{n}c",
-                                           stamp, events=True) as _rec:
-                            mixed_result = measure_mixed(
-                                BINARY, n, longrun_count=max(4, n // 2),
-                                burst_size=mixed_burst_size)
-                        log_info(f"[{sched_name}] {n}C mixed montauk -> "
-                                 f"{_rec.dir}")
-                    else:
-                        mixed_result = measure_mixed(
-                            BINARY, n, longrun_count=max(4, n // 2),
-                            burst_size=mixed_burst_size)
-                    if sched_ejected(guard):
-                        mixed_result["survived"] = False
-                        log_error(f"{sched_name} CRASHED during mixed test "
-                                  f"(exit {guard.proc.returncode})")
-                    sched_result["mixed"] = mixed_result
+                    sched_result["mixed"] = repeat_phase(
+                        "mixed", lambda: measure_mixed(
+                            probe_tool(), n, longrun_count=max(4, n // 2),
+                            burst_size=mixed_burst_size))
 
                 if run_full or args.deadline:
                     # Periodic deadline (frame scheduling jitter)
-                    deadline_result = measure_deadline(BINARY, n)
-                    if sched_ejected(guard):
-                        deadline_result["survived"] = False
-                        log_error(f"{sched_name} CRASHED during deadline test "
-                                  f"(exit {guard.proc.returncode})")
-                    sched_result["deadline"] = deadline_result
+                    sched_result["deadline"] = repeat_phase(
+                        "deadline", lambda: measure_deadline(probe_tool(), n))
 
                 _ipc_rec = None
                 if run_full or args.ipc:
@@ -4583,19 +4565,9 @@ def cmd_bench_scale(args) -> int:
                                 and montauk_available()):
                             safe = (sched_name.replace(" ", "-")
                                     .replace("(", "").replace(")", ""))
-                            # THE OPT-IN IS THE CONSTRUCTOR ARG, NOT THE ENV.
-                            # MontaukTrace scrubs MONTAUK_SCX_STORM from every
-                            # child env on purpose -- an ambient export is the
-                            # documented route to both of this box's hard locks --
-                            # so a bench asks for the probes explicitly or does
-                            # not get them. Attach order is still the launcher's:
-                            # it waits for the first .prom before returning, so
-                            # the trampoline patch lands while scx is quiescent.
                             with montauk_trace(IPC_COMM, f"ipc-{safe}-{n}c",
                                                stamp, events=True,
-                                               sched_detail=True,
-                                               scx_storm=getattr(
-                                                   args, "scx_storm", False)) as _rec:
+                                               sched_detail=True) as _rec:
                                 _r = measure_ipc(BINARY, n)
                             _ipc_rec = _rec
                             _r["events"] = (str(_rec.events_path)
@@ -4610,7 +4582,6 @@ def cmd_bench_scale(args) -> int:
                     # scheduler-side half of the hop in beside the RTT so the table
                     # can say WHERE the microseconds go, not only how many.
                     _hop = ipc_hop_from_recording(_ipc_rec)
-                    _hop.update(ipc_kick_from_recording(_ipc_rec))
                     _hop.update(ipc_contention_from_recording(_ipc_rec))
                     _hop.update(ipc_pair_from_recording(_ipc_rec))
                     if _hop and _runs:
@@ -4633,12 +4604,10 @@ def cmd_bench_scale(args) -> int:
 
                 if run_full or args.launch:
                     # Application launch under load
-                    launch_result = measure_launch(BINARY, n)
-                    if sched_ejected(guard):
-                        launch_result["survived"] = False
-                        log_error(f"{sched_name} CRASHED during launch test "
-                                  f"(exit {guard.proc.returncode})")
-                    sched_result["launch"] = launch_result
+                    sched_result["launch"] = repeat_phase(
+                        "launch", lambda: measure_launch(probe_tool(), n))
+
+                sched_result["thermal"]["end_c"] = cpu_max_c()
 
                 # Stop scheduler, capture telemetry
                 stdout = stop_and_wait(guard)
@@ -4732,6 +4701,366 @@ def cmd_bench_scale(args) -> int:
 
 # BENCH-SYS COMMAND
 
+# THE PROBE, TRACED WHOLE (prism-probe)
+#
+# scale's latency, longrun and mixed phases carry the probe under a saturated
+# box, and a capture of them needs what scale's measurement does not: One CPU
+# left to montauk so the capture keeps up, the per-switch stream on so a floored
+# wake can be attributed, and the probe, the stress workers and the long-runners
+# traced as one tree. This command runs those phases minus the drain core, traced
+# that way, and reads the probe's wakes back through montauk by pid.
+
+PROBE_TRACE_PATTERN = "pand-probe,pand-stress,pandemonium,python3"
+PROBE_TRACE_CLASSES = "sched,fork,exec,exit,comm"
+# A COMPILE IS THOUSANDS OF SHORT rustc AND cc PROCESSES AND A FLOOD OF FILE IO.
+# THE QUESTION IS WHERE ITS CPU TIME WAITS, SO ONLY THE SCHEDULER AND THE
+# PROCESS-TREE CLASSES ARE RESERVED.
+COMPILE_TRACE_CLASSES = "sched,fork,exec,exit,comm"
+PROBE_SCENARIOS = ("latency", "longrun", "mixed")
+# (reading key, report label, cell format)
+PROBE_ROWS = [
+    ("probe_p50_us",           "PROBE p50 us",          "{:.0f}"),
+    ("probe_p99_us",           "PROBE p99 us",          "{:.0f}"),
+    ("probe_worst_us",         "PROBE WORST us",        "{:.0f}"),
+    ("wake2run_p50_us",        "WAKE2RUN p50 us",       "{:.1f}"),
+    ("wake2run_p99_us",        "WAKE2RUN p99 us",       "{:.0f}"),
+    ("wake2run_p999_us",       "WAKE2RUN p99.9 us",     "{:.0f}"),
+    ("wake2run_tickfloor_pct", "TICK-FLOOR WAKES %",    "{:.2f}"),
+    ("preempt_starved_pct",    "PREEMPT-STARVED %",     "{:.0f}"),
+    ("order_starved_pct",      "ORDER-STARVED %",       "{:.0f}"),
+    ("passover_p99",           "PASS-OVERS p99",        "{:.0f}"),
+    ("dark_pct",               "DARK %",                "{:.0f}"),
+    ("migration_rate_hz",      "MIGRATIONS/s, BOX",     "{:.0f}"),
+    ("cross_l3_pct",           "CROSS-L3 MOVES %",      "{:.1f}"),
+    ("work_total",             "LONG-RUN WORK",         "{:.0f}"),
+    ("cpu_max_c_start",        "CPU MAX C, START",      "{:.0f}"),
+    ("cpu_max_c_end",          "CPU MAX C, END",        "{:.0f}"),
+    ("outsider_cpu_pct",       "BOX OUTSIDER CPU %",    "{:.0f}"),
+    ("completeness",           "CAPTURE COMPLETENESS",  "{:.3f}"),
+]
+
+
+def _probe_readings(events: Path | None, probe_pid: int | None) -> dict:
+    """montauk's reading of one capture: The probe's wake-to-run and the
+    attribution of its floored wakes, narrowed to its pid, and the box's
+    migration rate and locality over the whole stream."""
+    out: dict = {}
+    if events is None or not Path(events).is_file():
+        return out
+    whole = montauk_envelope(events)
+    narrow = montauk_envelope(events, pid=probe_pid) if probe_pid else whole
+    if whole:
+        out.update(envelope_capture(whole))
+        loc = envelope_report(whole, "locality")
+        lg = envelope_gauges(loc)
+        if "montauk_analysis_locality_migration_rate_hz" in lg:
+            out["migration_rate_hz"] = float(
+                lg["montauk_analysis_locality_migration_rate_hz"])
+        if "montauk_analysis_locality_local_pct" in lg:
+            out["local_pct"] = float(lg["montauk_analysis_locality_local_pct"])
+        tiers = envelope_gauge_by_label(
+            loc, "montauk_analysis_locality_tier_moves", "tier")
+        total = sum(float(v) for v in tiers.values()) if tiers else 0.0
+        if total > 0:
+            far = sum(float(v) for k, v in tiers.items()
+                      if k in ("same_socket", "cross_socket"))
+            out["cross_l3_pct"] = 100.0 * far / total
+        out["locality_class"], out["locality_verdict"] = envelope_verdict(loc)
+    if narrow:
+        w = envelope_report(narrow, "sched").get("wake2run") or {}
+        for k in ("count", "p50_us", "p99_us", "p999_us", "worst_us",
+                  "tickfloor_pct"):
+            if w.get(k) is not None:
+                out[f"wake2run_{k}"] = float(w[k])
+        stall = envelope_report(narrow, "dispatch-stall")
+        out["stall_class"], out["stall_verdict"] = envelope_verdict(stall)
+        sg = envelope_gauges(stall)
+        for g, k in (("montauk_analysis_dispatch_preempt_pct", "preempt_starved_pct"),
+                     ("montauk_analysis_dispatch_order_pct", "order_starved_pct"),
+                     ("montauk_analysis_dispatch_dark_pct", "dark_pct"),
+                     ("montauk_analysis_dispatch_held_pct", "held_pct"),
+                     ("montauk_analysis_dispatch_avg_passovers", "passovers_avg"),
+                     ("montauk_analysis_dispatch_passover_p99", "passover_p99")):
+            if g in sg:
+                out[k] = float(sg[g])
+    return out
+
+
+def _probe_cell(vals: list[float], fmt: str) -> str:
+    if not vals:
+        return "-"
+    m, sd = mean_stdev(vals)
+    return fmt.format(m) if len(vals) == 1 else f"{fmt.format(m)} ±{fmt.format(sd)}"
+
+
+def _write_probe_report(ver, git, stamp, ncpus, drain, duration, iterations,
+                        results, names, scen_names, skipped) -> Path:
+    lines = [
+        "PANDEMONIUM PRISM-PROBE",
+        f"VERSION:     {ver}",
+        f"COMMIT:      {git['commit']}{' (dirty)' if git['dirty'] else ''}",
+        f"TIMESTAMP:   {stamp}",
+        f"CPUS:        {ncpus} (load on {ncpus - 1}, montauk on cpu{drain})",
+        f"ITERATIONS:  {iterations}",
+        f"DURATION:    {duration:.0f}s latency and longrun, {2 * duration:.0f}s mixed",
+        f"BOX:         uptime {box_uptime_s() / 3600:.1f}h, governor {box_governor()}",
+        "TRACED:      timings are diagnostic and not comparable to scale's",
+        "",
+    ]
+    outsiders = sorted({r["outsiders"] for s in names for rs in results[s].values()
+                        for r in rs if r.get("outsiders")})
+    if outsiders:
+        lines.insert(9, f"BESIDE:      {'; '.join(outsiders)}")
+    for scen in scen_names:
+        lines.append(f"SCENARIO {scen.upper()}")
+        lines.append(table_header("METRIC", names, 26, 20))
+        for key, label, fmt in PROBE_ROWS:
+            cols = [_probe_cell([r[key] for r in results[s].get(scen, []) if key in r], fmt)
+                    for s in names]
+            if all(c == "-" for c in cols):
+                continue
+            lines.append(table_row(label, cols, 26, 20))
+        lines.append("")
+        # montauk's own verdicts, verbatim: It is the instrument.
+        for s in names:
+            for r in results[s].get(scen, []):
+                if r.get("stall_verdict"):
+                    lines.append(f"dispatch-stall, probe, {s}: {r['stall_verdict']}")
+                if r.get("locality_verdict"):
+                    lines.append(f"locality, box, {s}: {r['locality_verdict']}")
+        lines.append("")
+    for s, reason in skipped.items():
+        lines.append(f"SKIPPED: {s} -- {reason}")
+    path = LOG_DIR / f"prism-probe-{stamp}.log"
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def _write_probe_prom(ver, git, stamp, ncpus, drain, duration, results,
+                      names, skipped) -> Path:
+    path = LOG_DIR / f"prism-probe-{stamp}.prom"
+    pb = PrometheusBuilder("probe")
+    try:
+        ts = int(datetime.strptime(stamp, "%Y%m%d-%H%M%S").timestamp())
+    except ValueError:
+        ts = None
+    pb.info(ts=ts, version=ver, git_commit=git["commit"],
+            git_dirty=git.get("dirty", False))
+    pb.gauge("cpus", ncpus, help="CPUs online")
+    pb.gauge("drain_cpu", drain, help="the CPU montauk drained on, outside the load")
+    pb.gauge("duration_s", f"{duration:.1f}", help="longrun seconds per capture")
+    pb.gauge("uptime_s", f"{box_uptime_s():.0f}", help="box uptime at the report")
+    for sched, reason in skipped.items():
+        pb.gauge("scheduler_skipped", 1,
+                 help="scheduler crashed or failed to activate (not measured)",
+                 labels={"scheduler": sched,
+                         "reason": reason.splitlines()[0].replace('"', "'")})
+    for sched in names:
+        for scen, runs in results[sched].items():
+            for key, _label, _fmt in PROBE_ROWS:
+                vals = [r[key] for r in runs if key in r]
+                if not vals:
+                    continue
+                m, sd = mean_stdev(vals)
+                lab = {"scheduler": sched, "scenario": scen}
+                pb.gauge(key, f"{m:.6f}", help=f"probe capture {key}",
+                         labels={**lab, "stat": "mean"})
+                pb.gauge(key, f"{sd:.6f}", labels={**lab, "stat": "stdev"})
+    path.write_text(pb.render())
+    return path
+
+
+def cmd_bench_probe(args) -> int:
+    """The latency probe under scale's longrun and mixed loads, traced whole."""
+    if not getattr(args, "trace", False):
+        log_error("prism-probe is a capture: it runs under --trace and nothing else")
+        return 2
+    if not montauk_available():
+        log_error("montauk not found -- prism-probe cannot capture")
+        return 1
+    scen_names = ([s.strip() for s in (args.scenarios or "").split(",") if s.strip()]
+                  or list(PROBE_SCENARIOS))
+    unknown = [s for s in scen_names if s not in PROBE_SCENARIOS]
+    if unknown:
+        log_error(f"unknown scenario(s): {', '.join(unknown)} (latency, longrun, mixed)")
+        return 2
+
+    nuke_stale_build()
+    if not build():
+        return 1
+    if is_scx_active():
+        log_warn(f"sched_ext is active ({scx_scheduler_name()}) -- stopping pandemonium service")
+        stop_systemd_scheduler()
+        if not wait_for_deactivation(5.0):
+            log_error("Could not deactivate sched_ext -- is another scheduler running?")
+            return 1
+
+    ncpus = get_online_cpus()
+    if ncpus < 3:
+        log_error("prism-probe needs three CPUs: two for the load and one drain core")
+        return 1
+    # THE DRAIN CORE IS EXCLUSIVE. Under a saturated load an unpinned montauk is
+    # starved by its own subject and drops the windows worth measuring, and a
+    # montauk pinned to a CPU the load also covers contends with it there. The
+    # load takes every CPU but the last; montauk takes the last alone.
+    drain = ncpus - 1
+    load_cpus = ncpus - 1
+
+    if getattr(args, "pandemonium_only", False):
+        entries: list[tuple[str, list[str] | None]] = [
+            ("PANDEMONIUM (BPF)", [str(BINARY), "--verbose", "--no-adaptive"]),
+            ("PANDEMONIUM (ADAPTIVE)", [str(BINARY), "--verbose"]),
+        ]
+    else:
+        _sl = args.schedulers or []
+        if isinstance(_sl, str):
+            _sl = [s.strip() for s in _sl.split(",") if s.strip()]
+        _named = {str(s).strip().lower() for s in _sl}
+        _field_only = bool(_sl)
+        entries = [("EEVDF", None)]
+        if (not _field_only) or (_named & {"pandemonium", "scx_pandemonium"}):
+            entries.append(("PANDEMONIUM (BPF)", [str(BINARY), "--verbose", "--no-adaptive"]))
+            entries.append(("PANDEMONIUM (ADAPTIVE)", [str(BINARY), "--verbose"]))
+        for name in _sl:
+            if str(name).strip().lower() in ("pandemonium", "scx_pandemonium", "eevdf"):
+                continue
+            path = find_scheduler(name)
+            if path:
+                entries.append((name, [name]))
+            else:
+                log_warn(f"SKIPPING {name} (not installed)")
+
+    version = get_version()
+    git = get_git_info()
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    iterations = max(1, args.iterations)
+    log_info(f"prism-probe: {', '.join(n for n, _ in entries)}; "
+             f"{', '.join(scen_names)}; load on {load_cpus} CPUs, montauk on cpu{drain}")
+
+    # Everything spawned from here inherits the load mask; montauk's taskset
+    # sets its own.
+    os.sched_setaffinity(0, set(range(load_cpus)))
+
+    results: dict[str, dict[str, list[dict]]] = {n: {s: [] for s in scen_names}
+                                                 for n, _ in entries}
+    skipped: dict[str, str] = {}
+    recs = 0
+    try:
+        for it in range(iterations):
+            k = it % len(entries)
+            for sched_name, sched_cmd in entries[k:] + entries[:k]:
+                if sched_name in skipped:
+                    continue
+                guard = None
+                if sched_cmd is not None:
+                    settle = 10.0 if "ADAPTIVE" in sched_name else 5.0
+                    guard = start_and_wait(sched_cmd, sched_name, settle_secs=settle)
+                    if guard is None:
+                        # THE REPORT CARRIES WHAT THE LOADER SAID, SO A FAILED
+                        # ARM IS DIAGNOSABLE FROM THE ARTIFACT ALONE.
+                        said = pandemonium_common.last_activation_failure
+                        skipped[sched_name] = "failed to activate" + (
+                            "\n" + said if said else "")
+                        log_error(f"[{sched_name}] failed to activate -- SKIPPED")
+                        continue
+                safe = sched_name.replace(" ", "-").replace("(", "").replace(")", "")
+                try:
+                    for scen in scen_names:
+                        label = f"probe-{scen}-{safe}" + (f"-{it + 1}" if iterations > 1 else "")
+                        c_start = cpu_max_c()
+                        out_cpu, out_names = box_outsiders()
+                        log_info(f"[{sched_name}] {scen}: tracing"
+                                 + (f" (beside {out_names})" if out_names else ""))
+                        # THE KICK AND DSQ PROBES ARE ARMED: A FLOORED WAKE'S
+                        # QUESTION IS WHICH QUEUE IT SAT ON AND WHETHER ITS KICK
+                        # WAS ISSUED AND ANSWERED, WHICH THE BASE STREAM CANNOT SAY.
+                        with montauk_trace(PROBE_TRACE_PATTERN, label, stamp,
+                                           events=True, pin_cpu=drain,
+                                           sched_detail=True, scx_storm=True,
+                                           scx_dsq=True,
+                                           trace_classes=PROBE_TRACE_CLASSES) as rec:
+                            if scen == "latency":
+                                res = measure_latency(
+                                    probe_tool(), load_cpus, iterations=1,
+                                    duration_secs=int(args.duration))
+                            elif scen == "longrun":
+                                res = measure_longrun(
+                                    probe_tool(), load_cpus,
+                                    longrun_count=max(4, load_cpus // 2),
+                                    longrun_secs=args.duration)
+                            else:
+                                res = measure_mixed(
+                                    probe_tool(), load_cpus,
+                                    longrun_count=max(4, load_cpus // 2),
+                                    longrun_secs=2 * args.duration,
+                                    burst_size=max(8, load_cpus * 4))
+                        recs += 1
+                        c_end = cpu_max_c()
+                        if sched_ejected(guard):
+                            skipped[sched_name] = f"crashed during {scen}"
+                            log_error(f"[{sched_name}] CRASHED during {scen}")
+                            break
+                        lat = res.get("latency") or res
+                        m: dict = {
+                            "probe_p50_us": float(lat.get("median_us", 0)),
+                            "probe_p99_us": float(lat.get("p99_us", 0)),
+                            "probe_worst_us": float(lat.get("worst_us", 0)),
+                            "work_total": float(res.get("work_total", 0)),
+                        }
+                        if c_start is not None:
+                            m["cpu_max_c_start"] = c_start
+                        if c_end is not None:
+                            m["cpu_max_c_end"] = c_end
+                        m["outsider_cpu_pct"] = out_cpu
+                        if out_names:
+                            m["outsiders"] = out_names
+                        m.update(_probe_readings(rec.events_path, res.get("probe_pid")))
+                        results[sched_name][scen].append(m)
+                        w99 = m.get("wake2run_p99_us")
+                        tf = m.get("wake2run_tickfloor_pct")
+                        log_info(f"[{sched_name}] {scen}: probe p99 {m['probe_p99_us']:.0f}us"
+                                 f"  wake2run p99 {w99:.0f}us" if w99 is not None else
+                                 f"[{sched_name}] {scen}: probe p99 {m['probe_p99_us']:.0f}us")
+                        if tf is not None:
+                            log_info(f"[{sched_name}] {scen}: tick-floor wakes {tf:.2f}%"
+                                     f"  {m.get('stall_class', '')} -> {rec.dir}")
+                finally:
+                    if guard is not None:
+                        stop_and_wait(guard)
+                # THE REPORT IS WRITTEN AFTER EVERY ARM, NOT ONLY AT THE END, SO
+                # A RUN CUT SHORT STILL LEAVES WHAT IT MEASURED ON DISK.
+                done = [n for n, _ in entries if any(results[n].values())]
+                if done:
+                    _chown_to_invoking_user(
+                        _write_probe_report(version, git, stamp, ncpus, drain,
+                                            args.duration, iterations, results,
+                                            done, scen_names, skipped),
+                        _write_probe_prom(version, git, stamp, ncpus, drain,
+                                          args.duration, results, done, skipped))
+                time.sleep(2)
+    except KeyboardInterrupt:
+        log.interrupted()
+    finally:
+        if is_scx_active():
+            wait_for_deactivation(5.0)
+
+    names = [n for n, _ in entries if any(results[n].values())]
+    if not names:
+        log_error("no scheduler produced a capture")
+        return 1
+    report = _write_probe_report(version, git, stamp, ncpus, drain, args.duration,
+                                 iterations, results, names, scen_names, skipped)
+    prom = _write_probe_prom(version, git, stamp, ncpus, drain, args.duration,
+                             results, names, skipped)
+    _chown_to_invoking_user(report, prom)
+    print()
+    log.report(report.read_text())
+    log_info(f"TRACE COMPLETE: {recs} recording(s) under /tmp/pandemonium")
+    log_info(f"REPORT: {report}")
+    log_info(f"METRICS: {prom}")
+    return 0
+
+
 def cmd_bench_sys(args) -> int:
     """Live system telemetry capture. Run a scheduler, use your desktop,
     Ctrl+C when done. Writes Prometheus metrics from the session.
@@ -4819,7 +5148,7 @@ def cmd_bench_sys(args) -> int:
             return 1
         log_info("Starting latency probe (unpinned)")
         probe_proc = subprocess.Popen(
-            [str(BINARY), "probe"],
+            [str(probe_tool()), "probe"],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         )
 
@@ -6236,7 +6565,7 @@ def cmd_low_cpu_deadline(args) -> int:
                 continue
 
             try:
-                r = measure_deadline(BINARY, nr_cpus,
+                r = measure_deadline(probe_tool(), nr_cpus,
                                      target_fps=60,
                                      duration_secs=args.duration,
                                      threshold_us=500)
@@ -6313,6 +6642,9 @@ def main() -> int:
     bench.add_argument("--launch", action="store_true",
                        help="Launch-only mode: run only fork+exec latency "
                             "test under load")
+    bench.add_argument("--compile", action="store_true",
+                       help="Compile-only mode: run only the compile cell "
+                            "(the self-build, or --cmd)")
     bench.add_argument("--pandemonium-only", action="store_true",
                        help="Skip EEVDF and external schedulers, run only "
                             "PANDEMONIUM (BPF) and PANDEMONIUM (ADAPTIVE)")
@@ -6321,18 +6653,34 @@ def main() -> int:
                             "pand-ipc recording (raw per-event log) to "
                             "/tmp/pandemonium -- resolves individual RTTs at the "
                             "tick floor. Diagnostic; latency numbers are "
-                            "contaminated. Pairs with --ipc (also via prism-ipc).")
-    bench.add_argument("--scx-storm", action="store_true",
-                       help="Arm montauk's scx storm probes for the --trace "
-                            "recording (fentry/scx_bpf_kick_cpu, fexit/"
-                            "scx_bpf_reenqueue_local, fentry/resched_curr). "
-                            "Without them kick-latency reads NONE and a kick "
-                            "cannot be paired against the resched that should "
-                            "answer it. HAZARD: sched-ext/scx#3687 Bug 1 faults "
-                            "on the two KFUNC probes under a live scx load; it "
-                            "was filed against 7.1.2 and this is the 7.2+ arm "
-                            "the note gated on. Implies --trace.")
+                            "contaminated. Pairs with --ipc (also via prism-ipc). "
+                            "With --compile, one extra build per arm records "
+                            "the build's process tree; it is not timed.")
 
+
+    probe_bench = sub.add_parser("prism-probe",
+                                 help="The latency probe under the longrun and "
+                                      "mixed loads, traced whole (capture-only)")
+    probe_bench.add_argument("--iterations", type=int, default=1,
+                             help="Captures per scheduler and scenario (default: 1)")
+    probe_bench.add_argument("--schedulers", type=str,
+                             default=",".join(DEFAULT_EXTERNALS),
+                             help="Comma-separated external schedulers; a named "
+                                  "list is the whole field against EEVDF")
+    probe_bench.add_argument("--cores", type=str, default=None,
+                             help="Accepted for suite uniformity; prism-probe runs "
+                                  "at native width with one CPU kept for montauk")
+    probe_bench.add_argument("--duration", type=float, default=10.0,
+                             help="Seconds per latency and longrun capture; mixed "
+                                  "runs twice that (default: 10)")
+    probe_bench.add_argument("--scenarios", type=str, default="",
+                             help="Comma-separated subset of latency,longrun,mixed "
+                                  "(default: all three)")
+    probe_bench.add_argument("--pandemonium-only", action="store_true",
+                             help="Skip EEVDF and external schedulers")
+    probe_bench.add_argument("--trace", action="store_true",
+                             help="Record the montauk capture. prism-probe is a "
+                                  "capture and refuses to run without it")
 
     contention_bench = sub.add_parser("prism-contention",
                                       help="Contention stress test for v5.4.x adaptive features")
@@ -6400,7 +6748,8 @@ def main() -> int:
     coldwake_bench = sub.add_parser("prism-coldwake",
         help="Cold-wake latency vs frequency-at-wake (idle->bare-wake, powersave)")
     coldwake_bench.add_argument("--trace", action="store_true",
-        help="Capture montauk recordings of the cold-wake cycle (the only mode)")
+        help="Capture montauk recordings of the cold-wake or storm cycle. "
+             "Required: this bench is a capture")
     coldwake_bench.add_argument("--duration", type=int, default=60,
         help="Cold-wake cycle window seconds per scheduler arm (default: 60)")
     coldwake_bench.add_argument("--dwell", type=int, default=2,
@@ -6462,11 +6811,6 @@ def main() -> int:
                      help="Max allowed miss ratio (default: 0.10 = 10%%)")
 
     args = parser.parse_args()
-    # --scx-storm arms probes around the --trace recording, so it implies it.
-    # Stated here rather than in the help alone: a user who passes only
-    # --scx-storm gets the capture, not a silent no-op.
-    if getattr(args, "scx_storm", False) and not getattr(args, "trace", False):
-        args.trace = True
 
     if args.command is None:
         parser.print_help()
@@ -6478,6 +6822,8 @@ def main() -> int:
 
     if args.command == "prism-scale":
         return cmd_bench_scale(args)
+    if args.command == "prism-probe":
+        return cmd_bench_probe(args)
     if args.command == "prism-contention":
         return cmd_bench_contention(args)
     if args.command == "prism-sys":

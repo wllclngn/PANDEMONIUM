@@ -13,7 +13,7 @@ import subprocess
 import sys
 import time
 
-from pandemonium_common import BINARY, percentile
+from pandemonium_common import percentile, probe_tool
 
 IPC_COMM = "pand-ipc"
 IPC_RTT_PRIMS = ["pipe", "socket", "eventfd", "sem"]
@@ -96,7 +96,7 @@ def ipc_start_stress(cores, reserve=()):
         if cpu in reserve:
             continue
         workers.append(subprocess.Popen(
-            [str(BINARY), "stress-worker", "--cpu", str(cpu)],
+            [str(probe_tool()), "stress-worker", "--cpu", str(cpu)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
     return workers
 

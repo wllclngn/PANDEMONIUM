@@ -1,0 +1,15 @@
+# Dockerfile.kbuild -- builds kernels from source. Nothing here runs qemu.
+#
+# bc is the reason this exists as a container at all: the kernel build needs it
+# for timeconst.h and the host does not carry it. pahole is what turns
+# DEBUG_INFO into BTF; without it DEBUG_INFO_BTF silently drops out of the
+# resolved config, which payloads/build_kernel.py refuses.
+
+FROM archlinux:base-devel
+
+RUN pacman -Syu --noconfirm --needed \
+      bc pahole flex bison cpio python perl libelf openssl zstd xz \
+      clang lld llvm \
+ && pacman -Scc --noconfirm
+
+WORKDIR /obj

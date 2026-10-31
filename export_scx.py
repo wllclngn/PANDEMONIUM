@@ -3,28 +3,50 @@
 # AUTOMATES THE IMPORT PROCESS FOR sched-ext/scx.
 #
 # USAGE:
-#   ./export_scx.py /path/to/scx
+#   ./export_scx.py /path/to/scx [--ported HASH ...]
+#
+# BEFORE ANYTHING IS TOUCHED:
+#   FETCHES THE sched-ext REMOTE AND REFUSES IF ANY COMMIT TOUCHED THE CRATE
+#   SINCE OUR LAST RELEASE THERE. THE EXPORT REPLACES THE CRATE WHOLESALE, SO AN
+#   UNPORTED UPSTREAM EDIT WOULD BE REVERTED. PORT EACH ONE INTO THIS TREE, THEN
+#   RERUN WITH --ported NAMING EVERY LISTED HASH
+#   READS scx's SCHEDULER CATALOG (services/catalog.json), WHICH scxcli AND
+#   scxtui START SCHEDULERS FROM, AND REFUSES IF IT NO LONGER LISTS
+#   scx_pandemonium FEATURED OR STABLE, OR IF catalog/profiles.json BREAKS
+#   THE CATALOG's RULES FOR A CUSTOM PROFILE
 #
 # WHAT IT DOES:
-#   1. COPIES SOURCE FILES INTO scheds/rust/scx_pandemonium/
+#   1. COPIES SOURCE FILES INTO scheds/rust/scx_pandemonium/, catalog/profiles.json
+#      INCLUDED: THE BPF ARM's PROFILE FOR AN ADMINISTRATOR's /etc/scx/catalog.json,
+#      SINCE scx's SHIPPED CATALOG TAKES NO PROFILE WITH OPTIONS
 #   2. RENAMES CRATE: pandemonium -> scx_pandemonium
 #   3. STRIPS [profile.release] (WORKSPACE PROVIDES ITS OWN)
 #   4. REPLACES build.rs WITH scx_cargo::BpfBuilder (MATCHES OTHER SCHEDULERS)
 #   5. SWAPS libbpf-cargo FOR scx_cargo PATH+VERSION DEP
 #   6. STRIPS default-features=false FROM libbpf-rs (ENABLES VENDORED LIBBPF FOR CI)
 #   7. PATCHES bpf_skel.rs INCLUDE PATH FOR BpfBuilder OUTPUT
-#   8. PATCHES intf.h WITH BINDGEN-COMPATIBLE TYPE DEFINITIONS
-#   9. ADDS WORKSPACE MEMBER TO ROOT Cargo.toml IF MISSING
+#   8. ADDS WORKSPACE MEMBER TO ROOT Cargo.toml IF MISSING
+#   9. FORMATS, UPDATES Cargo.lock, THEN FAILS ON cargo fmt --check OR A FAILED
+#      cargo build OF THE CRATE
+#  10. WRITES THE PR BODY FROM COMMIT_MESSAGE.txt TO /tmp/pandemonium/ WHEN THE
+#      TREE HAS ONE (THE PUBLISHED TREE DOES NOT)
+#
+# THE BPF SOURCE IS COPIED AS IT STANDS: IT IS WRITTEN AGAINST THE SAME scx
+# HEADER API THE MONOREPO BUILDS IT WITH.
 #
 # WHAT IT DOES NOT DO:
 #   - DOES NOT COMMIT OR PUSH ANYTHING
-#   - DOES NOT MODIFY Cargo.lock (RUN cargo update AFTER)
 
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+
+from pandemonium_common import (
+    get_git_info, get_version, log, log_error, log_info, log_warn, scx_profiles,
+)
 
 CRATE_OLD = "pandemonium"
 CRATE_NEW = "scx_pandemonium"
@@ -37,6 +59,7 @@ INCLUDE = [
     "LICENSE",
     "README.md",
     "build.rs",
+    "catalog/",
     "src/",
     "veristat/",
 ]
@@ -69,12 +92,11 @@ def assert_export_is_exactly_include(dst_root):
     present = set(os.listdir(dst_root))
     unexpected = sorted(present - permitted)
     if unexpected:
-        print("\n  ABORT: the export tree holds entries INCLUDE does not name:")
-        for f in unexpected:
-            print(f"    {f}")
+        log_error("the export tree holds entries INCLUDE does not name: "
+                  + ", ".join(unexpected))
         shutil.rmtree(dst_root, ignore_errors=True)
         raise SystemExit(2)
-    print(f"  VERIFY: export tree matches INCLUDE exactly ({len(present)} entries)")
+    log_info(f"export tree matches INCLUDE exactly ({len(present)} entries)")
 
 def copy_tree(src_root, dst_root):
     """Copy INCLUDE paths from src_root to dst_root, skipping EXCLUDE."""
@@ -84,7 +106,7 @@ def copy_tree(src_root, dst_root):
         dst = os.path.join(dst_root, entry)
 
         if not os.path.exists(src):
-            print(f"  SKIP (missing): {entry}")
+            log_warn(f"skipped {entry}: missing")
             continue
 
         if os.path.isdir(src):
@@ -92,18 +114,18 @@ def copy_tree(src_root, dst_root):
                 shutil.rmtree(dst)
             shutil.copytree(src, dst, ignore=shutil.ignore_patterns(*EXCLUDE))
             count = sum(len(files) for _, _, files in os.walk(dst))
-            print(f"  COPY DIR: {entry} ({count} files)")
+            log_info(f"copied {entry} ({count} files)")
             copied += count
         else:
             # EXCLUDE reaches the directory walk through ignore_patterns and never
             # reached this branch, so a skipped name listed in INCLUDE would have
             # copied cleanly. Check it here too.
             if os.path.basename(entry) in EXCLUDE:
-                print(f"  SKIP (excluded): {entry}")
+                log_warn(f"skipped {entry}: excluded")
                 continue
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             shutil.copy2(src, dst)
-            print(f"  COPY: {entry}")
+            log_info(f"copied {entry}")
             copied += 1
 
     return copied
@@ -123,7 +145,7 @@ def rename_crate(dst_root):
         )
         if new_text != text:
             open(cargo_path, "w").write(new_text)
-            print(f"  RENAME: Cargo.toml package name -> {CRATE_NEW}")
+            log_info(f"renamed the Cargo.toml package to {CRATE_NEW}")
             changes += 1
 
     # .rs files: use pandemonium:: -> use scx_pandemonium::
@@ -146,7 +168,7 @@ def rename_crate(dst_root):
             if new_text != text:
                 open(fpath, "w").write(new_text)
                 rel = os.path.relpath(fpath, dst_root)
-                print(f"  RENAME: {rel}")
+                log_info(f"renamed crate references in {rel}")
                 changes += 1
 
     return changes
@@ -163,7 +185,7 @@ def strip_profile_release(dst_root):
 
     if new_text != text:
         open(cargo_path, "w").write(new_text.rstrip() + "\n")
-        print("  STRIP: [profile.release] (workspace provides its own)")
+        log_info("stripped [profile.release] (the workspace provides its own)")
         return 1
     return 0
 
@@ -216,7 +238,7 @@ def replace_build_rs(dst_root):
     """Replace standalone build.rs with scx_cargo::BpfBuilder version."""
     build_rs = os.path.join(dst_root, "build.rs")
     open(build_rs, "w").write(SCX_BUILD_RS)
-    print("  REPLACE: build.rs -> scx_cargo::BpfBuilder")
+    log_info("replaced build.rs with scx_cargo::BpfBuilder")
     return 1
 
 
@@ -224,12 +246,12 @@ def read_scx_cargo_version(scx_root):
     """Read scx_cargo version from the monorepo's rust/scx_cargo/Cargo.toml."""
     cargo_path = os.path.join(scx_root, "rust", "scx_cargo", "Cargo.toml")
     if not os.path.exists(cargo_path):
-        print(f"  WARNING: {cargo_path} not found, falling back to wildcard version")
+        log_warn(f"{cargo_path} not found, falling back to wildcard version")
         return "*"
     text = open(cargo_path).read()
     m = re.search(r'^version\s*=\s*"([^"]+)"', text, re.MULTILINE)
     if not m:
-        print(f"  WARNING: no version found in {cargo_path}, falling back to wildcard")
+        log_warn(f"no version found in {cargo_path}, falling back to wildcard")
         return "*"
     return m.group(1)
 
@@ -248,9 +270,9 @@ def swap_build_deps(dst_root, scx_root):
     )
     if new_text != text:
         open(cargo_path, "w").write(new_text)
-        print(f"  SWAP: libbpf-cargo -> scx_cargo (version {version})")
+        log_info(f"swapped libbpf-cargo for scx_cargo {version}")
         return 1
-    print("  WARNING: libbpf-cargo not found in [build-dependencies]")
+    log_warn("libbpf-cargo not found in [build-dependencies]")
     return 0
 
 
@@ -271,9 +293,9 @@ def fix_libbpf_vendoring(dst_root):
     )
     if new_text != text:
         open(cargo_path, "w").write(new_text)
-        print("  FIX: libbpf-rs default-features = false stripped (enables vendored libbpf)")
+        log_info("stripped default-features = false from libbpf-rs (vendored libbpf)")
         return 1
-    print("  FIX: libbpf-rs already uses default features")
+    log_info("libbpf-rs already uses default features")
     return 0
 
 
@@ -312,96 +334,9 @@ def normalize_dep_versions(dst_root):
 
     if new_text != text:
         open(cargo_path, "w").write(new_text)
-        print("  NORMALIZE: dependency versions reduced to API boundaries")
+        log_info("reduced dependency versions to API boundaries")
         return 1
-    print("  NORMALIZE: versions already normalized")
-    return 0
-
-
-def patch_intf_types(dst_root):
-    """Add portable type definitions so bindgen can parse intf.h without vmlinux.h."""
-    intf_path = os.path.join(dst_root, "src", "bpf", "intf.h")
-    if not os.path.exists(intf_path):
-        print("  WARNING: src/bpf/intf.h not found")
-        return 0
-
-    text = open(intf_path).read()
-
-    # Insert unconditional typedefs after the include guard.
-    # C11+ (and C23 which PANDEMONIUM targets) allows duplicate compatible
-    # typedefs, so these coexist safely with vmlinux.h during BPF compilation.
-    # scx_utils defines __bpf__ during bindgen, so a #ifndef guard won't work.
-    type_compat = (
-        "\n// BINDGEN/SCX COMPATIBILITY: provide kernel types unconditionally.\n"
-        "// vmlinux.h also typedefs these in BPF context; C11+ permits\n"
-        "// duplicate compatible typedefs, so no conflict.\n"
-        "typedef unsigned long long u64;\n"
-        "typedef unsigned char u8;\n"
-    )
-
-    anchor = "#define __INTF_H\n"
-    if anchor not in text:
-        print("  WARNING: intf.h missing expected include guard, skipping type patch")
-        return 0
-
-    if "typedef unsigned long long u64;" in text:
-        print("  PATCH: intf.h type compatibility already present")
-        return 0
-
-    new_text = text.replace(anchor, anchor + type_compat)
-    open(intf_path, "w").write(new_text)
-    print("  PATCH: intf.h type compatibility (u64/u8 for bindgen)")
-    return 1
-
-
-def patch_dsq_move_to_local(dst_root):
-    """Add enq_flags=0 to scx_bpf_dsq_move_to_local() calls for scx monorepo.
-
-    Standalone uses a 1-arg compat macro. scx monorepo uses the 2-arg native API.
-    """
-    bpf_path = os.path.join(dst_root, "src", "bpf", "main.bpf.c")
-    if not os.path.exists(bpf_path):
-        print("  WARNING: src/bpf/main.bpf.c not found")
-        return 0
-
-    text = open(bpf_path).read()
-    token = "scx_bpf_dsq_move_to_local("
-    parts = []
-    count = 0
-    i = 0
-
-    while i < len(text):
-        j = text.find(token, i)
-        if j == -1:
-            parts.append(text[i:])
-            break
-
-        parts.append(text[i:j + len(token)])
-        i = j + len(token)
-
-        # find matching close paren
-        depth = 1
-        k = i
-        while k < len(text) and depth > 0:
-            if text[k] == '(':
-                depth += 1
-            elif text[k] == ')':
-                depth -= 1
-            k += 1
-
-        inner = text[i:k - 1]
-        if not inner.rstrip().endswith(", 0"):
-            parts.append(inner + ", 0)")
-            count += 1
-        else:
-            parts.append(inner + ")")
-        i = k
-
-    if count:
-        open(bpf_path, "w").write("".join(parts))
-        print(f"  PATCH: scx_bpf_dsq_move_to_local -> 2-arg ({count} calls)")
-        return count
-    print("  PATCH: scx_bpf_dsq_move_to_local already 2-arg")
+    log_info("dependency versions already normalized")
     return 0
 
 
@@ -409,12 +344,12 @@ def read_scx_utils_version(scx_root):
     """Read scx_utils version from the monorepo's rust/scx_utils/Cargo.toml."""
     cargo_path = os.path.join(scx_root, "rust", "scx_utils", "Cargo.toml")
     if not os.path.exists(cargo_path):
-        print(f"  WARNING: {cargo_path} not found, falling back to wildcard version")
+        log_warn(f"{cargo_path} not found, falling back to wildcard version")
         return "*"
     text = open(cargo_path).read()
     m = re.search(r'^version\s*=\s*"([^"]+)"', text, re.MULTILINE)
     if not m:
-        print(f"  WARNING: no version found in {cargo_path}, falling back to wildcard")
+        log_warn(f"no version found in {cargo_path}, falling back to wildcard")
         return "*"
     return m.group(1)
 
@@ -426,7 +361,7 @@ def add_scx_utils_dep(dst_root, scx_root):
     text = open(cargo_path).read()
 
     if "scx_utils" in text:
-        print("  DEP: scx_utils already present")
+        log_info("scx_utils dependency already present")
         return 0
 
     scx_utils_line = f'scx_utils = {{ path = "../../../rust/scx_utils", version = "{version}" }}'
@@ -437,9 +372,9 @@ def add_scx_utils_dep(dst_root, scx_root):
     )
     if new_text != text:
         open(cargo_path, "w").write(new_text)
-        print(f"  DEP: added scx_utils (version {version})")
+        log_info(f"added scx_utils {version}")
         return 1
-    print("  WARNING: could not find [dependencies] section")
+    log_warn("could not find the [dependencies] section")
     return 0
 
 
@@ -451,7 +386,7 @@ def patch_version_display(dst_root):
     """
     main_path = os.path.join(dst_root, "src", "main.rs")
     if not os.path.exists(main_path):
-        print("  WARNING: src/main.rs not found")
+        log_warn("src/main.rs not found")
         return 0
 
     text = open(main_path).read()
@@ -535,9 +470,9 @@ def patch_version_display(dst_root):
 
     if changes:
         open(main_path, "w").write(text)
-        print(f"  PATCH: main.rs version display -> scx_utils::build_id ({changes} changes)")
+        log_info(f"patched the main.rs version display to scx_utils::build_id ({changes} changes)")
         return changes
-    print("  PATCH: main.rs version display already patched")
+    log_info("main.rs version display already patched")
     return 0
 
 
@@ -550,13 +485,13 @@ def patch_ops_version_suffix(dst_root):
     """
     sched_path = os.path.join(dst_root, "src", "scheduler.rs")
     if not os.path.exists(sched_path):
-        print("  WARNING: src/scheduler.rs not found")
+        log_warn("src/scheduler.rs not found")
         return 0
 
     text = open(sched_path).read()
 
     if "ops_version_suffix" in text:
-        print("  PATCH: ops version suffix already present")
+        log_info("ops version suffix already present")
         return 0
 
     # Insert version suffix injection between open and load
@@ -592,12 +527,12 @@ def patch_ops_version_suffix(dst_root):
 
     old_anchor = '        let mut open_skel = builder.open(open_object)?;'
     if old_anchor not in text:
-        print("  WARNING: could not find open_skel anchor in scheduler.rs")
+        log_warn("could not find the open_skel anchor in scheduler.rs")
         return 0
 
     new_text = text.replace(old_anchor, inject_block)
     open(sched_path, "w").write(new_text)
-    print("  PATCH: scheduler.rs ops version suffix (scx_loader GUI)")
+    log_info("patched scheduler.rs with the ops version suffix (scx_loader GUI)")
     return 1
 
 
@@ -605,13 +540,13 @@ def patch_bpf_skel_include(dst_root):
     """Patch bpf_skel.rs include path for BpfBuilder output filename."""
     skel_path = os.path.join(dst_root, "src", "bpf_skel.rs")
     if not os.path.exists(skel_path):
-        print("  WARNING: src/bpf_skel.rs not found")
+        log_warn("src/bpf_skel.rs not found")
         return 0
     text = open(skel_path).read()
     new_text = text.replace("/bpf.skel.rs", "/main_skel.rs")
     if new_text != text:
         open(skel_path, "w").write(new_text)
-        print("  PATCH: bpf_skel.rs include path (bpf.skel.rs -> main_skel.rs)")
+        log_info("patched the bpf_skel.rs include path to main_skel.rs")
         return 1
     return 0
 
@@ -620,14 +555,14 @@ def add_workspace_member(scx_root):
     """Add scx_pandemonium to workspace Cargo.toml members if missing."""
     cargo_path = os.path.join(scx_root, "Cargo.toml")
     if not os.path.exists(cargo_path):
-        print(f"  WARNING: {cargo_path} not found, skipping workspace registration")
+        log_warn(f"{cargo_path} not found, skipping workspace registration")
         return 0
 
     text = open(cargo_path).read()
     member_line = f'    "{DEST_REL}",'
 
     if DEST_REL in text:
-        print("  WORKSPACE: already registered")
+        log_info("workspace member already registered")
         return 0
 
     # Find the members array and insert alphabetically
@@ -658,106 +593,230 @@ def add_workspace_member(scx_root):
 
     if inserted:
         open(cargo_path, "w").write("\n".join(new_lines))
-        print(f"  WORKSPACE: added {DEST_REL} to members")
+        log_info(f"added {DEST_REL} to workspace members")
         return 1
 
-    print(f"  WARNING: could not find insertion point in workspace Cargo.toml")
+    log_warn("could not find an insertion point in workspace Cargo.toml")
     return 0
 
 
-def main():
-    if len(sys.argv) != 2:
-        print(f"Usage: {sys.argv[0]} /path/to/scx")
+def git(cwd, *args):
+    return subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True)
+
+
+def upstream_remote(scx_root):
+    """The remote that points at sched-ext/scx."""
+    r = git(scx_root, "remote", "-v")
+    for line in r.stdout.splitlines():
+        name, url = line.split()[:2]
+        if "sched-ext/scx" in url:
+            return name
+    log_error(f"no remote in {scx_root} points at sched-ext/scx")
+    sys.exit(1)
+
+
+def require_upstream_ported(scx_root, ported):
+    """Refuse while a crate commit since our last upstream release is unported.
+
+    The last release is the newest commit on the remote's main whose subject
+    starts PANDEMONIUMv or scx_pandemoniumv and that touches the crate.
+    """
+    remote = upstream_remote(scx_root)
+    r = git(scx_root, "fetch", "-q", remote, "main")
+    if r.returncode != 0:
+        log_error(f"git fetch {remote} main failed: {r.stderr.strip()}")
+        sys.exit(1)
+    main_ref = f"{remote}/main"
+    r = git(scx_root, "log", main_ref, "-1", "--format=%h", "-i", "-E",
+            "--grep=^(scx_)?pandemoniumv[0-9]", "--", DEST_REL)
+    last = r.stdout.strip()
+    if not last:
+        log_error(f"no PANDEMONIUM release found on {main_ref}")
+        sys.exit(1)
+    r = git(scx_root, "log", "--no-merges", "--format=%h%x09%an%x09%s",
+            f"{last}..{main_ref}", "--", DEST_REL)
+    since = [line.split("\t") for line in r.stdout.splitlines()]
+    unported = [c for c in since
+                if not any(c[0].startswith(p) or p.startswith(c[0]) for p in ported)]
+    log_info(f"last release {last}, {len(since)} crate commit(s) since")
+    if unported:
+        log_error(f"{len(unported)} upstream commit(s) touched the crate since "
+                  f"{last}, and the export would revert them")
+        log_error("port each into this tree, then rerun with --ported naming every hash")
+        log.report("\n".join([f"{'HASH':<12}{'AUTHOR':<20}SUBJECT"]
+                             + [f"{h:<12}{author:<20}{subject}"
+                                for h, author, subject in unported]))
+        log_info(f"REVIEW: git -C {scx_root} show HASH -- {DEST_REL}")
         sys.exit(1)
 
-    scx_root = os.path.abspath(sys.argv[1])
+
+def require_catalog(scx_root):
+    """scx's catalog lists scx_pandemonium featured or stable, and the profiles
+    the crate ships pass the catalog's rules and take no name the catalog
+    already uses. scxcli and scxtui start schedulers from this catalog, and its
+    tier is how they present one."""
+    try:
+        profiles = scx_profiles()
+    except (OSError, ValueError) as e:
+        log_error(str(e))
+        sys.exit(1)
+    path = os.path.join(scx_root, "services", "catalog.json")
+    if not os.path.exists(path):
+        log_warn("services/catalog.json not found -- this scx predates the "
+                 "catalog; the profiles ship in the crate regardless")
+        return
+    with open(path) as f:
+        catalog = json.load(f)
+    tiers = [t for t in ("featured", "stable", "experimental", "hidden")
+             if CRATE_NEW in (catalog.get(t) or [])]
+    if not ({"featured", "stable"} & set(tiers)):
+        where = f"listed {'/'.join(tiers)} in" if tiers else "missing from"
+        log_error(f"{CRATE_NEW} is {where} scx's catalog "
+                  f"(services/catalog.json); scxcli and scxtui would not "
+                  f"present it as stable. Settle that in scx first")
+        sys.exit(1)
+    taken = ({r.get("id") for r in catalog.get("recommended", [])}
+             | {s for t in ("featured", "hidden", "stable", "experimental")
+                for s in (catalog.get(t) or [])})
+    clash = [p["id"] for p in profiles if p["id"] in taken]
+    if clash:
+        log_error(f"profile id(s) already taken in scx's catalog: {', '.join(clash)}")
+        sys.exit(1)
+    log_info(f"catalog: {CRATE_NEW} is {tiers[0]}; ships profile(s) "
+             + ", ".join(p["id"] for p in profiles))
+
+
+def run_checked(cmd, cwd, label):
+    """Run a command; print its output tail and exit on failure."""
+    r = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
+    if r.returncode != 0:
+        log_error(f"{label} failed: {' '.join(cmd)}")
+        log.report("\n".join((r.stdout + r.stderr).strip().splitlines()[-20:]))
+        sys.exit(1)
+    log_info(f"{label}: ok")
+
+
+def write_pr_body(pand_root):
+    """The PR description: COMMIT_MESSAGE.txt without the subject or epigraph,
+    one line per paragraph, bullet and section header. COMMIT_MESSAGE.txt is not
+    in the published tree, so an export from a public clone has none to write."""
+    message = os.path.join(pand_root, "COMMIT_MESSAGE.txt")
+    if not os.path.exists(message):
+        log_info("no COMMIT_MESSAGE.txt in this tree, so no PR body is written")
+        return None
+    lines = open(message).read().splitlines()
+    # BODY STARTS AFTER THE EPIGRAPH'S ATTRIBUTION LINE, OR AFTER THE SUBJECT.
+    start = next((i + 1 for i, l in enumerate(lines) if l.startswith("— ")), 1)
+    blocks, items = [], []
+    for line in lines[start:] + [""]:
+        if not line.strip():
+            if items:
+                blocks.append(items)
+                items = []
+            continue
+        # A BULLET STARTS AN ITEM; ANY OTHER LINE (A WRAPPED CONTINUATION, OR A
+        # SECTION'S FILE LIST AFTER ITS HEADER) JOINS THE ITEM BEFORE IT.
+        if line.startswith("- ") or not items:
+            items.append(line)
+        else:
+            items[-1] += " " + line.strip()
+    version = re.search(r'^version\s*=\s*"([^"]+)"',
+                        open(os.path.join(pand_root, "Cargo.toml")).read(),
+                        re.MULTILINE).group(1)
+    out_dir = os.path.join("/tmp", CRATE_OLD)
+    os.makedirs(out_dir, exist_ok=True)
+    out = os.path.join(out_dir, f"scx-pr-body-v{version}.md")
+    open(out, "w").write("\n\n".join("\n".join(b) for b in blocks) + "\n")
+    return out
+
+
+def main():
+    args = sys.argv[1:]
+    ported = []
+    if "--ported" in args:
+        i = args.index("--ported")
+        ported = [h for h in args[i + 1:] for h in h.split(",") if h]
+        args = args[:i]
+    if len(args) != 1:
+        log_error(f"usage: {sys.argv[0]} /path/to/scx [--ported HASH ...]")
+        sys.exit(1)
+
+    scx_root = os.path.abspath(args[0])
     pand_root = os.path.dirname(os.path.abspath(__file__))
     dst_root = os.path.join(scx_root, DEST_REL)
 
     # VALIDATE
     if not os.path.isdir(scx_root):
-        print(f"ERROR: {scx_root} is not a directory")
+        log_error(f"{scx_root} is not a directory")
         sys.exit(1)
 
     workspace_cargo = os.path.join(scx_root, "Cargo.toml")
     if not os.path.exists(workspace_cargo):
-        print(f"ERROR: {workspace_cargo} not found (is this an scx checkout?)")
+        log_error(f"{workspace_cargo} not found (is this an scx checkout?)")
         sys.exit(1)
 
-    print(f"PANDEMONIUM -> scx export")
-    print(f"  Source: {pand_root}")
-    print(f"  Target: {dst_root}")
-    print()
+    git_info = get_git_info()
+    dirty = "-dirty" if git_info.get("dirty") else ""
+    log_info(f"export_scx v{get_version()} [{git_info['commit']}{dirty}] "
+             f"[scx={scx_root}]")
+    log_info(f"TARGET: {dst_root}")
 
-    # CLEAN DESTINATION
+    # GUARD: NOTHING IS TOUCHED UNTIL IT PASSES.
+    log.section("upstream: CHECK")
+    require_upstream_ported(scx_root, ported)
+    log.section("catalog: CHECK")
+    require_catalog(scx_root)
+
+    log.section("source: COPY")
     if os.path.exists(dst_root):
         shutil.rmtree(dst_root)
-        print(f"  CLEAN: removed existing {DEST_REL}/")
-
+        log_info(f"removed the existing {DEST_REL}/")
     os.makedirs(dst_root, exist_ok=True)
-
-    # STEP 1: COPY
-    print("\n#1: COPY SOURCE FILES")
     copied = copy_tree(pand_root, dst_root)
     assert_export_is_exactly_include(dst_root)
 
-    # STEP 2: RENAME CRATE
-    print("\n#2: RENAME CRATE")
+    log.section("crate: RENAME")
     renamed = rename_crate(dst_root)
 
-    # STEP 3: STRIP PROFILE
-    print("\n#3: STRIP RELEASE PROFILE")
+    # BUILD SYSTEM: MATCH THE scx CONVENTION
+    log.section("build system: PATCH")
     stripped = strip_profile_release(dst_root)
-
-    # STEP 4: BUILD SYSTEM (MATCH scx CONVENTION)
-    print("\n#4: BUILD SYSTEM")
     replace_build_rs(dst_root)
     swap_build_deps(dst_root, scx_root)
     fix_libbpf_vendoring(dst_root)
     normalize_dep_versions(dst_root)
     patch_bpf_skel_include(dst_root)
-    patch_intf_types(dst_root)
-    patch_dsq_move_to_local(dst_root)
     add_scx_utils_dep(dst_root, scx_root)
     patch_version_display(dst_root)
     patch_ops_version_suffix(dst_root)
 
-    # STEP 5: WORKSPACE REGISTRATION
-    print("\n#5: WORKSPACE REGISTRATION")
+    log.section("workspace: REGISTER")
     registered = add_workspace_member(scx_root)
 
-    # STEP 6: CARGO FMT
-    print("\n#6: FORMAT")
-    result = subprocess.run(
-        ["cargo", "fmt", "--manifest-path", os.path.join(dst_root, "Cargo.toml")],
-        capture_output=True, text=True,
-    )
-    if result.returncode == 0:
-        print("  FMT: cargo fmt applied")
-    else:
-        print(f"  FMT: cargo fmt failed ({result.stderr.strip()})")
-        print("  FMT: run manually: cargo fmt --manifest-path", os.path.join(dst_root, "Cargo.toml"))
+    # FORMAT, LOCK (CI BUILDS WITH --locked), THEN THE CHECKS CI ENFORCES PLUS A
+    # BUILD OF THE CRATE
+    log.section("cargo: VERIFY")
+    run_checked(["cargo", "fmt", "--manifest-path",
+                 os.path.join(dst_root, "Cargo.toml")], scx_root, "cargo fmt")
+    run_checked(["cargo", "update", "-p", CRATE_NEW], scx_root, "cargo update")
+    run_checked(["cargo", "fmt", "--check", "-p", CRATE_NEW], scx_root,
+                "cargo fmt --check")
+    run_checked(["cargo", "build", "-p", CRATE_NEW, "--release"], scx_root,
+                "cargo build")
 
-    # STEP 7: UPDATE CARGO.LOCK (CI BUILDS WITH --locked)
-    print("\n#7: UPDATE CARGO.LOCK")
-    result = subprocess.run(
-        ["cargo", "update", "-p", CRATE_NEW],
-        capture_output=True, text=True, cwd=scx_root,
-    )
-    if result.returncode == 0:
-        print(f"  LOCK: cargo update -p {CRATE_NEW} succeeded")
-    else:
-        print(f"  LOCK: cargo update failed ({result.stderr.strip()})")
-        print(f"  LOCK: run manually: cd {scx_root} && cargo update -p {CRATE_NEW}")
+    body = write_pr_body(pand_root)
 
-    # SUMMARY
-    print(f"\nDONE: {copied} files copied, {renamed} crate renames, "
-          f"{stripped} profile stripped, {registered} workspace update")
-    print(f"\nNext steps:")
-    print(f"  cd {scx_root}")
-    print(f"  cargo build -p {CRATE_NEW} --release")
-    print(f"  git add -A && git diff --cached --stat")
+    log.blank()
+    log_info(f"EXPORT COMPLETE: {copied} files copied, {renamed} crate renames, "
+             f"{stripped} profile stripped, {registered} workspace update")
+    if body:
+        log_info(f"PR BODY: {body}")
+    log_info(f"NEXT: cd {scx_root} && git add -A && git diff --cached --stat")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        log.interrupted()
+        sys.exit(130)

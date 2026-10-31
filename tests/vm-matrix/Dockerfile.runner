@@ -1,0 +1,14 @@
+# Dockerfile.runner -- the only place qemu runs. A guest that hangs or panics
+# takes this container down with it, never the host. No kernel toolchain and
+# no COPY: the kernel, the initramfs and payloads/vmrun.py arrive as mounts.
+#
+# e2fsprogs formats the virtio-blk scratch disk; util-linux carries fallocate.
+
+FROM archlinux:base
+
+RUN pacman -Syu --noconfirm --needed \
+      qemu-base qemu-system-x86 \
+      e2fsprogs python util-linux \
+ && pacman -Scc --noconfirm
+
+WORKDIR /run

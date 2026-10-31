@@ -2,7 +2,7 @@
 
 The single reference for everything the suite prints to a terminal. One logger,
 one shape per output kind. Every bench (`prism`, `prism-scale`/
-`pandemonium-tests`, `prism-cachyos`, `prism-fork-thread`, `prism-ipc`,
+`pandemonium-tests`, `prism-fork-thread`, `prism-ipc`,
 `prism-power`, `prism-plot`, `prism-strand`) renders through it,
 so a user sees the same grammar everywhere.
 
@@ -64,8 +64,7 @@ First line of every command. Identity, version, build, mode — one line.
 ```
 
 Form: `<command> <version> [<commit><-dirty?>] <mode-tag?>`. The `[COMMAND]
-SELECTED` line and the separate `prism-cachyos v...` banner are removed — one
-intro per invocation, not two. A sub-bench spawned under another (child mode,
+SELECTED` line is removed — one intro per invocation, not two. A sub-bench spawned under another (child mode,
 below) prints no intro.
 
 ## WELCOME block
@@ -85,17 +84,16 @@ blank line closes it.
 
 ## SECTION header
 
-A phase. One grammar for all of them — replaces today's five shapes (`PHASE:`,
-`Scheduler:`, `[16 CORES]`, `[cachyos] running`, `WORKLOAD`). Preceded by one
+A phase. One grammar for all of them — replaces today's four shapes (`PHASE:`,
+`Scheduler:`, `[16 CORES]`, `WORKLOAD`). Preceded by one
 blank line.
 
 Form: `<Name>: <VERB>` — the verb UPPERCASE, a colon between. Names are fixed
-labels, cased per name (proper nouns CachyOS and IPC keep their casing; the
-descriptive phase names stay lowercase), not the raw key.
+labels, cased per name (the acronym IPC keeps its casing; the descriptive
+phase names stay lowercase), not the raw key.
 
 ```
 
-[09:01:21] [INFO]   CachyOS: TRACE
 [09:01:21] [INFO]   fork-thread: TRACE
 [09:01:21] [INFO]   IPC: TRACE
 [09:01:21] [INFO]   burst-starvation: TRACE
@@ -123,8 +121,8 @@ Progress inside a section. The action and its result are both flush lines; the
 result reads as a continuation by wording, not indent.
 
 ```
-[08:58:55] [INFO]   tracing stress-ng cpu-cache-mem (comm=stress-ng)
-[08:59:11] [INFO]   13.637s: montauk-cachyos-EEVDF-stress-ng-cpu-cache-mem-...
+[09:00:41] [INFO]   EEVDF storm (montauk, 180s window)
+[09:00:43] [INFO]   completed in 2.574s
 ```
 
 ## Tables
@@ -158,8 +156,7 @@ suite, not montauk):
   backing detail.
 - It drops all-zero dispatch-stall blocks and the `not analyzed (no per-event
   trace)` non-result.
-- THERMAL/POWER is trimmed to temp/power/idle; for cachyos (no latency trace) the
-  THERMAL/POWER block is dropped entirely, leaving the hot-cpu offender.
+- THERMAL/POWER is trimmed to temp/power/idle.
 
 ```
 [09:02:07] [INFO]   REPORT: ~/.cache/pandemonium/prism-report-5.14.0-...txt
@@ -211,10 +208,6 @@ So a profile run reads as one uniform progress log, and the per-bench detail is 
 disk and in the final report, never inline.
 
 ```
-[08:58:54] [INFO]   cachyos — tracing 3 workloads × 3 schedulers
-
-[08:58:55] [INFO]   TRACING stress-ng cpu-cache-mem (comm=stress-ng)
-[08:59:11] [INFO]   13.637s: montauk-cachyos-EEVDF-stress-ng-cpu-cache-mem-...
 [09:00:36] [INFO]   fork-thread — tracing the messaging storm × 3 schedulers
 [09:00:41] [INFO]   EEVDF storm (montauk, 180s window)
 [09:00:43] [INFO]   completed in 2.574s

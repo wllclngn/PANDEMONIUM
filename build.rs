@@ -36,7 +36,7 @@ fn main() {
             .unwrap_or(false)
     {
         let raw = std::fs::read_to_string(&cache_path).expect("cached vmlinux.h is not utf-8");
-        let patched = patch_vmlinux_c23(&raw);
+        let patched = patch_vmlinux_anon_fields(&raw);
         std::fs::write(&vmlinux_h, patched.as_bytes()).expect("failed to write vmlinux.h");
     } else {
         let output = Command::new("bpftool")
@@ -60,7 +60,7 @@ fn main() {
         }
         std::fs::write(&cache_path, &output.stdout).expect("failed to cache vmlinux.h");
         let raw = String::from_utf8(output.stdout).expect("vmlinux.h is not utf-8");
-        let patched = patch_vmlinux_c23(&raw);
+        let patched = patch_vmlinux_anon_fields(&raw);
         std::fs::write(&vmlinux_h, patched.as_bytes()).expect("failed to write vmlinux.h");
     }
 
@@ -79,7 +79,6 @@ fn main() {
     // rather than a cargo feature because it is a measurement tool, not a
     // shipping configuration.
     let mut cflags: Vec<String> = vec![
-        "-std=gnu23".into(),
         "-I".into(),
         "include".into(),
         "-I".into(),
@@ -134,18 +133,13 @@ fn main() {
     println!("cargo:rustc-env=PANDEMONIUM_TARGET={}", target);
 }
 
-// PATCH vmlinux.h FOR COMPATIBILITY.
-// C23: true/false/bool ARE KEYWORDS, BUT vmlinux.h DEFINES THEM AS
-// ENUM VALUES AND A TYPEDEF. RENAME THE CONFLICTS.
+// PATCH vmlinux.h FOR THE RUST SKELETON.
 // ANONYMOUS FIELDS: KERNEL PATCHES (e.g. BORE) ADD STRUCT FIELDS NAMED `_`,
 // WHICH IS VALID C BUT INVALID AS A RUST STRUCT FIELD. LIBBPF-CARGO GENERATES
 // `pub _: u8` IN THE SKELETON, CAUSING RUSTFMT TO REJECT IT.
 // FIX: RENAME `_` FIELDS TO `_anon_pad` IN THE C HEADER BEFORE SKELETON GEN.
-fn patch_vmlinux_c23(raw: &str) -> String {
-    let mut out = raw
-        .replace("typedef _Bool bool;", "/* C23: bool is a keyword */")
-        .replace("\tfalse = 0,", "\t/* C23: false */ _false = 0,")
-        .replace("\ttrue = 1,", "\t/* C23: true */ _true = 1,");
+fn patch_vmlinux_anon_fields(raw: &str) -> String {
+    let mut out = raw.to_string();
 
     // RENAME ANONYMOUS STRUCT FIELDS: `type _;` -> `type _anon_pad;`
     // MATCHES ANY C TYPE FOLLOWED BY ` _;` AT A FIELD DECLARATION
