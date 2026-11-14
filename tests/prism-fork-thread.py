@@ -3,8 +3,9 @@
 PANDEMONIUM prism-fork-thread: scheduler IPC throughput + hot-path profiling.
 
 Cycles through EEVDF, PANDEMONIUM (BPF), PANDEMONIUM (ADAPTIVE), and
-scx_bpfland, running `perf bench sched messaging -t -g 24 -l 6000` under
-perf stat to capture both elapsed time and hardware counters.
+scx_bpfland, running `perf bench sched messaging -t -g 24 -l 6000` under a
+montauk recording of its own: perf bench's elapsed time, and the hardware
+counters as the delta of montauk's system-wide PMU over the run.
 
 Usage:
     ./pandemonium.py prism-fork-thread
@@ -15,7 +16,6 @@ import os
 import re
 import resource
 import shutil
-import signal
 import subprocess
 import sys
 import time
@@ -24,17 +24,19 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.resolve()))
 from pandemonium_common import (
-    start_and_wait, stop_and_wait, find_scheduler, trace_workload, stop_systemd_scheduler,
-    parse_knobs_line,
-    LOG_DIR, ARCHIVE_DIR, BINARY,
+    start_and_wait, stop_and_wait, sched_ejected, trace_workload, clear_loaded_scheduler,
+    parse_knobs_line, add_field_flags, field_of,
+    LOG_DIR, ARCHIVE_DIR,
     get_version, get_git_info,
     log, log_info, log_warn, log_error,
-    is_scx_active, scx_scheduler_name,
+    is_scx_active,
     wait_for_deactivation,
-    montauk_available, MONTAUK_LOG_INTERVAL_MS, MONTAUK, montauk_analyze_argv,
+    MONTAUK, montauk_available, montauk_has_flag, MONTAUK_RECORD_FLAGS,
+    record_run, stop_recorders, montauk_population, counter_delta,
+    _chown_to_invoking_user,
     montauk_envelope, envelope_report, envelope_gauges, envelope_gauge_by_label, envelope_verdict,
     envelope_capture,
-    table_header, table_row, LABEL_W, PrometheusBuilder,
+    table_header, table_row, PrometheusBuilder,
     mean_stdev, median, get_online_cpus,
 )
 
@@ -46,7 +48,7 @@ NR_LOOPS_QUICK = 1000
 NR_LOOPS = NR_LOOPS_FULL  # SET BY main() BASED ON --quick FLAG
 
 # PHASE 1 -- short traced burst. A brief montauk capture per arm for the two
-# scheduling-quality axes the perf-stat timing run is blind to: wake2run latency
+# scheduling-quality axes the recorded timing run is blind to: wake2run latency
 # and placement locality (cross-domain scatter). Short on purpose -- like a
 # prism profile, the burst answers "how late / how scattered" fast; the
 # full iteration below answers "how cheap". Fused, they read latency | cause |
@@ -101,16 +103,19 @@ def build_cells(modes, groups):
             cells.append(Cell(f"{tag}/g{g}", threaded, g))
     return cells
 
-PERF_EVENTS = [
-    "cycles",
-    "instructions",
-    "cache-misses",
-    "cache-references",
-    "context-switches",
-    "cpu-migrations",
-    "branch-misses",
-    "task-clock",
-]
+# The cost phase's counters: Each event's cumulative total in montauk's
+# system-wide PMU, read as its delta over the run's recording. System-wide, so
+# a delta counts every task on the box while the cell ran, the scheduler's own
+# process and montauk among them, not the workload's tree alone.
+PMU_COUNTERS = {
+    "cycles": "montauk_pmu_cycles_total",
+    "instructions": "montauk_pmu_instructions_total",
+    "cache-misses": "montauk_pmu_cache_misses_total",
+    "context-switches": "montauk_pmu_context_switches_total",
+    "cpu-migrations": "montauk_pmu_cpu_migrations_total",
+    "branch-misses": "montauk_pmu_branch_misses_total",
+}
+REC_DIR = LOG_DIR / "fork-thread"
 
 
 def _raise_fd_limit():
@@ -134,62 +139,34 @@ def _messaging_cmd(groups, threaded, loops):
     return cmd
 
 
-def arm_ejected(guard, expected_ops: str) -> bool:
-    """The arm's scheduler is gone: its process exited, or the kernel no longer
-    runs the ops it registered at activation. EEVDF has no guard."""
-    if guard is None:
-        return False
-    return guard.proc.poll() is not None or scx_scheduler_name() != expected_ops
-
-
-def run_perf_bench(groups=NUM_GROUPS, threaded=True, loops=None):
-    """Run perf stat wrapping perf bench. Returns (elapsed_s, counters) or (None, None)."""
+def run_perf_bench(rec_dir, groups=NUM_GROUPS, threaded=True, loops=None):
+    """perf bench under a montauk recording of its own at rec_dir. Returns
+    (elapsed_s, counters), counters keyed by PMU_COUNTERS' event names, or
+    (None, None)."""
     nloops = loops if loops is not None else NR_LOOPS
-    events = ",".join(PERF_EVENTS)
-    cmd = ["perf", "stat", "-e", events, "--",
-           *_messaging_cmd(groups, threaded, nloops)]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    ran = record_run(rec_dir, _messaging_cmd(groups, threaded, nloops), timeout=600)
+    if ran is None:
+        return None, None
+    rec, _wall_s, result = ran
 
-    elapsed = None
+    # perf bench's own clock, the one number -f simple prints: The quantity
+    # this bench's `seconds` carries. The wall around the process would add
+    # perf's own start and exit to every cell.
     try:
         elapsed = float(result.stdout.strip())
     except (ValueError, AttributeError):
         log_error(f"Could not parse perf bench output: {result.stdout.strip()}")
         return None, None
 
+    # A counter that never moved did not open, and reads N/A.
     counters = {}
-    # PERF'S TRAILER IS NOT A COUNTER, AND IT WAS BEING READ AS ONE. `perf stat`
-    # closes with "<n> seconds time elapsed", "<n> seconds user" and "<n> seconds
-    # sys", all three of which match a "<value> <name>" shape and all three of
-    # which parsed as a counter literally named `seconds` -- the last one winning.
-    # That value was then published under the same gauge name and labels as the
-    # real elapsed time, so pandemonium_fork_thread_seconds appeared TWICE per
-    # cell with one of them being user CPU time. Only requested events are kept
-    # now, which also means an unrecognised trailer can never invent a series.
-    wanted = {e.replace("-", "_"): e for e in PERF_EVENTS}
-    for line in result.stderr.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or line.startswith("Performance"):
-            continue
-        m = re.match(r'^([\d,\.]+)\s+(?:msec\s+)?(\S+)', line)
-        if not m:
-            continue
-        val_str = m.group(1).replace(",", "")
-        # STRIP THE :u/:k MODIFIER AS A SUFFIX, NOT AS A CHARACTER SET. rstrip
-        # takes a set, so `rstrip(":k")` ate the trailing k of `task-clock` and
-        # every capture in the archive carries it as `task_cloc`.
-        name = m.group(2)
-        for mod in (":u", ":k"):
-            if name.endswith(mod):
-                name = name[: -len(mod)]
-        key = name.replace("-", "_")
-        if key not in wanted:
-            continue
-        try:
-            counters[wanted[key]] = float(val_str)
-        except ValueError:
-            pass
-
+    for event, metric in PMU_COUNTERS.items():
+        delta = counter_delta(montauk_population(rec.dir, metric))
+        if delta:
+            counters[event] = delta
+    if not counters:
+        log_warn(f"montauk's system-wide PMU was not up, so the counters read "
+                 f"N/A (montauk says why in {rec.stdout_path})")
     return elapsed, counters
 
 
@@ -293,18 +270,15 @@ def write_prometheus(version, git, stamp, ncpus, cells_data, loops,
             pb.gauge("seconds", f"{elapsed:.4f}", help="elapsed time", labels=sl)
             if counters:
                 for cn, cv in counters.items():
-                    safe = cn.replace("-", "_").replace(".", "_")
-                    pb.gauge(safe, f"{cv:.0f}", help=f"perf stat {cn}", labels=sl)
+                    pb.gauge(f"pmu_{cn.replace('-', '_')}", f"{cv:.0f}",
+                             help=f"{cn} over the run, montauk's system-wide PMU",
+                             labels=sl)
                 cyc = counters.get("cycles", 0)
                 ins = counters.get("instructions", 0)
-                cm = counters.get("cache-misses", 0)
-                cr = counters.get("cache-references", 0)
                 if cyc > 0 and ins > 0:
-                    pb.gauge("ipc", f"{ins / cyc:.3f}",
-                             help="instructions per cycle", labels=sl)
-                if cr > 0:
-                    pb.gauge("cache_miss_rate", f"{cm / cr:.6f}",
-                             help="cache miss rate", labels=sl)
+                    pb.gauge("pmu_ipc", f"{ins / cyc:.3f}",
+                             help="instructions per cycle over the run, "
+                                  "montauk's system-wide PMU", labels=sl)
             sp = (all_spreads or {}).get(sched_name)
             ss = sp.get("seconds") if sp else None
             if ss:
@@ -317,13 +291,6 @@ def write_prometheus(version, git, stamp, ncpus, cells_data, loops,
                 pb.gauge("seconds_n", ss["n"],
                          help="iterations contributing to the elapsed spread",
                          labels=sl)
-            cs = sp.get("cache_miss_rate") if sp else None
-            if cs:
-                for k in ("mean", "stddev", "min", "max"):
-                    pb.gauge(f"cache_miss_rate_{k}", f"{cs[k]:.6f}",
-                             help=f"cache miss rate {k} across iterations", labels=sl)
-                pb.gauge("cache_miss_rate_n", cs["n"],
-                         help="iterations contributing to the cache miss rate", labels=sl)
 
         # PHASE 1 readings (latency + cause) beside the cost counters.
         for sched_name, tr in (trace_results or {}).items():
@@ -375,25 +342,15 @@ def _cell_block(report, cell, loops, all_results, all_spreads, trace_results):
     eevdf_elapsed = all_results.get("EEVDF", (None, None))[0]
     has_trace = bool(trace_results)
 
-    def _miss_ipc(sn):
-        _, counters = all_results.get(sn, (None, None))
-        if not counters:
-            return "N/A", "N/A"
-        cm, cr = counters.get("cache-misses"), counters.get("cache-references")
+    def _ipc(sn):
+        counters = all_results.get(sn, (None, None))[1] or {}
         cyc, ins = counters.get("cycles"), counters.get("instructions")
-        miss = f"{cm / cr * 100:.2f}%" if cm and cr else "N/A"
-        ipc = f"{ins / cyc:.3f}" if cyc and ins else "N/A"
-        # ±stddev when --iterations gave a spread, so signal/noise is in the table
-        sp = (all_spreads or {}).get(sn)
-        cs = sp.get("cache_miss_rate") if sp else None
-        if cs and cs.get("n", 1) > 1 and cm and cr:
-            miss = f"{cm / cr * 100:.2f}±{cs['stddev'] * 100:.2f}%"
-        return miss, ipc
+        return f"{ins / cyc:.3f}" if cyc and ins else "N/A"
 
     def _time_vs(sched_name, elapsed):
         # THE WALL-CLOCK SPREAD WAS COMPUTED AND RENDERED NOWHERE, WHICH IS WHAT
         # MADE --iterations LOOK BROKEN. _measure returns spreads["seconds"] on
-        # every run and only the cache-miss half was ever read, so an N=3 run
+        # every run and nothing read it, so an N=3 run
         # reported a median with no indication of the variance it existed to
         # measure -- and this bench's process arm swings several seconds on
         # identical code, so the median alone cannot separate a regression from
@@ -412,32 +369,30 @@ def _cell_block(report, cell, loops, all_results, all_spreads, trace_results):
         return ts, ""
 
     if has_trace:
-        report.append("TRADEOFF  (latency | cause | cost -- lower time/miss%, higher IPC is better)")
+        report.append("TRADEOFF  (latency | cause | cost -- lower time, higher IPC is better)")
         report.append(table_header("SCHEDULER",
-                      ["WAKE2RUN p99", "CROSS-DOM", "TIME", "VS EEVDF",
-                       "CACHE MISS%", "IPC"]))
+                      ["WAKE2RUN p99", "CROSS-DOM", "TIME", "VS EEVDF", "IPC"]))
     else:
-        report.append("COST  (no montauk -- timing + counters only)")
-        report.append(table_header("SCHEDULER",
-                      ["TIME", "VS EEVDF", "CACHE MISS%", "IPC"]))
+        report.append("COST  (untraced -- timing + counters only)")
+        report.append(table_header("SCHEDULER", ["TIME", "VS EEVDF", "IPC"]))
     for sched_name, (elapsed, _) in all_results.items():
         ts, vs = _time_vs(sched_name, elapsed)
-        miss, ipc = _miss_ipc(sched_name)
+        ipc = _ipc(sched_name)
         if has_trace:
             tr = (trace_results or {}).get(sched_name) or {}
             p99 = tr.get("p99_us")
             xd = tr.get("cross_domain_pct")
             p99s = f"{p99}us" if p99 is not None else "N/A"
             xds = f"{xd:.1f}%" if xd is not None else "N/A"
-            report.append(table_row(sched_name, [p99s, xds, ts, vs, miss, ipc]))
+            report.append(table_row(sched_name, [p99s, xds, ts, vs, ipc]))
         else:
-            report.append(table_row(sched_name, [ts, vs, miss, ipc]))
+            report.append(table_row(sched_name, [ts, vs, ipc]))
     report.append("")
 
     # RAW COUNTERS -- instructions/cycles/misses/branches per arm. The diagnostic
     # gold: identical instructions with higher cycles means the cost is pure
     # locality, not extra work.
-    counter_names = ["cycles", "instructions", "cache-misses", "cache-references",
+    counter_names = ["cycles", "instructions", "cache-misses",
                      "cpu-migrations", "branch-misses"]
     sched_names = list(all_results.keys())
     header = f"{'COUNTER':<20}"
@@ -599,6 +554,8 @@ def write_report(version, git, stamp, ncpus, cells_data, loops,
     report = []
     report.append(f"prism-fork-thread v{version} [{git['commit']}]")
     report.append(f"cpus: {ncpus}  cells: {len(cells_data)}  loops: {loops}")
+    report.append("counters: montauk's system-wide PMU, each the delta over its "
+                  "run's recording")
     for sched, cell in (ejected_by_sched or {}).items():
         report.append(f"EJECTED: {sched} during {cell}; that cell and every later "
                       "one are withheld")
@@ -731,7 +688,7 @@ def trace_capture(sched_name, cmd, stamp, duration,
 # ---- phase 1: short traced burst -> wake2run latency + placement locality ----
 # Reuses `montauk --analyze` the same way prism does: --digest carries the
 # wake2run p99 and the cross-domain scatter on one line; --report locality breaks
-# the migrations into cache-tier distances. The perf-stat timing run (phase 2)
+# the migrations into cache-tier distances. The recorded timing run (phase 2)
 # cannot see either -- it only measures cost. Phase 1 supplies latency and cause.
 
 _LOC_TIERS = ("same-L2", "same-L3", "same-socket", "cross-socket")
@@ -915,7 +872,7 @@ def run_burst_phase(entries, stamp, cell):
     """PHASE 1 for one workload cell -- the short traced burst per arm. For each
     scheduler, capture a brief montauk recording of THIS cell's storm (mode +
     groups) at BURST_LOOPS and fold it to {p99_us, cross_domain_pct, locality}.
-    The full perf-stat iteration of the same cell runs after. Returns
+    The full recorded iteration of the same cell runs after. Returns
     {sched_name: readings}."""
     log_info(f"PHASE 1 [{cell.label}]: traced burst (-l {BURST_LOOPS}, "
              f"<= {BURST_SAFETY:.0f}s/arm, montauk) -- wake2run + locality")
@@ -932,7 +889,7 @@ def run_burst_phase(entries, stamp, cell):
         # an arm that completed compares a prefix against a whole, which is the
         # exact bias this bench keeps rediscovering. Reaching the net is a
         # failure of the run, so it is reported as one and the arm contributes
-        # no traced row. The perf-stat phase is untouched and still reports.
+        # no traced row. The cost phase is untouched and still reports.
         if elapsed is None:
             log_error(f"[{name}] load did not finish inside the "
                       f"{BURST_SAFETY:.0f}s safety net -- traced readings for "
@@ -958,14 +915,18 @@ def run_burst_phase(entries, stamp, cell):
     return trace_results
 
 
-def _measure(sched_name, cell, iterations):
-    """PHASE 2 for one (scheduler, cell): run the full perf-stat timing N times,
-    return ((median_elapsed, median_counters), spreads) or ((None, None), None).
+def _measure(sched_name, cell, iterations, rec_root):
+    """PHASE 2 for one (scheduler, cell): run the full recorded timing N times,
+    each under a recording of its own in rec_root, and return
+    ((median_elapsed, median_counters), spreads) or ((None, None), None).
     The median is robust to a poisoned sched_ext iteration; the per-iteration
-    cache-miss spread is kept so a delta can be judged against the noise."""
+    elapsed spread is kept so a delta can be judged against the noise."""
+    tag = (sched_name.replace(" ", "-").replace("(", "").replace(")", "")
+           + "-" + cell.label.replace("/", "-"))
     samples = []
     for it in range(iterations):
-        el, ct = run_perf_bench(cell.groups, cell.threaded)
+        el, ct = run_perf_bench(rec_root / f"{tag}-{it + 1}", cell.groups,
+                                cell.threaded)
         if el is not None:
             samples.append((el, ct))
             msg = f"[{sched_name}] {cell.label} iter {it + 1}/{iterations}: {el:.3f}s"
@@ -988,21 +949,14 @@ def _measure(sched_name, cell, iterations):
         vals = [ct[k] for _, ct in samples if ct and k in ct]
         if vals:
             counters[k] = median(vals)
-    rates = [ct["cache-misses"] / ct["cache-references"]
-             for _, ct in samples
-             if ct and ct.get("cache-references", 0) > 0]
-    spreads = {"cache_miss_rate": _spread_stats(rates),
-               "seconds": _spread_stats([s[0] for s in samples])}
+    spreads = {"seconds": _spread_stats([s[0] for s in samples])}
     cyc, ins = counters.get("cycles", 0), counters.get("instructions", 0)
     ipc = ins / cyc if cyc > 0 else 0
-    cs = spreads["cache_miss_rate"]
     ss = spreads["seconds"]
     spread_msg = ""
     if ss and ss.get("n", 1) > 1:
         spread_msg += (f"  wall={ss['mean']:.3f}±{ss['stddev']:.3f}s"
                        f" [{ss['min']:.3f}-{ss['max']:.3f}]")
-    if cs:
-        spread_msg += f"  miss%={cs['mean'] * 100:.2f}±{cs['stddev'] * 100:.2f}"
     log_info(f"[{sched_name}] {cell.label} MEDIAN {elapsed:.3f}s  IPC={ipc:.3f}  "
              f"cache-misses={_fmt_count(counters.get('cache-misses', 0))}  "
              f"(n={len(samples)}/{iterations}){spread_msg}")
@@ -1017,7 +971,7 @@ def main():
     ap.add_argument("--no-burst", action="store_true",
                     help="Skip phase 1 (the short traced burst that captures "
                          "wake2run latency + placement locality) and run only the "
-                         "full perf-stat cost iteration. Default runs both.")
+                         "full recorded cost iteration. Default runs both.")
     ap.add_argument("--modes", type=str, default=DEFAULT_MODES,
                     help="Comma list of workload modes to sweep: thread (shared "
                          "address space) and/or process (separate -- the fork arm). "
@@ -1033,22 +987,10 @@ def main():
     ap.add_argument("--iterations", type=int, default=1,
                     help="Run each scheduler N times. The MEDIAN is the headline "
                          "(robust to a poisoned outlier run); the per-iteration "
-                         "cache-miss spread (mean/stddev/min/max/n) is recorded in "
+                         "elapsed spread (mean/stddev/min/max/n) is recorded in "
                          "the report and archive so a delta can be judged against "
                          "the noise. Default 1.")
-    ap.add_argument("--schedulers", type=str, default="",
-                    help="Comma-separated external scx field "
-                         "(EEVDF baseline always; PANDEMONIUM only if named). "
-                         "Runs EEVDF vs exactly the named schedulers.")
-    ap.add_argument("--all-scx", action="store_true",
-                    help="Also run the full installed scx scheduler field "
-                         "(scx_bpfland, scx_rusty, scx_lavd, scx_flow, "
-                         "scx_rustland, scx_p2dq, scx_tickless, scx_cosmos, "
-                         "scx_cake, scx_flash, scx_beerland, scx_layered). "
-                         "Default: EEVDF + PANDEMONIUM (BPF + ADAPTIVE) only.")
-    ap.add_argument("--pandemonium-only", action="store_true",
-                    help="Run only PANDEMONIUM entries -- drop EEVDF and any "
-                         "external scx schedulers from the field.")
+    add_field_flags(ap)
     ap.add_argument("--cores", type=str, default=None,
                     help="Accepted for suite uniformity; the storm runs at native width (the fork rate IS the axis)")
     args = ap.parse_args()
@@ -1058,20 +1000,27 @@ def main():
     global NR_LOOPS
     NR_LOOPS = NR_LOOPS_QUICK if args.quick else NR_LOOPS_FULL
 
+    if not shutil.which("perf"):
+        log_error("perf not found; the workload is perf bench sched messaging. "
+                  "Install with: sudo pacman -S perf")
+        return 1
+    if not montauk_available():
+        log_error(f"montauk not found at {MONTAUK}; it records every cost run. "
+                  f"Install montauk")
+        return 1
+    missing = [f for f in MONTAUK_RECORD_FLAGS if not montauk_has_flag(f)]
+    if missing:
+        log_error(f"the installed montauk has no {', '.join(missing)}, which "
+                  f"every cost run's recording passes. Install the newer montauk")
+        return 1
+
     # PHASE 1 gate: the traced burst (wake2run latency + placement locality) runs
-    # by default, but not under --no-burst, and not without montauk. It needs root end-to-end (montauk eBPF attach +
+    # under --trace, but not under --no-burst. It needs root end-to-end (montauk eBPF attach +
     # sched_ext load), so self-elevate once up front -- matches --trace and the
     # RUN-BARE convention (the bench acquires its own root; the user never sudo's).
-    run_burst = args.trace and not args.no_burst and montauk_available()
+    run_burst = args.trace and not args.no_burst
     if run_burst and os.geteuid() != 0:
         os.execvp("sudo", ["sudo", sys.executable, *sys.argv])
-    if args.trace and not args.no_burst and not montauk_available():
-        log_warn("montauk not found -- skipping phase 1 (traced burst); running "
-                 "cost-only. Install montauk for the wake2run + locality axes.")
-
-    if not shutil.which("perf"):
-        log_error("perf not found. Install with: sudo pacman -S perf")
-        return 1
 
     _raise_fd_limit()
 
@@ -1083,40 +1032,14 @@ def main():
     mode = "QUICK" if args.quick else "FULL"
 
     log_info(f"prism-fork-thread v{ver} [{git['commit']}{dirty}] [{mode}]")
-    log_info(f"CPUs: {ncpus}  loops: {NR_LOOPS}  perf stat + perf bench sched messaging")
+    log_info(f"CPUs: {ncpus}  loops: {NR_LOOPS}  perf bench sched messaging under montauk")
     print()
 
-    if is_scx_active():
-        name = scx_scheduler_name()
-        log_warn(f"sched_ext is active ({name}) -- stopping pandemonium service")
-        stop_systemd_scheduler()
-        if not wait_for_deactivation(5.0):
-            log_error("Could not deactivate sched_ext")
-            return 1
+    if not clear_loaded_scheduler():
+        return 1
     time.sleep(1)
 
-    entries = [
-        ("EEVDF", None),
-        ("PANDEMONIUM (BPF)", [str(BINARY), "--verbose", "--no-adaptive"]),
-        ("PANDEMONIUM (ADAPTIVE)", [str(BINARY)]),
-    ]
-
-    # FULL FIELD: every installed production scx scheduler in the ring against
-    # EEVDF and PANDEMONIUM. Gated behind --all-scx (opt-in) to keep the default
-    # run fast -- the EEVDF + PANDEMONIUM (BPF + ADAPTIVE) trio is what we iterate
-    # on most. scx_chaos is excluded (fault-injection test scheduler, not a
-    # contender). scx_layered needs a layer spec and may self-skip without one.
-    if args.all_scx:
-        scx_field = [
-            "scx_bpfland", "scx_rusty", "scx_lavd", "scx_flow", "scx_rustland",
-            "scx_p2dq", "scx_tickless", "scx_cosmos", "scx_cake", "scx_flash",
-            "scx_beerland", "scx_layered",
-        ]
-        for s in scx_field:
-            if find_scheduler(s):
-                entries.append((s, [s]))
-            else:
-                log_warn(f"{s} not found, skipping")
+    entries = field_of(args)
 
     # WORKLOAD CELLS: modes x groups. The default fork/thread split, sweepable.
     modes = [m.strip() for m in args.modes.split(",")
@@ -1131,8 +1054,10 @@ def main():
         groups = [NUM_GROUPS]
     cells = build_cells(modes, groups or [NUM_GROUPS])
 
-    if args.pandemonium_only:
-        entries = [(n, c) for n, c in entries if "PANDEMONIUM" in n]
+    if not entries:
+        log_error("no scheduler arm to run: nothing named by --only/--schedulers "
+                  "is on PATH")
+        return 2
 
     log_info("cells: " + ", ".join(c.label for c in cells)
              + (f"  (x{args.iterations} iter)" if args.iterations > 1 else ""))
@@ -1147,9 +1072,10 @@ def main():
             if is_scx_active():
                 wait_for_deactivation(5.0)
 
-    # PHASE 2 -- the full perf-stat iteration. ARM-OUTER, CELL-INNER: activate each
+    # PHASE 2 -- the full recorded iteration. ARM-OUTER, CELL-INNER: activate each
     # scheduler once and run every cell under it, so a sweep does not re-load the
     # scheduler per cell.
+    rec_root = REC_DIR / stamp
     results_by_cell = {c.label: {} for c in cells}
     spreads_by_cell = {c.label: {} for c in cells}
     steal_by_sched = {}
@@ -1168,13 +1094,12 @@ def main():
                         results_by_cell[c.label][sched_name] = (None, None)
                     continue
 
-            expected_ops = scx_scheduler_name() if guard is not None else ""
             for i, cell in enumerate(cells):
-                res, spreads = _measure(sched_name, cell, args.iterations)
+                res, spreads = _measure(sched_name, cell, args.iterations, rec_root)
                 # A SCHEDULER THE KERNEL EJECTED MID-CELL LEAVES EEVDF RUNNING
                 # UNDER ITS NAME: THE NUMBERS ARE EEVDF's. THE CELL AND EVERY
                 # LATER ONE ARE WITHHELD AND THE ARM IS MARKED EJECTED.
-                if arm_ejected(guard, expected_ops):
+                if sched_ejected(guard):
                     log_error(f"[{sched_name}] EJECTED during {cell.label} -- its "
                               f"numbers are withheld, they would be EEVDF's")
                     ejected_by_sched[sched_name] = cell.label
@@ -1205,6 +1130,8 @@ def main():
     except KeyboardInterrupt:
         log.interrupted()
     finally:
+        stop_recorders()
+        _chown_to_invoking_user(REC_DIR)
         # DISENGAGE AT END (MATCHES OTHER BENCHES). EACH PER-SCHEDULER
         # stop_and_wait() ALREADY TORE DOWN ITS OWN INSTANCE; WE JUST MAKE
         # SURE NOTHING LINGERS BY WAITING FOR FULL DEACTIVATION.
@@ -1224,6 +1151,7 @@ def main():
         log.report(report_path.read_text())
         log_info(f"REPORT: {report_path}")
         log_info(f"METRICS: {prom_path}")
+        log_info(f"RECORDINGS: {rec_root}")
 
     return 0
 

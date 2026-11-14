@@ -87,6 +87,9 @@ pub struct RawWindow<const N: usize> {
     buf: [f64; N],
     head: usize,
     filled: usize,
+    // HOW MANY OF THE NEWEST SAMPLES THE WINDOW HOLDS, AT MOST N. A WINDOW
+    // THAT SPANS TIME SETS IT FROM THE SAMPLE RATE.
+    span: usize,
 }
 
 impl<const N: usize> Default for RawWindow<N> {
@@ -101,14 +104,24 @@ impl<const N: usize> RawWindow<N> {
             buf: [0.0; N],
             head: 0,
             filled: 0,
+            span: N,
         }
     }
 
     pub fn push(&mut self, x: f64) {
         self.buf[self.head] = x;
         self.head = (self.head + 1) % N;
-        if self.filled < N {
+        if self.filled < self.span {
             self.filled += 1;
+        }
+    }
+
+    // HOLD THE NEWEST w SAMPLES (1..=N). SHRINKING DROPS THE OLDEST AT ONCE;
+    // GROWING FILLS FROM THE PUSHES THAT FOLLOW.
+    pub fn set_span(&mut self, w: usize) {
+        self.span = w.clamp(1, N);
+        if self.filled > self.span {
+            self.filled = self.span;
         }
     }
 
@@ -128,11 +141,8 @@ impl<const N: usize> RawWindow<N> {
 
     // YIELD SAMPLES IN INSERTION ORDER (OLDEST -> NEWEST).
     pub fn iter(&self) -> RawWindowIter<'_, N> {
-        let start = if self.filled < N {
-            0
-        } else {
-            self.head
-        };
+        // THE OLDEST HELD SAMPLE SITS filled SLOTS BEHIND head, WRAPPED OR NOT.
+        let start = (self.head + N - self.filled) % N;
         RawWindowIter {
             win: self,
             pos: 0,
@@ -318,7 +328,8 @@ pub fn bandt_pompe_d3<const N: usize>(w: &RawWindow<N>) -> f64 {
     h / LN_BP_D3
 }
 
-// RQA DETERMINISM (DET)
+// RQA DETERMINISM (DET), AFTER MARWAN ET AL. 2007, RECURRENCE PLOTS FOR THE
+// ANALYSIS OF COMPLEX SYSTEMS.
 //
 // DELAY-EMBED THE WINDOW INTO RQA_EMBED_DIM-D VECTORS WITH UNIT DELAY,
 // BUILD THE RECURRENCE MATRIX UNDER A CHEBYSHEV (L-INFINITY) BALL OF
@@ -376,9 +387,9 @@ pub fn rqa_det<const N: usize>(w: &RawWindow<N>) -> Option<f64> {
     // FLAT-WINDOW SPECIAL CASE. A PERFECTLY STEADY SIGNAL HAS sigma = 0;
     // EVERY EMBEDDED POINT RECURS WITH EVERY OTHER. THAT IS FULLY
     // DETERMINISTIC -- RETURN 1.0 DIRECTLY (AND AVOID eps = 0 / A
-    // DEGENERATE RECURRENCE MATRIX). idle_pct IS INTEGER-PERCENT CAST
-    // TO f64, SO A STEADY COMPUTE WORKLOAD PRODUCES AN EXACTLY-FLAT
-    // WINDOW AND MUST READ AS QUIESCENT.
+    // DEGENERATE RECURRENCE MATRIX). A SATURATED COMPUTE WORKLOAD SEATS
+    // NO WAKE ON AN IDLE CPU, SO ITS IDLE-HIT SHARE IS ZERO IN EVERY
+    // BUCKET: AN EXACTLY-FLAT WINDOW THAT MUST READ AS QUIESCENT.
     if sigma < 1e-9 {
         return Some(1.0);
     }
@@ -562,9 +573,22 @@ fn lag1_autocorr_raw<const N: usize>(w: &RawWindow<N>) -> Option<f64> {
 // MAXIMALLY BURSTY, AT EVERY n -- WHICH IS WHAT MAKES IT COMPARABLE
 // ACROSS WINDOW SIZES. ONE SCALAR SEPARATING BURST-STARVATION (POSITIVE),
 // LONGRUN (NEAR ZERO) AND DEADLINE-PACED (NEGATIVE).
-// NOT WIRED TO A DECISION.
+// r IS THE CV OF THE GAPS BETWEEN EVENTS. kim_jo_counts_priced READS IT FROM
+// ARRIVALS PER BUCKET (r = sqrt(Fano), n = THE ARRIVALS IN THE WINDOW), AND
+// THAT FORM SETS EACH DOMAIN's BATCH CEILING.
 
 pub const BURSTINESS_MIN_SAMPLES: usize = 4;
+
+// THE CORRECTION ITSELF, SHARED BY THE LEVEL AND THE COUNTS FORMS.
+fn kim_jo_a(nf: f64, r: f64) -> Option<f64> {
+    let sp = (nf + 1.0).sqrt();
+    let sm = (nf - 1.0).sqrt();
+    let denom = (sp - 2.0) * r + sm;
+    if denom.abs() < 1e-12 {
+        return None;
+    }
+    Some(((sp * r - sm) / denom).clamp(-1.0, 1.0))
+}
 
 // Unfloored body -- the priced form supplies its own minimum.
 fn kim_jo_burstiness_raw<const N: usize>(w: &RawWindow<N>) -> Option<f64> {
@@ -595,15 +619,7 @@ fn kim_jo_burstiness_raw<const N: usize>(w: &RawWindow<N>) -> Option<f64> {
     // SAMPLE (n-1) STANDARD DEVIATION: THE KIM-JO CORRECTION IS DERIVED
     // AGAINST THE UNBIASED VARIANCE.
     let sigma = (var / (nf - 1.0)).sqrt();
-    let r = sigma / mu;
-
-    let sp = (nf + 1.0).sqrt();
-    let sm = (nf - 1.0).sqrt();
-    let denom = (sp - 2.0) * r + sm;
-    if denom.abs() < 1e-12 {
-        return None;
-    }
-    Some(((sp * r - sm) / denom).clamp(-1.0, 1.0))
+    kim_jo_a(nf, sigma / mu)
 }
 
 // FANO-FACTOR BURSTINESS AND PERSISTENCE: ONE ARRIVAL COUNTER, TWO LENSES.
@@ -651,6 +667,8 @@ pub fn fano_burstiness_priced<const N: usize>(w: &RawWindow<N>) -> Option<Priced
     })
 }
 
+// The Fano-slope Hurst: The Fano factor of the counts grows as T^(2H-1) across
+// bucket widths T (Lowen and Teich 2005, Fractal-Based Point Processes).
 // The slope needs at least three aggregation levels with eight aggregates
 // each (a window of 32); it is worth full weight at six levels (256).
 const FANO_H_LEVELS_FULL: usize = 6;
@@ -706,9 +724,9 @@ pub fn fano_hurst_priced<const N: usize>(w: &RawWindow<N>) -> Option<Priced> {
 // AMORTIZATION PAY. H < 0.5 IS ANTI-PERSISTENT / MEAN-REVERTING, WHERE
 // A BUSY WINDOW PREDICTS AN IDLE ONE.
 //
-// NOT WIRED TO ANY DECISION. PORTED AND MEASURED FIRST; ITS BEHAVIOR ON
-// THIS SCHEDULER'S OWN SIGNALS IS NOT YET KNOWN, AND A LONG-RANGE-
-// DEPENDENCE READ ON A 16-SAMPLE WINDOW IS THIN BY CONSTRUCTION.
+// IT READS EACH DOMAIN's ARRIVALS PER BUCKET AND SETS THAT DOMAIN's RESCUE
+// THRESHOLD. ON THE SAME COUNTS IT AGREES WITH fano_hurst_priced WITHIN 0.06
+// (RESEARCH t17).
 
 // MINIMUM SAMPLES: 16 GIVES THREE USABLE OCTAVES (8, 4 AND 2 DETAIL
 // COEFFICIENTS), WHICH IS THE FLOOR FOR A SLOPE THAT IS A FIT RATHER
@@ -955,6 +973,28 @@ pub fn kim_jo_burstiness_priced<const N: usize>(w: &RawWindow<N>) -> Option<Pric
     Some(Priced { value: v, confidence: confidence(n, BURSTINESS_MATH_MIN, BURSTINESS_MIN_SAMPLES) })
 }
 
+// KIM-JO ON ARRIVALS PER BUCKET. FOR A RENEWAL PROCESS THE FANO FACTOR OF THE
+// COUNTS TENDS TO THE SQUARED CV OF THE GAPS, SO r = sqrt(F); n IS THE NUMBER
+// OF GAPS, THE ARRIVALS THE WINDOW HOLDS. PRICED ON THE BUCKETS AS THE LEVEL
+// FORM IS.
+pub fn kim_jo_counts_priced<const N: usize>(w: &RawWindow<N>) -> Option<Priced> {
+    let n = w.filled;
+    if n < BURSTINESS_MATH_MIN {
+        return None;
+    }
+    let mut s: [f64; N] = [0.0; N];
+    for (k, x) in w.iter().enumerate() {
+        s[k] = x;
+    }
+    let f = fano(&s[..n])?;
+    let arrivals: f64 = s[..n].iter().sum();
+    if arrivals < 2.0 {
+        return None;
+    }
+    let v = kim_jo_a(arrivals, f.sqrt())?;
+    Some(Priced { value: v, confidence: confidence(n, BURSTINESS_MATH_MIN, BURSTINESS_MIN_SAMPLES) })
+}
+
 // Coupling needs a nearest neighbour that is not the point itself, so n >= 3.
 const PC_MATH_MIN: usize = 3;
 pub fn pecora_carroll_priced<const N: usize>(
@@ -998,5 +1038,46 @@ impl ChaosCounter {
 
     pub fn load(&self) -> u64 {
         self.0.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RawWindow;
+
+    fn held<const N: usize>(w: &RawWindow<N>) -> Vec<f64> {
+        w.iter().collect()
+    }
+
+    #[test]
+    fn window_keeps_order_through_wrap_and_span() {
+        let mut w = RawWindow::<4>::new();
+        for x in 1..=6 {
+            w.push(x as f64);
+        }
+        assert_eq!(held(&w), vec![3.0, 4.0, 5.0, 6.0]);
+
+        // SHRINKING KEEPS THE NEWEST, OLDEST FIRST, EVEN ACROSS THE WRAP.
+        w.set_span(2);
+        assert_eq!(held(&w), vec![5.0, 6.0]);
+        w.push(7.0);
+        assert_eq!(held(&w), vec![6.0, 7.0]);
+
+        // GROWING FILLS FROM THE PUSHES THAT FOLLOW.
+        w.set_span(4);
+        w.push(8.0);
+        assert_eq!(held(&w), vec![6.0, 7.0, 8.0]);
+        w.push(9.0);
+        w.push(10.0);
+        assert_eq!(held(&w), vec![7.0, 8.0, 9.0, 10.0]);
+
+        // A SPAN SET BEFORE THE FIRST PUSH HOLDS FROM THE START.
+        let mut v = RawWindow::<8>::new();
+        v.set_span(3);
+        for x in 1..=5 {
+            v.push(x as f64);
+        }
+        assert_eq!(held(&v), vec![3.0, 4.0, 5.0]);
+        assert_eq!(held(&v.newest::<2>()), vec![4.0, 5.0]);
     }
 }

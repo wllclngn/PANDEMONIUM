@@ -29,6 +29,10 @@ MIN_STALL = 60
 # REPO@COMMIT[:SUBDIR] on the command line; REPO may be a URL.
 COMMIT_FORM = re.compile(r"(.+)@([0-9A-Fa-f]{7,64})(?::(.*))?")
 REMOTE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://|[^/@]+@[^/:]+:")
+# A kernel's env entries reach the build container beside the rig's own, which
+# they may not replace. kbuild reads its HOSTCFLAGS and KCFLAGS from there.
+ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+RIG_ENV = {"KLOCALVERSION", "KCC", "HOST_UID", "HOST_GID"}
 # --scheduler options per kind: (single-valued, repeatable).
 SCHED_OPTIONS = {
     "none": ({"ops", "note"}, {"arg"}),
@@ -51,6 +55,7 @@ class Kernel:
     mirrors: tuple[str, ...] = ()   # git: extra remotes that serve fetch-by-SHA
     config: tuple[str, ...] = ()    # git: extra CONFIG_ lines over kernel.config
     cc: str = "gcc"                 # git: "gcc" | "clang" (LLVM=1)
+    env: tuple[str, ...] = ()       # git: extra environment for the build, VAR=VALUE
     image: str = ""                 # image: path to a bzImage / vmlinuz
     modules: str = ""               # image: its /usr/lib/modules/<release>
     note: str = ""
@@ -248,6 +253,11 @@ def validate(t: Ticket) -> Ticket:
                 raise SpecError(f"kernel {k.label}: git kernels need url")
             if k.cc not in ("gcc", "clang"):
                 raise SpecError(f"kernel {k.label}: cc is gcc or clang")
+            for e in k.env:
+                name, sep, _ = e.partition("=")
+                if not sep or not ENV_NAME.fullmatch(name) or name in RIG_ENV:
+                    raise SpecError(f"kernel {k.label}: env {e!r}: VAR=VALUE, VAR not one the "
+                                    f"rig sets itself ({', '.join(sorted(RIG_ENV))})")
         elif k.kind == "image":
             if not k.image or not Path(k.image).is_file():
                 raise SpecError(f"kernel {k.label}: image {k.image!r} not found")
@@ -330,18 +340,19 @@ def _options(arg: str, opts: list[str], single: set[str], multi: set[str]) -> di
 
 
 def parse_kernel_arg(arg: str) -> Kernel:
-    """LABEL=git:URL@SHA[#REF][,mirror=URL]...[,config=CONFIG_X=y]...[,cc=clang][,note=TEXT]
+    """LABEL=git:URL@SHA[#REF][,mirror=URL]...[,config=CONFIG_X=y]...[,env=VAR=VALUE]...
+    [,cc=clang][,note=TEXT]
     LABEL=image:PATH[,modules=DIR][,note=TEXT]
     Option values cannot carry a comma."""
     label, _, rest = arg.partition("=")
     kind, _, body = rest.partition(":")
     head, *opts = body.split(",")
     if kind == "git":
-        o = _options(arg, opts, {"cc", "note"}, {"mirror", "config"})
+        o = _options(arg, opts, {"cc", "note"}, {"mirror", "config", "env"})
         head, _, ref = head.partition("#")
         url, _, sha = head.rpartition("@")
         raw = {"label": label, "kind": "git", "url": url, "sha": sha, "ref": ref,
-               "mirrors": o["mirror"], "config": o["config"]}
+               "mirrors": o["mirror"], "config": o["config"], "env": o["env"]}
         raw.update({k: o[k] for k in ("cc", "note") if k in o})
         return _kernel(raw)
     if kind == "image":

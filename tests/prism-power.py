@@ -3,16 +3,23 @@
 PANDEMONIUM prism-power: scheduler energy efficiency comparison.
 
 Compares EEVDF, PANDEMONIUM (BPF), PANDEMONIUM (ADAPTIVE), and any
-installed external scx schedulers on three workload classes:
+installed external scx schedulers on four workload classes:
 
   idle-floor   30s of no workload. Measures scheduler restlessness via
                idle-window package energy. A scheduler that lets idle
-               cores reach C6 and stay there shows lower idle wattage
-               and (when turbostat is available) higher %C6 residency.
+               cores reach their deepest idle state and stay there shows
+               lower idle wattage and more residency in that state.
 
   messaging    perf bench sched messaging -t -g 24 -l 6000. Fork-storm
                + IPC-heavy workload. Measures J/message under
                reproducible high-cadence wake load.
+
+  paced        30s of prism-frame's paced scenario: framebench capped at
+               144 fps, its work per frame calibrated once on EEVDF before
+               any arm loads. Fixed work at a fixed rate on a partly loaded
+               box, a game, where placement decides how many cores wake, how
+               deep idle goes and how high clocks run. Measures J/frame on
+               the same row as the frame bench's late-frame share and 1% low.
 
   schbench     schbench -m N/4 -t 4 -r 10. Latency-bounded synthetic
                workload at 4 messengers per worker over 10s. Measures
@@ -20,20 +27,23 @@ installed external scx schedulers on three workload classes:
 
 Per (scheduler, workload) the bench runs N independent iterations
 (default 5) with a configurable cooldown between runs (default 30s).
-Each run is wrapped in `perf stat -a -e power/energy-pkg/,...,cycles,
-instructions` to capture run-integral package energy alongside
-instructions and cycles for IPC and EPI derivation. When turbostat is
-installed the bench also samples Avg_MHz, %C6 residency, PkgWatt, and
-PkgTmp throughout the run.
+montauk records each run in a directory of its own, scraping every 250ms
+with its thermal collector sampling at the same rate. Package energy is
+the run's delta of montauk's cumulative RAPL counter, instructions and
+cycles come from its system-wide PMU for IPC and EPI derivation, and the
+same recording carries the cpufreq clock, the CPU temperature and each
+cpuidle state's residency. montauk --analyze reduces every recording.
 
 Output: human-readable column report at
 ~/.cache/pandemonium/prism-power-<stamp>.log plus a sibling Prometheus
 .prom matching the prism-scale emission shape so the file folds into
-the existing reporting pipeline.
+the existing reporting pipeline. montauk's recordings stay under
+~/.cache/pandemonium/power/<stamp>/, one directory per run.
 
 Usage:
     sudo ./tests/prism-power.py
     sudo ./tests/prism-power.py --workload idle-floor
+    sudo ./tests/prism-power.py --workload paced
     sudo ./tests/prism-power.py --iterations 10 --cooldown 60
     sudo ./tests/prism-power.py --schedulers scx_lavd,scx_bpfland
     sudo ./tests/prism-power.py --pandemonium-only
@@ -41,8 +51,8 @@ Usage:
 """
 
 import argparse
+import importlib.util
 import multiprocessing
-import os
 import re
 import shutil
 import subprocess
@@ -53,17 +63,35 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.resolve()))
 from pandemonium_common import (
-    start_and_wait, stop_and_wait, find_scheduler, stop_systemd_scheduler,
-    LOG_DIR, ARCHIVE_DIR, BINARY,
+    start_and_wait, stop_and_wait, clear_loaded_scheduler,
+    LOG_DIR, ARCHIVE_DIR, add_field_flags, field_of,
     get_version, get_git_info,
     log, log_info, log_warn, log_error,
     mean_stdev, mean,
-    is_scx_active, scx_scheduler_name,
-    wait_for_deactivation,
+    is_scx_active,
+    wait_for_deactivation, get_online_cpus,
     ensure_build, PrometheusBuilder,
+    MONTAUK, montauk_available, montauk_has_flag, montauk_analyze_argv,
+    montauk_envelope, run_cmd_capture, _chown_to_invoking_user,
+    MONTAUK_RECORD_MS, MONTAUK_RECORD_FLAGS, MontaukRecorder, stop_recorders,
+    record_run, montauk_population, counter_delta,
  warm_sudo, refresh_sudo,)
 
 sys.path.insert(0, str(Path(__file__).parent.resolve()))
+
+
+def load_frame():
+    """prism-frame, whose framebench build, calibration, paced scenario and
+    run parse the paced workload runs through. A hyphenated name, so it is
+    loaded by path."""
+    spec = importlib.util.spec_from_file_location(
+        "prism_frame", str(Path(__file__).parent / "prism-frame.py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+FRAME = load_frame()
 
 
 # CONFIGURATION
@@ -75,22 +103,15 @@ MESSAGING_GROUPS = 24
 MESSAGING_LOOPS = 6000
 SCHBENCH_RUNTIME_SECS = 10
 SCHBENCH_THREADS_PER_MSG = 4
+# idle-floor's 30s. prism-frame's 15s window suits a throughput read; here
+# each end of the energy delta sits within one 250ms scrape of the run's, so
+# the longer run halves that share, and at 144 fps it leaves 43 frames in
+# the slowest 1% the 1% low is read from.
+PACED_SECS = 30
 
-WORKLOADS = ("idle-floor", "messaging", "schbench")
-DEFAULT_EXTERNALS = []
+WORKLOADS = ("idle-floor", "messaging", "paced", "schbench")
 
-# RAPL events to probe in priority order. The first that works defines
-# the primary energy reading; cores/ram are best-effort and not all
-# CPUs expose them (Zen 2 / 3 typically expose pkg only).
-RAPL_EVENT_CANDIDATES = [
-    "power/energy-pkg/",
-    "power/energy-cores/",
-    "power/energy-ram/",
-]
-
-# Turbostat columns we care about. Filtered down so the subprocess
-# emits a small, parsable table.
-TURBOSTAT_COLUMNS = "CPU,Avg_MHz,Busy%,IRQ,POLL%,C1%,C1E%,C3%,C6%,Pkg%pc6,PkgWatt,CorWatt,PkgTmp"
+POWER_DIR = LOG_DIR / "power"
 
 
 # CAPABILITY PROBES
@@ -119,258 +140,100 @@ def detect_cpu_model() -> str:
     return "unknown"
 
 
-def detect_perf_power_events() -> list[str]:
-    """Probe each candidate RAPL event with a tiny `sleep 0.05` workload.
-    Returns the events that perf accepted. Empty list -> RAPL unavailable.
-    Runs under sudo because perf_event_paranoid=2 (default) blocks RAPL
-    reads from the user PMU."""
-    available = []
-    for ev in RAPL_EVENT_CANDIDATES:
-        r = subprocess.run(
-            ["sudo", "perf", "stat", "-a", "-e", ev, "--", "sleep", "0.05"],
-            capture_output=True, text=True,
-        )
-        # perf prints "<not supported>" when the event exists in the PMU but
-        # the CPU doesn't expose it; "Invalid argument" when the event isn't
-        # registered. Either way, skip.
-        if r.returncode == 0 and "<not supported>" not in r.stderr \
-                and "Invalid argument" not in r.stderr:
-            available.append(ev)
-    return available
-
-
-def detect_turbostat() -> str | None:
-    return shutil.which("turbostat")
-
-
 def detect_schbench() -> str | None:
     return shutil.which("schbench")
 
 
-# PERF STAT WRAPPER
-
-def parse_perf_stat_output(stderr_text: str) -> dict:
-    """Parse perf stat -a output (everything goes to stderr).
-
-    perf prints one event per line, in formats like:
-        12.34 Joules power/energy-pkg/
-        1,234,567 cycles
-        2,345,678 instructions
-    Locale separators (commas) are stripped before float() conversion.
-    """
-    counters: dict[str, float] = {}
-    for raw in stderr_text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        # Skip section headers / metadata
-        if line.startswith("Performance counter"):
-            continue
-        if line.startswith("seconds time elapsed"):
-            continue
-        # Greedy match: number, optional unit word, event name (rest of line
-        # up to whitespace).
-        m = re.match(r"^([\d,]+(?:\.\d+)?)\s+(?:[A-Za-z%/]+\s+)?(\S+)", line)
-        if not m:
-            continue
-        val_str = m.group(1).replace(",", "")
-        name = m.group(2)
-        try:
-            val = float(val_str)
-        except ValueError:
-            continue
-        # perf may suffix events with :u or :k for user/kernel filters
-        name = name.rstrip(":u").rstrip(":k")
-        counters[name] = val
-    return counters
+def montauk_version() -> str:
+    rc, so, _se = run_cmd_capture([*montauk_analyze_argv(), "--version"])
+    return so.strip() if rc == 0 and so.strip() else "unknown"
 
 
-def run_perf_workload(workload_cmd: list[str], power_events: list[str],
-                      timeout: float = 600.0) -> tuple[float, dict] | None:
-    """Run a workload under `perf stat -a` with the given RAPL events plus
-    cycles + instructions. Returns (wall_s, counters_dict) or None on
-    error.
+# MONTAUK RECORDING
 
-    counters_dict keys are perf event names: 'power/energy-pkg/',
-    'cycles', 'instructions', etc."""
-    events = ",".join(power_events + ["cycles", "instructions"])
-    cmd = ["sudo", "perf", "stat", "-a", "-e", events, "--"] + workload_cmd
-    t0 = time.monotonic()
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        log_error(f"perf stat workload timed out after {timeout}s")
+_CSTATE = re.compile(r"(?:^| )state=(\S+)")
+
+
+def cstate_means(cells: list[tuple[str, list[dict]]]) -> dict[str, float]:
+    """{cpuidle state: mean residency %} over the recording's scrapes. Each
+    group's mean is repeated once per scrape it covers, so a run split across
+    two groups weighs every scrape alike."""
+    by_state: dict[str, list[float]] = {}
+    for cell, groups in cells:
+        m = _CSTATE.search(cell)
+        if m is None:
+            continue
+        vals = by_state.setdefault(m.group(1), [])
+        for g in groups:
+            vals += [float(g["mean"])] * int(g["n"])
+    return {s: mean(v) for s, v in by_state.items() if v}
+
+
+def reduce_recording(rec: MontaukRecorder) -> tuple[dict, dict] | None:
+    """(numbers, cstates) for one run from its montauk recording, or None when
+    the recording carries no package energy."""
+    tp = (montauk_envelope(rec.dir, digest=True) or {}).get("thermal_power") or {}
+    if "energy_joules_total" not in tp:
+        log_error(f"montauk recorded no package energy in {rec.dir} "
+                  f"(see {rec.stdout_path})")
         return None
-    wall_s = time.monotonic() - t0
-    if r.returncode != 0:
-        log_error(f"perf stat exit {r.returncode}: {r.stderr.strip()[:300]}")
+    out = {"j_pkg": float(tp["energy_joules_total"])}
+    for key in ("power_avg_w", "power_peak_w", "cpu_clock_avg_mhz",
+                "cpu_temp_avg_c", "cpu_temp_peak_c"):
+        if key in tp:
+            out[key] = float(tp[key])
+    pmu = montauk_population(rec.dir, "montauk_pmu_available")
+    out["pmu_available"] = 1.0 if any(g["max"] > 0 for _c, gs in pmu
+                                      for g in gs) else 0.0
+    if out["pmu_available"]:
+        for key, metric in (("instructions", "montauk_pmu_instructions_total"),
+                            ("cycles", "montauk_pmu_cycles_total")):
+            delta = counter_delta(montauk_population(rec.dir, metric))
+            if delta:
+                out[key] = delta
+    else:
+        log_warn(f"      montauk's system-wide PMU was not up, so IPC and EPI "
+                 f"read n/a (montauk says why in {rec.stdout_path})")
+    cstates = cstate_means(montauk_population(
+        rec.dir, "montauk_cstate_residency_percent"))
+    return out, cstates
+
+
+def record_workload(rec_dir: Path, cmd: list[str], timeout: float):
+    """Run CMD under the shared montauk recorder. Returns (result,
+    CompletedProcess), result carrying wall_s, montauk's numbers and the
+    cpuidle residency, or None on failure."""
+    ran = record_run(rec_dir, cmd, timeout)
+    if ran is None:
         return None
-    counters = parse_perf_stat_output(r.stderr)
-    return wall_s, counters
-
-
-# TURBOSTAT (OPTIONAL BACKGROUND SAMPLER)
-
-class TurbostatSampler:
-    """Run turbostat in the background, capture rows to a tempfile, parse
-    aggregates on stop. Skip silently if turbostat is missing.
-
-    turbostat must be SIGINT'd to flush its output -- it does not buffer
-    cleanly under SIGTERM.
-    """
-
-    def __init__(self, turbostat_path: str | None, label: str):
-        self.path = turbostat_path
-        self.label = label
-        self.proc: subprocess.Popen | None = None
-        self.out_file = None
-        self.out_path: Path | None = None
-
-    def start(self) -> None:
-        if self.path is None:
-            return
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        self.out_path = LOG_DIR / f"turbostat-{self.label}-{os.getpid()}.tmp"
-        self.out_file = open(self.out_path, "w")
-        cmd = [
-            "sudo", self.path, "--quiet",
-            "--interval", "1",
-            "--show", TURBOSTAT_COLUMNS,
-        ]
-        try:
-            self.proc = subprocess.Popen(
-                cmd,
-                stdout=self.out_file,
-                stderr=subprocess.DEVNULL,
-                preexec_fn=os.setpgrp,
-            )
-        except (FileNotFoundError, PermissionError) as e:
-            log_warn(f"turbostat failed to start: {e}")
-            self.proc = None
-            self.out_file.close()
-            self.out_file = None
-
-    def stop(self) -> dict:
-        if self.proc is None:
-            return {}
-        # turbostat runs as root via sudo and ignores SIGTERM in some
-        # versions; SIGINT triggers its clean-flush path. Cross-uid
-        # signaling requires sudo. Send to the negative pgid so both the
-        # sudo wrapper and turbostat receive it.
-        try:
-            pgid = os.getpgid(self.proc.pid)
-            subprocess.run(
-                ["sudo", "kill", "-INT", "--", f"-{pgid}"],
-                capture_output=True,
-            )
-        except (ProcessLookupError, OSError):
-            pgid = None
-        try:
-            self.proc.wait(timeout=3.0)
-        except subprocess.TimeoutExpired:
-            if pgid is not None:
-                subprocess.run(
-                    ["sudo", "kill", "-KILL", "--", f"-{pgid}"],
-                    capture_output=True,
-                )
-            self.proc.wait()
-        if self.out_file:
-            self.out_file.close()
-        if self.out_path and self.out_path.exists():
-            text = self.out_path.read_text()
-            try:
-                self.out_path.unlink()
-            except OSError:
-                pass
-            return parse_turbostat_output(text)
-        return {}
-
-
-def parse_turbostat_output(text: str) -> dict:
-    """Parse turbostat stdout. We want package-summary rows (CPU == '-')
-    and average across them.
-
-    turbostat emits a header row, then per-CPU rows, then a summary row
-    where the CPU column is '-'. Each sample interval emits a fresh
-    block.
-    """
-    if not text:
-        return {}
-    header_cols: list[str] | None = None
-    summaries: list[dict[str, float]] = []
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        # First non-empty line that includes "CPU" is the header
-        if header_cols is None:
-            if "CPU" in line and "Avg_MHz" in line:
-                header_cols = line.split()
-            continue
-        # Re-detection of repeated headers between sample blocks
-        if line.startswith("CPU\t") or line.split()[0] == "CPU":
-            header_cols = line.split()
-            continue
-        cols = line.split()
-        if not cols or len(cols) != len(header_cols):
-            continue
-        # Summary row: CPU column == '-'
-        if cols[0] != "-":
-            continue
-        row: dict[str, float] = {}
-        for name, raw_val in zip(header_cols, cols):
-            try:
-                row[name] = float(raw_val)
-            except ValueError:
-                pass
-        summaries.append(row)
-
-    if not summaries:
-        return {}
-
-    # Average each numeric column across the sample summaries
-    keys = set()
-    for row in summaries:
-        keys.update(row.keys())
-    out: dict[str, float] = {}
-    for key in keys:
-        vals = [row[key] for row in summaries if key in row]
-        if vals:
-            out[key] = mean(vals)
-    out["_samples"] = len(summaries)
-    return out
+    rec, wall_s, r = ran
+    reduced = reduce_recording(rec)
+    if reduced is None:
+        return None
+    numbers, cstates = reduced
+    return {"wall_s": wall_s, "montauk": numbers, "cstates": cstates}, r
 
 
 # WORKLOAD RUNNERS
 
-def run_idle_floor(power_events: list[str], secs: int,
-                   turbostat_path: str | None) -> dict:
-    """Run nothing for `secs` seconds under perf stat -a + turbostat.
+def run_idle_floor(rec_dir: Path, secs: int) -> dict:
+    """Run nothing for `secs` seconds under a montauk recording.
 
     work_unit = elapsed seconds (since there's no other notion of work
     here -- we want average wattage during idle)."""
-    sampler = TurbostatSampler(turbostat_path, "idle")
-    sampler.start()
-    result = run_perf_workload(["sleep", str(secs)], power_events,
-                               timeout=secs + 30)
-    ts = sampler.stop()
-    if result is None:
+    recorded = record_workload(rec_dir, ["sleep", str(secs)], timeout=secs + 30)
+    if recorded is None:
         return {}
-    wall_s, counters = result
-    return {
-        "wall_s": wall_s,
-        "counters": counters,
-        "turbostat": ts,
-        "work_unit": wall_s,
-        "work_unit_label": "idle-second",
-    }
+    result, _proc = recorded
+    result["work_unit"] = result["wall_s"]
+    result["work_unit_label"] = "idle-second"
+    return result
 
 
-def run_messaging(power_events: list[str],
-                  turbostat_path: str | None) -> dict:
-    """perf bench sched messaging under perf stat. Work unit = number of
-    messages exchanged. Each group has 1 sender talking to 20 receivers
-    by default, looped NR_LOOPS times. We treat the work unit as
+def run_messaging(rec_dir: Path) -> dict:
+    """perf bench sched messaging under a montauk recording. Work unit =
+    number of messages exchanged. Each group has 1 sender talking to 20
+    receivers by default, looped NR_LOOPS times. We treat the work unit as
     (groups * loops * 20 * 2) -- each loop is a send+receive in both
     directions."""
     cmd = [
@@ -379,27 +242,45 @@ def run_messaging(power_events: list[str],
         "-g", str(MESSAGING_GROUPS),
         "-l", str(MESSAGING_LOOPS),
     ]
-    sampler = TurbostatSampler(turbostat_path, "messaging")
-    sampler.start()
-    result = run_perf_workload(cmd, power_events, timeout=600)
-    ts = sampler.stop()
-    if result is None:
+    recorded = record_workload(rec_dir, cmd, timeout=600)
+    if recorded is None:
         return {}
-    wall_s, counters = result
+    result, _proc = recorded
     # 20 receivers per group is the perf bench default
-    work_unit = MESSAGING_GROUPS * MESSAGING_LOOPS * 20 * 2
-    return {
-        "wall_s": wall_s,
-        "counters": counters,
-        "turbostat": ts,
-        "work_unit": work_unit,
-        "work_unit_label": "message",
-    }
+    result["work_unit"] = MESSAGING_GROUPS * MESSAGING_LOOPS * 20 * 2
+    result["work_unit_label"] = "message"
+    return result
 
 
-def run_schbench(power_events: list[str], n_cpus: int,
-                 turbostat_path: str | None) -> dict:
-    """schbench -m <msgr> -t <thr> -r <secs> -F128 -n5
+def run_paced(rec_dir: Path, fb: Path, ipu: float, args: list[str]) -> dict:
+    """prism-frame's paced scenario for PACED_SECS under a montauk recording.
+    Work unit = frames presented, with the frame bench's late-frame share and
+    1% low beside it.
+
+    The warmup is zero: framebench counts no frame before its warmup ends, so
+    a warmup's frames would be in the recording's energy and missing from the
+    count. With none, it records every frame time from its first present to
+    its last, the whole process the recording covers. The samples land beside
+    the recording, as its montauk stdout does."""
+    out, tag = rec_dir.parent, rec_dir.name
+    cmd = FRAME.run_cmd(fb, ipu, args, PACED_SECS, 0, out, tag)
+    recorded = record_workload(rec_dir, cmd, timeout=PACED_SECS + 60)
+    if recorded is None:
+        return {}
+    result, r = recorded
+    m = FRAME.run_metrics(r.stdout, args, PACED_SECS, out, tag)
+    if m is None:
+        return {}
+    result["work_unit"] = m["frames"]
+    result["work_unit_label"] = "frame"
+    result["late_pct"] = m["late_pct"]
+    result["low1"] = m["low1"]
+    return result
+
+
+def run_schbench(rec_dir: Path, n_cpus: int) -> dict:
+    """schbench -m <msgr> -t <thr> -r <secs> -F128 -n5 under a montauk
+    recording.
     msgr = max(1, n_cpus // 4) so we don't oversubscribe; threads
     SCHBENCH_THREADS_PER_MSG.
     Work unit = total samples reported by schbench."""
@@ -412,35 +293,15 @@ def run_schbench(power_events: list[str], n_cpus: int,
         "-F", "128",
         "-n", "5",
     ]
-    sampler = TurbostatSampler(turbostat_path, "schbench")
-    sampler.start()
-    # schbench emits its histogram on stderr; we want to capture it for
-    # the sample count. Use Popen + perf wrapper manually so we get both
-    # streams.
-    events = ",".join(power_events + ["cycles", "instructions"])
-    full_cmd = ["sudo", "perf", "stat", "-a", "-e", events, "--"] + cmd
-    t0 = time.monotonic()
-    try:
-        r = subprocess.run(full_cmd, capture_output=True, text=True,
-                           timeout=SCHBENCH_RUNTIME_SECS + 60)
-    except subprocess.TimeoutExpired:
-        log_error("schbench timed out")
-        sampler.stop()
+    recorded = record_workload(rec_dir, cmd, timeout=SCHBENCH_RUNTIME_SECS + 60)
+    if recorded is None:
         return {}
-    wall_s = time.monotonic() - t0
-    ts = sampler.stop()
-    if r.returncode != 0:
-        log_error(f"schbench exit {r.returncode}: {r.stderr.strip()[:300]}")
-        return {}
-    counters = parse_perf_stat_output(r.stderr)
+    result, r = recorded
+    # schbench emits its histogram on stderr
     samples = parse_schbench_samples(r.stdout + "\n" + r.stderr)
-    return {
-        "wall_s": wall_s,
-        "counters": counters,
-        "turbostat": ts,
-        "work_unit": samples or 1,
-        "work_unit_label": "sample",
-    }
+    result["work_unit"] = samples or 1
+    result["work_unit_label"] = "sample"
+    return result
 
 
 def parse_schbench_samples(text: str) -> int:
@@ -476,7 +337,7 @@ def aggregate_runs(runs: list[dict]) -> dict:
     """Take a list of per-run result dicts (from run_idle_floor / etc.) and
     return aggregated mean/stddev across runs. Empty/failed runs are
     excluded."""
-    valid = [r for r in runs if r and "counters" in r]
+    valid = [r for r in runs if r and "montauk" in r]
     if not valid:
         return {"runs": 0}
 
@@ -490,36 +351,36 @@ def aggregate_runs(runs: list[dict]) -> dict:
     out["work_unit_label"] = valid[0].get("work_unit_label", "op")
     out["work_unit_mean"] = sum(r.get("work_unit", 0) for r in valid) / len(valid)
 
-    # Energy and counter aggregation
-    counter_names: set[str] = set()
+    # montauk's numbers: Package energy, the PMU deltas, the clock, the
+    # temperature and the package power it sampled
+    names: set[str] = set()
     for r in valid:
-        counter_names.update(r.get("counters", {}).keys())
-    for cn in counter_names:
-        vals = [r["counters"][cn] for r in valid if cn in r.get("counters", {})]
-        if not vals:
-            continue
+        names.update(r["montauk"])
+    for name in names:
+        vals = [r["montauk"][name] for r in valid if name in r["montauk"]]
         m, sd = mean_stdev(vals)
-        out[f"{cn}_mean"] = m
-        out[f"{cn}_stdev"] = sd
+        out[f"{name}_mean"] = m
+        out[f"{name}_stdev"] = sd
 
-    # Turbostat aggregation
-    ts_keys: set[str] = set()
+    states: set[str] = set()
     for r in valid:
-        ts_keys.update(r.get("turbostat", {}).keys())
-    for tk in ts_keys:
-        if tk == "_samples":
-            continue
-        vals = [r["turbostat"][tk] for r in valid if tk in r.get("turbostat", {})]
-        if not vals:
-            continue
-        m, sd = mean_stdev(vals)
-        out[f"ts_{tk}_mean"] = m
-        out[f"ts_{tk}_stdev"] = sd
+        states.update(r["cstates"])
+    out["cstates"] = {s: mean([r["cstates"][s] for r in valid if s in r["cstates"]])
+                      for s in states}
 
-    # Derived: J/work_unit, IPC, EPI (joules per instruction)
-    j_pkg = out.get("power/energy-pkg/_mean", 0.0)
-    ins = out.get("instructions_mean", 0.0)
-    cyc = out.get("cycles_mean", 0.0)
+    # A paced cell's frame quality, the frame bench's own numbers
+    for key in ("late_pct", "low1"):
+        vals = [r[key] for r in valid if key in r]
+        if vals:
+            out[f"{key}_mean"], out[f"{key}_stdev"] = mean_stdev(vals)
+
+    # Derived: J/work_unit, IPC, EPI (joules per instruction). IPC and EPI
+    # only for a cell whose every run had the PMU up: Over fewer runs the
+    # instruction mean would not share J_PKG's run set.
+    pmu = all(r["montauk"]["pmu_available"] for r in valid)
+    j_pkg = out.get("j_pkg_mean", 0.0)
+    ins = out.get("instructions_mean", 0.0) if pmu else 0.0
+    cyc = out.get("cycles_mean", 0.0) if pmu else 0.0
     work = out["work_unit_mean"]
     if j_pkg > 0 and work > 0:
         out["j_per_op_mean"] = j_pkg / work
@@ -546,8 +407,7 @@ def _fmt(val, width: int, prec: int = 2, suffix: str = "") -> str:
 
 
 def write_report(version: str, git: dict, stamp: str, ncpus: int,
-                 vendor: str, model: str, power_events: list[str],
-                 turbostat_available: bool, runs: int,
+                 vendor: str, model: str, montauk_ver: str, runs: int,
                  cooldown_secs: int, all_results: dict,
                  cold: dict | None = None) -> Path:
     """Render a column-table summary suitable for committing into the
@@ -559,8 +419,8 @@ def write_report(version: str, git: dict, stamp: str, ncpus: int,
     R.append(f"ncpus:      {ncpus}")
     R.append(f"runs:       {runs} per (scheduler, workload)")
     R.append(f"cooldown:   {cooldown_secs}s between runs")
-    R.append(f"rapl events: {', '.join(power_events) or 'none'}")
-    R.append(f"turbostat:  {'available' if turbostat_available else 'missing (install linux-cpupower for full profile)'}")
+    R.append(f"instrument: montauk {montauk_ver}, one recording per run at "
+             f"{MONTAUK_RECORD_MS}ms")
     R.append("")
 
     workloads = sorted({wl for results in all_results.values() for wl in results})
@@ -577,10 +437,14 @@ def write_report(version: str, git: dict, stamp: str, ncpus: int,
 
     for wl in workloads:
         R.append(f"[{wl.upper()}]")
-        # ENERGY TABLE
+        # ENERGY TABLE, a paced cell's frame quality on the same row
+        quality = any("late_pct_mean" in (all_results[sn].get(wl) or {})
+                      for sn in sched_order)
         header = (f"{'SCHEDULER':<26} {'RUNS':>5} {'WALL_S':>10} "
                   f"{'J_PKG':>10} {'AVG_W':>8} {'J/OP':>14} {'IPC':>7} "
                   f"{'EPI_pJ':>9}")
+        if quality:
+            header += f" {'LATE%':>7} {'LOW1':>7}"
         R.append(header)
         for sn in sched_order:
             sd = all_results[sn].get(wl)
@@ -589,7 +453,7 @@ def write_report(version: str, git: dict, stamp: str, ncpus: int,
                 continue
             row = f"{sn:<26} {sd['runs']:>5d}"
             row += f" {_fmt(sd.get('wall_s_mean'), 9, 2)}s"
-            row += f" {_fmt(sd.get('power/energy-pkg/_mean'), 9, 2)}J"
+            row += f" {_fmt(sd.get('j_pkg_mean'), 9, 2)}J"
             row += f" {_fmt(sd.get('avg_watts_mean'), 7, 2)}W"
             j_per_op = sd.get("j_per_op_mean")
             if j_per_op is not None:
@@ -610,29 +474,31 @@ def write_report(version: str, git: dict, stamp: str, ncpus: int,
                 row += f" {epi*1e12:>7.2f}pJ"
             else:
                 row += f" {'n/a':>9}"
+            if quality:
+                row += (f" {_fmt(sd.get('late_pct_mean'), 7, 2)}"
+                        f" {_fmt(sd.get('low1_mean'), 7, 1)}")
             R.append(row)
         R.append("")
 
-        # FREQUENCY / IDLE TABLE (turbostat)
-        ts_avail = any(
-            "ts_Avg_MHz_mean" in (all_results[sn].get(wl) or {})
-            for sn in sched_order
-        )
-        if ts_avail:
-            R.append(f"{'SCHEDULER':<26} {'AVG_MHZ':>9} {'BUSY%':>7} "
-                     f"{'C1%':>7} {'C6%':>7} {'PKG_PC6%':>9} {'PKGTMP':>8}")
-            for sn in sched_order:
-                sd = all_results[sn].get(wl) or {}
-                if "ts_Avg_MHz_mean" not in sd:
-                    R.append(f"{sn:<26} {'n/a':>9}")
+        # FREQUENCY / IDLE TABLE: montauk's cpufreq clock (scaling_cur_freq
+        # across online CPUs, not an APERF/MPERF reading), each cpuidle
+        # state's residency by name and the CPU temperature
+        cells = [all_results[sn].get(wl) or {} for sn in sched_order]
+        states = sorted({s for sd in cells for s in sd.get("cstates", {})},
+                        key=lambda s: (s != "POLL", s))
+        if any("cpu_clock_avg_mhz_mean" in sd or sd.get("cstates") for sd in cells):
+            R.append(f"{'SCHEDULER':<26} {'CPUFREQ_MHZ':>11}"
+                     + "".join(f" {s + '%':>7}" for s in states)
+                     + f" {'PKGTMP':>8}")
+            for sn, sd in zip(sched_order, cells):
+                if sd.get("runs", 0) == 0:
+                    R.append(f"{sn:<26} {'n/a':>11}")
                     continue
-                row = f"{sn:<26}"
-                row += f" {sd.get('ts_Avg_MHz_mean', 0):>9.0f}"
-                row += f" {sd.get('ts_Busy%_mean', 0):>7.1f}"
-                row += f" {sd.get('ts_C1%_mean', 0):>7.1f}"
-                row += f" {sd.get('ts_C6%_mean', 0):>7.1f}"
-                row += f" {sd.get('ts_Pkg%pc6_mean', 0):>9.1f}"
-                row += f" {sd.get('ts_PkgTmp_mean', 0):>7.1f}C"
+                row = f"{sn:<26} {_fmt(sd.get('cpu_clock_avg_mhz_mean'), 11, 0)}"
+                for s in states:
+                    row += f" {_fmt(sd['cstates'].get(s), 7, 1)}"
+                temp = sd.get("cpu_temp_avg_c_mean")
+                row += f" {temp:>7.1f}C" if temp is not None else f" {'n/a':>8}"
                 R.append(row)
             R.append("")
 
@@ -642,7 +508,7 @@ def write_report(version: str, git: dict, stamp: str, ncpus: int,
             R.append(f"{'SCHEDULER':<26} {'WALL_VS_EEVDF':>14} "
                      f"{'J_VS_EEVDF':>12} {'J/OP_VS_EEVDF':>15}")
             base_wall = eevdf_sd.get("wall_s_mean", 0)
-            base_j = eevdf_sd.get("power/energy-pkg/_mean", 0)
+            base_j = eevdf_sd.get("j_pkg_mean", 0)
             base_jop = eevdf_sd.get("j_per_op_mean", 0)
             for sn in sched_order:
                 if sn == "EEVDF":
@@ -654,7 +520,7 @@ def write_report(version: str, git: dict, stamp: str, ncpus: int,
                     continue
                 row = f"{sn:<26}"
                 w = sd.get("wall_s_mean", 0)
-                j = sd.get("power/energy-pkg/_mean", 0)
+                j = sd.get("j_pkg_mean", 0)
                 jop = sd.get("j_per_op_mean", 0)
                 if base_wall > 0 and w > 0:
                     d = (w - base_wall) / base_wall * 100
@@ -698,17 +564,18 @@ def write_report(version: str, git: dict, stamp: str, ncpus: int,
 # PROMETHEUS
 
 def write_prometheus(version: str, git: dict, stamp: str, ncpus: int,
-                     vendor: str, model: str, power_events: list[str],
+                     vendor: str, model: str, montauk_ver: str,
                      runs: int, cooldown_secs: int,
                      all_results: dict) -> Path:
     pb = PrometheusBuilder("power")
     pb.info(ts=int(datetime.strptime(stamp, "%Y%m%d-%H%M%S").timestamp()),
             version=version, git_commit=git["commit"], git_dirty=git["dirty"],
-            vendor=vendor, model=model)
+            vendor=vendor, model=model, montauk_version=montauk_ver)
     pb.gauge("cpus", ncpus, help="CPUs available")
     pb.gauge("runs", runs, help="iterations per cell")
     pb.gauge("cooldown_seconds", cooldown_secs, help="cooldown between runs")
-    pb.gauge("rapl_events", len(power_events), help="RAPL events used")
+    pb.gauge("montauk_interval_ms", MONTAUK_RECORD_MS,
+             help="montauk's scrape and thermal-sample interval in every run's recording")
 
     for sched_name, by_workload in all_results.items():
         for wl, sd in by_workload.items():
@@ -721,18 +588,10 @@ def write_prometheus(version: str, git: dict, stamp: str, ncpus: int,
                      help="wall-clock time (mean)", labels=ls)
             pb.gauge("wall_seconds_stdev", f"{sd.get('wall_s_stdev', 0):.4f}",
                      help="wall-clock time (stddev)", labels=ls)
-            pb.gauge("joules_pkg", f"{sd.get('power/energy-pkg/_mean', 0):.4f}",
+            pb.gauge("joules_pkg", f"{sd.get('j_pkg_mean', 0):.4f}",
                      help="package energy (mean joules)", labels=ls)
-            pb.gauge("joules_pkg_stdev", f"{sd.get('power/energy-pkg/_stdev', 0):.4f}",
+            pb.gauge("joules_pkg_stdev", f"{sd.get('j_pkg_stdev', 0):.4f}",
                      help="package energy (stddev joules)", labels=ls)
-            cores = sd.get("power/energy-cores/_mean")
-            if cores is not None:
-                pb.gauge("joules_cores", f"{cores:.4f}",
-                         help="cores energy (mean joules)", labels=ls)
-            ram = sd.get("power/energy-ram/_mean")
-            if ram is not None:
-                pb.gauge("joules_ram", f"{ram:.4f}",
-                         help="RAM energy (mean joules)", labels=ls)
             if "avg_watts_mean" in sd:
                 pb.gauge("avg_watts", f"{sd['avg_watts_mean']:.4f}",
                          help="average package wattage during run", labels=ls)
@@ -741,20 +600,46 @@ def write_prometheus(version: str, git: dict, stamp: str, ncpus: int,
                          help="joules per work unit (label varies per workload)", labels=ls)
                 pb.gauge("work_unit_count", f"{sd.get('work_unit_mean', 0):.0f}",
                          help="total work units in run (mean)", labels=ls)
+            if sd.get("work_unit_label") == "frame":
+                pb.gauge("frames", f"{sd.get('work_unit_mean', 0):.0f}",
+                         help="frames a paced run presented (mean)", labels=ls)
+            for key, metric, help_text in (
+                    ("late_pct", "frame_late_pct",
+                     f"% of paced frames later than {FRAME.LATE_FACTOR:.0%} of "
+                     f"the {FRAME.PACED_HZ} fps period"),
+                    ("low1", "frame_low1_fps",
+                     "1% low of a paced run, its p99 frame time as FPS")):
+                if f"{key}_mean" in sd:
+                    pb.gauge(metric, f"{sd[f'{key}_mean']:.4f}",
+                             help=f"{help_text} (mean)", labels=ls)
+                    pb.gauge(f"{metric}_stdev", f"{sd[f'{key}_stdev']:.4f}",
+                             help=f"{help_text} (stddev)", labels=ls)
             if "ipc_mean" in sd:
                 pb.gauge("ipc", f"{sd['ipc_mean']:.4f}",
                          help="instructions per cycle (mean)", labels=ls)
             if "epi_mean" in sd:
                 pb.gauge("epi_joules", f"{sd['epi_mean']:.4e}",
                          help="energy per instruction (mean joules)", labels=ls)
-            for ts_key in ("Avg_MHz", "Busy%", "C1%", "C6%", "Pkg%pc6",
-                           "PkgWatt", "PkgTmp"):
-                key = f"ts_{ts_key}_mean"
-                if key not in sd:
-                    continue
-                safe = ts_key.replace("%", "_pct").replace("/", "_")
-                pb.gauge(f"turbostat_{safe}", f"{sd[key]:.4f}",
-                         help=f"turbostat {ts_key} averaged across run samples", labels=ls)
+            pb.gauge("pmu_available", f"{sd.get('pmu_available_mean', 0):.4f}",
+                     help="fraction of runs whose montauk recording had the "
+                          "system-wide PMU up", labels=ls)
+            for key, metric, help_text in (
+                    ("power_avg_w_mean", "sampled_watts",
+                     "package power, mean of montauk's scrapes (mean across runs)"),
+                    ("power_peak_w_mean", "peak_watts",
+                     "peak package power montauk sampled (mean across runs)"),
+                    ("cpu_clock_avg_mhz_mean", "cpu_clock_mhz",
+                     "cpufreq clock across online CPUs (mean)"),
+                    ("cpu_temp_avg_c_mean", "cpu_temp_celsius",
+                     "CPU temperature, montauk's hottest CPU sensor (mean)"),
+                    ("cpu_temp_peak_c_mean", "cpu_temp_peak_celsius",
+                     "peak CPU temperature (mean across runs)")):
+                if key in sd:
+                    pb.gauge(metric, f"{sd[key]:.4f}", help=help_text, labels=ls)
+            for state, pct in sorted(sd.get("cstates", {}).items()):
+                pb.gauge("cstate_residency_pct", f"{pct:.4f}",
+                         help="cpuidle residency per state across online CPUs (mean)",
+                         labels={**ls, "state": state})
 
     ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
     path = ARCHIVE_DIR / f"prism-power-{version}-{stamp}.prom"
@@ -764,31 +649,19 @@ def write_prometheus(version: str, git: dict, stamp: str, ncpus: int,
 
 # SCHEDULER ENTRIES
 
-def build_entries(args, has_schbench: bool) -> list[tuple[str, list[str] | None]]:
-    """Returns ordered list of (display_name, cmd_or_None) entries.
-    None command means EEVDF (default kernel scheduler)."""
-    entries: list[tuple[str, list[str] | None]] = []
-    if not args.no_eevdf and not args.pandemonium_only:
-        entries.append(("EEVDF", None))
-    if not args.no_pandemonium:
-        # Production-realistic activation: no --verbose, the periodic
-        # logging would itself contaminate idle-floor measurements.
-        # NO --verbose HERE, AND THAT IS DELIBERATE. Every other bench passes it
-        # because its per-second line is the only surface for the enqueue-tier
-        # counters. This bench measures WATTS, so it is the one arm where the
-        # cost of a per-second print is the quantity under test rather than a
-        # rounding error. If the enqueue split is ever wanted here, it is worth
-        # measuring the flag's own draw first.
-        entries.append(("PANDEMONIUM (BPF)", [str(BINARY), "--no-adaptive"]))
-        entries.append(("PANDEMONIUM (ADAPTIVE)", [str(BINARY)]))
-    if not args.pandemonium_only:
-        for name in args.schedulers:
-            path = find_scheduler(name)
-            if path:
-                log_info(f"Found: {name} ({path})")
-                entries.append((name, [name]))
-            else:
-                log_warn(f"SKIPPING {name} (not installed)")
+def build_entries(args) -> list[tuple[str, list[str] | None]]:
+    """The (display_name, cmd_or_None) arms, EEVDF's cmd None: the field of
+    field_of."""
+    # Production-realistic activation: NO --verbose HERE, AND THAT IS DELIBERATE.
+    # Every other bench passes it because its per-second line is the only
+    # surface for the enqueue-tier counters. This bench measures WATTS, so it is
+    # the one arm where the cost of a per-second print is the quantity under test
+    # rather than a rounding error. If the enqueue split is ever wanted here, it
+    # is worth measuring the flag's own draw first.
+    entries = field_of(args, verbose=False)
+    if not entries:
+        log_error("no scheduler arm to run: nothing named by --only/--schedulers "
+                  "is installed")
     return entries
 
 
@@ -798,7 +671,7 @@ def select_workloads(args, has_schbench: bool) -> list[str]:
             log_warn("schbench not installed; skipping")
             return []
         return [args.workload]
-    out = ["idle-floor", "messaging"]
+    out = ["idle-floor", "messaging", "paced"]
     if has_schbench:
         out.append("schbench")
     else:
@@ -808,14 +681,15 @@ def select_workloads(args, has_schbench: bool) -> list[str]:
 
 # MAIN
 
-def run_workload(wl: str, power_events: list[str], n_cpus: int,
-                 turbostat_path: str | None) -> dict:
+def run_workload(wl: str, n_cpus: int, rec_dir: Path, paced: tuple | None) -> dict:
     if wl == "idle-floor":
-        return run_idle_floor(power_events, IDLE_FLOOR_SECS, turbostat_path)
+        return run_idle_floor(rec_dir, IDLE_FLOOR_SECS)
     if wl == "messaging":
-        return run_messaging(power_events, turbostat_path)
+        return run_messaging(rec_dir)
+    if wl == "paced":
+        return run_paced(rec_dir, *paced)
     if wl == "schbench":
-        return run_schbench(power_events, n_cpus, turbostat_path)
+        return run_schbench(rec_dir, n_cpus)
     log_error(f"unknown workload: {wl}")
     return {}
 
@@ -829,18 +703,11 @@ def main() -> int:
                     help=f"Iterations per (scheduler, workload) cell (default {DEFAULT_RUNS})")
     ap.add_argument("--cooldown", type=int, default=DEFAULT_COOLDOWN_SECS,
                     help=f"Seconds between runs (default {DEFAULT_COOLDOWN_SECS})")
-    ap.add_argument("--schedulers", default=",".join(DEFAULT_EXTERNALS),
-                    help="Comma-separated external scx schedulers")
     ap.add_argument("--trace", action="store_true",
                     help="Also run the cold-wake arm, a montauk capture of "
-                         "idle-exit latency. Without it the run is RAPL counters "
-                         "alone")
-    ap.add_argument("--pandemonium-only", action="store_true",
-                    help="Only test PANDEMONIUM (BPF + ADAPTIVE), no EEVDF or external scx")
-    ap.add_argument("--no-eevdf", action="store_true",
-                    help="Skip EEVDF baseline")
-    ap.add_argument("--no-pandemonium", action="store_true",
-                    help="Skip PANDEMONIUM (debugging external schedulers)")
+                         "idle-exit latency. Without it the run is the energy "
+                         "workloads' montauk recordings alone")
+    add_field_flags(ap)
     ap.add_argument("--no-build", action="store_true",
                     help="Skip ensure_build (use existing binary)")
     # COLD-WAKE IS POWER'S FOURTH ARM. The energy workloads measure what idle
@@ -848,7 +715,7 @@ def main() -> int:
     # first wake off a deep-idle core, separated from the governor's frequency
     # ramp. Reporting the win without the cost is half the trade, which is why
     # these were never two benches. prism-coldwake keeps its own entry point
-    # because --dev storm shares that implementation.
+    # because prism's default pass runs it, and its --storm reproducer, by name.
     ap.add_argument("--no-cold-wake", action="store_true",
                     help="Skip the cold-wake arm that --trace adds (energy "
                          "workloads only)")
@@ -857,14 +724,23 @@ def main() -> int:
     ap.add_argument("--cores", type=str, default=None,
                     help="Accepted for suite uniformity; RAPL is measured whole-package, not per width")
     args = ap.parse_args()
-    args.schedulers = [s.strip() for s in args.schedulers.split(",") if s.strip()]
-
     warm_sudo()
-    if not shutil.which("perf"):
-        log_error("perf not found. Install with: sudo pacman -S perf")
+    if args.workload in ("all", "messaging") and not shutil.which("perf"):
+        log_error("perf not found; the messaging workload is perf bench sched "
+                  "messaging. Install with: sudo pacman -S perf")
+        return 1
+    if not montauk_available():
+        log_error(f"montauk not found at {MONTAUK}; it records every run. "
+                  f"Install montauk")
+        return 1
+    missing = [f for f in MONTAUK_RECORD_FLAGS if not montauk_has_flag(f)]
+    if missing:
+        log_error(f"the installed montauk has no {', '.join(missing)}, which "
+                  f"every run's recording passes. Install the newer montauk")
         return 1
 
-    if not args.no_build and not args.no_pandemonium:
+    entries = build_entries(args)
+    if not args.no_build and any(n.startswith("PANDEMONIUM") for n, _ in entries):
         ensure_build()
 
     ver = get_version()
@@ -876,20 +752,8 @@ def main() -> int:
 
     log_info(f"prism-power v{ver} [{git['commit']}{' (dirty)' if git['dirty'] else ''}]")
     log_info(f"CPU: {model} ({vendor})  ncpus: {n_cpus}")
-
-    power_events = detect_perf_power_events()
-    if not power_events:
-        log_error("No RAPL events accessible via perf. Verify CONFIG_X86_RAPL "
-                  "and that perf can read MSRs as root.")
-        return 1
-    log_info(f"RAPL events: {', '.join(power_events)}")
-
-    turbostat_path = detect_turbostat()
-    if turbostat_path:
-        log_info(f"turbostat: {turbostat_path}")
-    else:
-        log_warn("turbostat not installed; install linux-cpupower for "
-                 "frequency / C-state / temperature profile")
+    montauk_ver = montauk_version()
+    log_info(f"montauk: {montauk_ver} at {MONTAUK}")
 
     schbench_path = detect_schbench()
     if schbench_path:
@@ -905,17 +769,20 @@ def main() -> int:
              f"cooldown: {args.cooldown}s")
     print()
 
-    # Disengage any active sched_ext before starting (matches prism-fork-thread)
-    if is_scx_active():
-        active = scx_scheduler_name()
-        log_warn(f"sched_ext active ({active}) -- stopping pandemonium service")
-        stop_systemd_scheduler()
-        if not wait_for_deactivation(5.0):
-            log_error("Could not deactivate sched_ext")
-            return 1
+    if not clear_loaded_scheduler():
+        return 1
     time.sleep(1)
 
-    entries = build_entries(args, schbench_path is not None)
+    # On EEVDF, before any arm loads, so every arm runs the same work per frame
+    paced = None
+    if "paced" in workloads:
+        fb = FRAME.build(stamp)
+        ipu = FRAME.calibrate(fb) if fb is not None else None
+        if ipu is None:
+            return 1
+        log_info(f"calibration on EEVDF: {ipu:.3f} iterations/us")
+        paced = (fb, ipu, FRAME.scenarios(get_online_cpus())["paced"])
+
     if not entries:
         log_error("No schedulers selected")
         return 1
@@ -923,12 +790,14 @@ def main() -> int:
     print()
 
     all_results: dict[str, dict[str, dict]] = {}
+    rec_root = POWER_DIR / stamp
 
     try:
         for sched_name, cmd in entries:
             all_results[sched_name] = {}
             log_info(f"[{sched_name}] starting...")
             refresh_sudo()
+            safe = sched_name.replace(" ", "-").replace("(", "").replace(")", "")
 
             guard = None
             if cmd is not None:
@@ -944,12 +813,11 @@ def main() -> int:
                     runs: list[dict] = []
                     for i in range(args.iterations):
                         log_info(f"    run {i+1}/{args.iterations}...")
-                        result = run_workload(wl, power_events, n_cpus,
-                                              turbostat_path)
-                        if result and "counters" in result:
-                            j = result["counters"].get("power/energy-pkg/", 0)
+                        result = run_workload(
+                            wl, n_cpus, rec_root / f"{safe}-{wl}-{i+1}", paced)
+                        if result and "montauk" in result:
                             log_info(f"      wall={result['wall_s']:.2f}s "
-                                     f"J_pkg={j:.2f}")
+                                     f"J_pkg={result['montauk']['j_pkg']:.2f}")
                         else:
                             log_warn("      run failed")
                         runs.append(result)
@@ -961,7 +829,7 @@ def main() -> int:
                     if agg.get("runs", 0) > 0:
                         log_info(f"  [{wl}] mean: "
                                  f"wall={agg.get('wall_s_mean', 0):.2f}s "
-                                 f"J_pkg={agg.get('power/energy-pkg/_mean', 0):.2f} "
+                                 f"J_pkg={agg.get('j_pkg_mean', 0):.2f} "
                                  f"avg_W={agg.get('avg_watts_mean', 0):.2f}")
                     if wl != workloads[-1]:
                         cooldown(args.cooldown)
@@ -974,6 +842,8 @@ def main() -> int:
     except KeyboardInterrupt:
         log_warn("interrupted")
     finally:
+        stop_recorders()
+        _chown_to_invoking_user(POWER_DIR)
         if is_scx_active():
             wait_for_deactivation(5.0)
 
@@ -995,15 +865,15 @@ def main() -> int:
     if any(by_wl for by_wl in all_results.values()):
         print()
         report_path = write_report(ver, git, stamp, n_cpus, vendor, model,
-                                   power_events, turbostat_path is not None,
-                                   args.iterations, args.cooldown, all_results,
-                                   cold=cold)
+                                   montauk_ver, args.iterations, args.cooldown,
+                                   all_results, cold=cold)
         prom_path = write_prometheus(ver, git, stamp, n_cpus, vendor, model,
-                                     power_events, args.iterations, args.cooldown,
+                                     montauk_ver, args.iterations, args.cooldown,
                                      all_results)
         log.report(report_path.read_text())
         log_info(f"REPORT: {report_path}")
         log_info(f"METRICS: {prom_path}")
+        log_info(f"RECORDINGS: {rec_root}")
     else:
         log_error("No successful results to report")
         return 1

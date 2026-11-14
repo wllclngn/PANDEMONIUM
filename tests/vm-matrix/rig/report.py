@@ -403,7 +403,7 @@ def _stale(k: Kernel, s: Scheduler, cell: dict, hashes: dict) -> list[str]:
     sid = cell.get("scheduler_identity") or {}
     want: dict = {"kind": k.kind}
     if k.kind == "git":
-        want.update(sha=k.sha, cc=k.cc, config_extra=list(k.config))
+        want.update(sha=k.sha, cc=k.cc, config_extra=list(k.config), env=list(k.env))
     else:
         want.update(image=str(Path(k.image)), modules=str(Path(k.modules)) if k.modules else None,
                     image_sha256=content(k.image))

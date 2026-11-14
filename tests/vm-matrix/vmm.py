@@ -276,8 +276,9 @@ def parser() -> argparse.ArgumentParser:
     common.add_argument("ticket", metavar="TICKET", help="ticket .toml, or - with --ticket-id")
     common.add_argument("--ticket-id", metavar="ID", help="ticket id for -, or a new id for a .toml")
     common.add_argument("--kernel", action="append", metavar="SPEC",
-                        help="LABEL=git:URL@SHA[#REF][,mirror=URL][,config=CONFIG_X=y][,cc=clang] "
-                             "or LABEL=image:PATH[,modules=DIR]; options repeat, values carry no comma")
+                        help="LABEL=git:URL@SHA[#REF][,mirror=URL][,config=CONFIG_X=y]"
+                             "[,env=VAR=VALUE][,cc=clang] or LABEL=image:PATH[,modules=DIR]; "
+                             "options repeat, values carry no comma")
     common.add_argument("--scheduler", action="append", metavar="SPEC",
                         help="LABEL=cargo:DIR or LABEL=cargo:REPO|URL@COMMIT[:SUBDIR] with "
                              "[,bin=,pkg=,ops=,ref=,arg=,sha256=REL:HEX,mirror=,input=], "

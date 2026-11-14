@@ -28,8 +28,8 @@
 #   8. ADDS WORKSPACE MEMBER TO ROOT Cargo.toml IF MISSING
 #   9. FORMATS, UPDATES Cargo.lock, THEN FAILS ON cargo fmt --check OR A FAILED
 #      cargo build OF THE CRATE
-#  10. WRITES THE PR BODY FROM COMMIT_MESSAGE.txt TO /tmp/pandemonium/ WHEN THE
-#      TREE HAS ONE (THE PUBLISHED TREE DOES NOT)
+#  10. WRITES THE PR BODY FROM COMMIT_MESSAGE.txt BESIDE THE LOGS
+#      (~/.cache/pandemonium/) WHEN THE TREE HAS ONE (THE PUBLISHED TREE DOES NOT)
 #
 # THE BPF SOURCE IS COPIED AS IT STANDS: IT IS WRITTEN AGAINST THE SAME scx
 # HEADER API THE MONOREPO BUILDS IT WITH.
@@ -45,7 +45,7 @@ import subprocess
 import sys
 
 from pandemonium_common import (
-    get_git_info, get_version, log, log_error, log_info, log_warn, scx_profiles,
+    LOG_DIR, get_git_info, get_version, log, log_error, log_info, log_warn, scx_profiles,
 )
 
 CRATE_OLD = "pandemonium"
@@ -325,7 +325,7 @@ def normalize_dep_versions(dst_root):
 
     # Match: key = "X.Y.Z" (simple string version deps)
     new_text = re.sub(
-        r'((?:libc|anyhow|clap|ctrlc|flate2|regex|libbpf-rs)\s*=\s*(?:\{[^}]*version\s*=\s*|))"(\d+\.\d+\.\d+)"',
+        r'((?:libc|anyhow|clap|ctrlc|regex|libbpf-rs)\s*=\s*(?:\{[^}]*version\s*=\s*|))"(\d+\.\d+\.\d+)"',
         normalize_version,
         text,
     )
@@ -392,13 +392,22 @@ def patch_version_display(dst_root):
     text = open(main_path).read()
     changes = 0
 
+    def swap(old, new, what):
+        # A STEP WHOSE ANCHOR HAS LEFT main.rs FAILS THE EXPORT. SKIPPED, THE
+        # HANDLER BELOW LEAVES A --version THAT PRINTS NOTHING AND STARTS THE
+        # SCHEDULER, AND THE CRATE STILL BUILDS.
+        nonlocal text, changes
+        if old not in text:
+            log_error(f"main.rs has no {what} for the version patch to anchor on")
+            sys.exit(1)
+        text = text.replace(old, new, 1)
+        changes += 1
+
     # Add use scx_utils::build_id import after existing use statements
     if "use scx_utils::build_id" not in text:
-        text = text.replace(
-            "use scheduler::Scheduler;",
-            "use scheduler::Scheduler;\nuse scx_utils::build_id;",
-        )
-        changes += 1
+        swap("use scheduler::Scheduler;",
+             "use scheduler::Scheduler;\nuse scx_utils::build_id;",
+             "`use scheduler::Scheduler;`")
 
     # Replace clap version attribute with disable_version_flag + manual flag
     old_clap = (
@@ -413,9 +422,8 @@ def patch_version_display(dst_root):
         '    about = "PANDEMONIUM -- ADAPTIVE LINUX SCHEDULER"\n'
         ")]"
     )
-    if old_clap in text:
-        text = text.replace(old_clap, new_clap)
-        changes += 1
+    if new_clap not in text:
+        swap(old_clap, new_clap, "clap version attribute")
 
     # Add --version flag to Cli struct (after verbose field)
     version_field = (
@@ -424,11 +432,9 @@ def patch_version_display(dst_root):
         "    version: bool,"
     )
     if "version: bool" not in text:
-        text = text.replace(
-            "    #[arg(short, long)]\n    verbose: bool,",
-            "    #[arg(short, long)]\n    verbose: bool,\n\n" + version_field,
-        )
-        changes += 1
+        swap("    #[arg(short, long)]\n    verbose: bool,",
+             "    #[arg(short, long)]\n    verbose: bool,\n\n" + version_field,
+             "verbose field")
 
     # Replace banner log_info with build_id::full_version
     old_banner = (
@@ -447,11 +453,10 @@ def patch_version_display(dst_root):
         '        if smt_on { "on" } else { "off" }\n'
         '    );'
     )
-    if old_banner in text:
-        text = text.replace(old_banner, new_banner)
-        changes += 1
+    if new_banner not in text:
+        swap(old_banner, new_banner, "version banner")
 
-    # Add --version handler in main() before the match block
+    # Add --version handler in main(), straight after the parse
     version_handler = (
         '\n    if cli.version {\n'
         '        println!(\n'
@@ -462,11 +467,9 @@ def patch_version_display(dst_root):
         '    }\n'
     )
     if "if cli.version {" not in text:
-        text = text.replace(
-            "    match cli.command {",
-            version_handler + "\n    match cli.command {",
-        )
-        changes += 1
+        swap("    let cli = Cli::parse();\n",
+             "    let cli = Cli::parse();\n" + version_handler,
+             "`let cli = Cli::parse();`")
 
     if changes:
         open(main_path, "w").write(text)
@@ -477,11 +480,11 @@ def patch_version_display(dst_root):
 
 
 def patch_ops_version_suffix(dst_root):
-    """Inject version suffix into struct_ops name for scx_loader GUI display.
+    """Inject version suffix into struct_ops name.
 
-    scx_loader reads /sys/kernel/sched_ext/root/ops to get the scheduler name
-    and version. Without this, the version appears in logs but not in the GUI.
-    Matches the pattern used by scx_cake, scx_flash, etc.
+    /sys/kernel/sched_ext/root/ops carries the running scheduler's name, and
+    with the suffix its version. Without this, the version appears in logs but
+    not there. Matches the pattern used by scx_flash and others.
     """
     sched_path = os.path.join(dst_root, "src", "scheduler.rs")
     if not os.path.exists(sched_path):
@@ -498,7 +501,7 @@ def patch_ops_version_suffix(dst_root):
     inject_block = (
         '        let mut open_skel = builder.open(open_object)?;\n'
         '\n'
-        '        // INJECT VERSION SUFFIX INTO OPS NAME FOR scx_loader GUI\n'
+        '        // INJECT VERSION SUFFIX INTO OPS NAME\n'
         '        {\n'
         '            let ops = open_skel.struct_ops.pandemonium_ops_mut();\n'
         '            let name_field = &mut ops.name;\n'
@@ -532,7 +535,7 @@ def patch_ops_version_suffix(dst_root):
 
     new_text = text.replace(old_anchor, inject_block)
     open(sched_path, "w").write(new_text)
-    log_info("patched scheduler.rs with the ops version suffix (scx_loader GUI)")
+    log_info("patched scheduler.rs with the ops version suffix")
     return 1
 
 
@@ -723,9 +726,10 @@ def write_pr_body(pand_root):
     version = re.search(r'^version\s*=\s*"([^"]+)"',
                         open(os.path.join(pand_root, "Cargo.toml")).read(),
                         re.MULTILINE).group(1)
-    out_dir = os.path.join("/tmp", CRATE_OLD)
-    os.makedirs(out_dir, exist_ok=True)
-    out = os.path.join(out_dir, f"scx-pr-body-v{version}.md")
+    # BESIDE THE LOGS, NOT UNDER /tmp/pandemonium: A prism RUN AS ROOT LEAVES THAT
+    # DIRECTORY ROOT-OWNED, AND THE EXPORT RUNS AS THE USER.
+    os.makedirs(LOG_DIR, exist_ok=True)
+    out = os.path.join(LOG_DIR, f"scx-pr-body-v{version}.md")
     open(out, "w").write("\n\n".join("\n".join(b) for b in blocks) + "\n")
     return out
 

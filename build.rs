@@ -91,8 +91,11 @@ fn main() {
         cflags.push("-DPAND_NO_RQ_DEPTH".into());
     }
 
+    // THE COMPILED OBJECT STAYS IN $OUT_DIR, SO `montauk --static` CAN READ THE
+    // INSTRUCTIONS THE SKELETON EMBEDS BESIDE THE SOURCE THEY CAME FROM.
     SkeletonBuilder::new()
         .source(BPF_SRC)
+        .obj(out_dir.join("main.bpf.o"))
         .clang_args(cflags)
         .build_and_generate(&skel_out)
         .unwrap();

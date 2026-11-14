@@ -72,6 +72,11 @@ fn run_scheduler(
     ctrlc::set_handler(move || {
         SHUTDOWN.store(true, Ordering::Relaxed);
     })?;
+    // A PHASE CUT, NEVER SIGUSR1's DEFAULT EXIT, ON EITHER ARM.
+    let cut: extern "C" fn(libc::c_int) = adaptive::on_phase_cut;
+    if unsafe { libc::signal(libc::SIGUSR1, cut as libc::sighandler_t) } == libc::SIG_ERR {
+        anyhow::bail!("SIGUSR1 handler: {}", std::io::Error::last_os_error());
+    }
 
     // WATCHDOG: ABORTS IF THE CONTROL LOOP STALLS FOR MORE THAN 10 SECONDS.
     // LIBBPF MAP OPERATIONS CAN HANG ON KERNEL STALL / VERIFIER RELOAD /
@@ -208,17 +213,13 @@ fn run_scheduler(
                     0
                 };
 
-                let sojourn_ms = stats.batch_sojourn_ns / 1_000_000;
-                let longrun_label = if stats.longrun_mode_active > 0 { " LONGRUN" } else { "" };
-
                 if verbose {
                     println!(
-                        "d/s: {:<8} idle: {}% shared: {:<6} preempt: {:<4} keep: {:<4} kick: H={:<4} S={:<4} enq: W={:<4} R={:<4} wake: {}us lat_idle: {}us lat_kick: {}us reenq: {} sjrn: {}ms l2: B={}% I={}% [BPF{}]",
+                        "d/s: {:<8} idle: {}% shared: {:<6} preempt: {:<4} keep: {:<4} kick: H={:<4} S={:<4} enq: W={:<4} R={:<4} wake: {}us lat_idle: {}us lat_kick: {}us reenq: {} l2: B={}% I={}% [BPF]",
                         delta_d, idle_pct, delta_shared, delta_preempt, delta_keep,
                         delta_hard, delta_soft, delta_enq_wake, delta_enq_requeue,
                         wake_avg_us, lat_idle_us, lat_kick_us,
-                        delta_reenq, sojourn_ms, l2_pct_b, l2_pct_i,
-                        longrun_label,
+                        delta_reenq, l2_pct_b, l2_pct_i,
                     );
                 }
 

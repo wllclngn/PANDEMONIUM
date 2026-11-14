@@ -54,6 +54,7 @@ static struct {
 	unsigned hub_rpcs, hub_us, worker_rpc_every;
 	unsigned audio_period_us, audio_us, input_hz, cap_hz;
 	unsigned bg_hogs, bg_spawn_ms, inflight;
+	unsigned wake_mode, spin_us;   // how the frame releases its workers, see WAKE_*
 	bool     audio_rt;
 	const char *out, *wake_out, *audio_out;
 } cfg = {
@@ -68,6 +69,28 @@ static struct {
 
 static atomic_bool stop;
 static atomic_bool measuring;
+
+// How main releases the workers each frame. The scheduler pays one wake per
+// woken thread whatever the primitive, so the modes differ in how many wakes
+// the frame asks for and who issues them, which is what a game's job system
+// decides: broadcast is one futex wake of every worker (fsync's shape); each
+// wakes every worker on its own word, one call per worker (a semaphore per
+// worker); spin has the workers poll for --spin-us before they block, so a
+// release that lands inside the window wakes nobody (what most engines do);
+// cascade wakes worker 0 alone and each worker wakes the next, so the wakes
+// spread across CPUs instead of queuing on main.
+enum { WAKE_BROADCAST = 0, WAKE_EACH, WAKE_SPIN, WAKE_CASCADE };
+static const char *const wake_mode_names[] = { "broadcast", "each", "spin", "cascade" };
+static atomic_int worker_gen[MAX_WORKERS];   // per-worker release word, modes each and cascade
+
+static inline void cpu_relax(void)
+{
+#if defined(__x86_64__) || defined(__i386__)
+	__builtin_ia32_pause();
+#else
+	__asm__ __volatile__("" ::: "memory");
+#endif
+}
 // Per thread: one shared sink would bounce a cache line between every core and
 // make the work cost depend on placement.
 static thread_local volatile unsigned long sink;
@@ -177,10 +200,25 @@ static void *worker_thread(void *arg)
 	while (!atomic_load(&stop)) {
 		int g = atomic_load(&job_gen);
 		if (g == seen) {
-			fwait(&job_gen, g);
+			if (cfg.wake_mode == WAKE_SPIN) {
+				uint64_t until = now_ns() + (uint64_t)cfg.spin_us * 1000;
+				while (atomic_load(&job_gen) == seen && !atomic_load(&stop) &&
+				       now_ns() < until)
+					cpu_relax();
+				if (atomic_load(&job_gen) != seen)
+					continue;
+			}
+			if (cfg.wake_mode == WAKE_EACH || cfg.wake_mode == WAKE_CASCADE)
+				fwait(&worker_gen[id], seen);
+			else
+				fwait(&job_gen, g);
 			continue;
 		}
 		seen = g;
+		if (cfg.wake_mode == WAKE_CASCADE && id + 1 < cfg.workers) {
+			atomic_store(&worker_gen[id + 1], g);
+			fwake(&worker_gen[id + 1], 1);
+		}
 		uint64_t start = now_ns();
 		if (atomic_load(&measuring))
 			record(wake_ns, &n_wakes, MAX_WAKES, start - atomic_load(&job_release_ns));
@@ -352,8 +390,21 @@ static void run_frame(uint64_t frame)
 	atomic_store(&jobs_left, (int)cfg.jobs);
 	atomic_store(&job_next, 0);
 	atomic_store(&job_release_ns, now_ns());
-	atomic_fetch_add(&job_gen, 1);
-	fwake(&job_gen, INT32_MAX);
+	int g = atomic_fetch_add(&job_gen, 1) + 1;
+	switch (cfg.wake_mode) {
+	case WAKE_EACH:
+		for (unsigned i = 0; i < cfg.workers; i++) {
+			atomic_store(&worker_gen[i], g);
+			fwake(&worker_gen[i], 1);
+		}
+		break;
+	case WAKE_CASCADE:
+		atomic_store(&worker_gen[0], g);
+		fwake(&worker_gen[0], 1);
+		break;
+	default:
+		fwake(&job_gen, INT32_MAX);
+	}
 	int left;
 	while ((left = atomic_load(&jobs_left)) > 0)
 		fwait(&jobs_left, left);
@@ -434,11 +485,25 @@ int main(int argc, char **argv)
 		else if (!strcmp(a, "--out"))              cfg.out = v;
 		else if (!strcmp(a, "--wake-out"))         cfg.wake_out = v;
 		else if (!strcmp(a, "--audio-out"))        cfg.audio_out = v;
+		else if (!strcmp(a, "--spin-us"))          cfg.spin_us = uarg(v);
+		else if (!strcmp(a, "--wake-mode")) {
+			unsigned m = 0;
+			for (; m < 4; m++)
+				if (!strcmp(v, wake_mode_names[m]))
+					break;
+			if (m == 4) {
+				fprintf(stderr, "framebench: --wake-mode is broadcast, each, spin or cascade\n");
+				return 2;
+			}
+			cfg.wake_mode = m;
+		}
 		else {
 			fprintf(stderr, "framebench: unknown option %s\n", a);
 			return 2;
 		}
 	}
+	if (cfg.wake_mode == WAKE_SPIN && !cfg.spin_us)
+		cfg.spin_us = 50;
 	if (cfg.ipu <= 0 || cfg.workers < 1 || cfg.workers > MAX_WORKERS ||
 	    cfg.jobs < 1 || cfg.jobs > MAX_JOBS || cfg.job_us_max < cfg.job_us_min ||
 	    cfg.bg_hogs > MAX_WORKERS || cfg.inflight < 1) {
@@ -509,6 +574,8 @@ int main(int argc, char **argv)
 	uint64_t measured_ns = now_ns() - (measured_from ? measured_from : t0);
 	atomic_store(&stop, true);
 	wake_all(&job_gen);
+	for (unsigned i = 0; i < cfg.workers; i++)
+		wake_all(&worker_gen[i]);
 	wake_all(&sim_done);
 	wake_all(&rendered);
 	wake_all(&submitted);
@@ -539,5 +606,7 @@ int main(int argc, char **argv)
 	printf("job_wakes=%u\n", nw);
 	printf("audio_periods=%u\n", na);
 	printf("audio_rt=%d\n", cfg.audio_rt ? 1 : 0);
+	printf("wake_mode=%u\n", cfg.wake_mode);   // index into broadcast, each, spin, cascade
+	printf("spin_us=%u\n", cfg.spin_us);
 	return 0;
 }

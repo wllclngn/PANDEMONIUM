@@ -31,6 +31,6 @@ tests/research/
 # Release banner generator and its renders. Local only.
 banner/
 
-# New User Guide materials: the Markdown source, generator, class and fonts.
+# User Guide materials: the Markdown source, generator, class and fonts.
 # The tree carries the PDF alone, in the root, at the path the README links.
 guide/

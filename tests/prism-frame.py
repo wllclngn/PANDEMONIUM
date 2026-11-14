@@ -41,6 +41,8 @@ Cliff's delta, multiple comparison with the best), embedded in the report.
 """
 import argparse
 import os
+import re
+import signal
 import subprocess
 import sys
 import time
@@ -50,8 +52,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.resolve()))
 from pandemonium_common import (
     table_header, table_row,
-    start_and_wait, stop_and_wait, find_scheduler, stop_systemd_scheduler,
-    BINARY, LOG_DIR,
+    start_and_wait, stop_and_wait, clear_loaded_scheduler,
+    BINARY, LOG_DIR, add_field_flags, field_of,
     get_git_info, get_version,
     is_scx_active, log, log_error, log_info, log_warn,
     mean_stdev, percentile, montauk_available, montauk_trace, scx_scheduler_name, MONTAUK,
@@ -71,9 +73,7 @@ DRIFT_WARN = 0.05
 # The metrics montauk's population lane tests, by direction.
 POP_HIGHER = ("fps", "low1", "low1_avg")
 POP_LOWER = ("ft_p99", "stutter_pk", "late_pct", "wake_p99", "audio_p99")
-ALL_SCX = ["scx_bpfland", "scx_rusty", "scx_lavd", "scx_flow", "scx_rustland",
-           "scx_p2dq", "scx_tickless", "scx_cosmos", "scx_cake", "scx_flash",
-           "scx_beerland", "scx_layered"]
+
 
 # (key, label, unit, higher_is_better)
 METRICS = [
@@ -91,17 +91,39 @@ METRICS = [
     ("wake_p999",  "JOB WAKE p99.9",          "us", False),
     ("audio_p99",  "AUDIO LATE p99",          "us", False),
     ("audio_max",  "AUDIO LATE MAX",          "us", False),
+    ("reg_l",      "REGIME TICKS LIGHT",      "",   False),
+    ("reg_m",      "REGIME TICKS MIXED",      "",   False),
+    ("reg_h",      "REGIME TICKS HEAVY",      "",   False),
 ]
+# The adaptive layer's [PHASE] line: the regime ticks since its last cut.
+PHASE_RE = re.compile(r"\[PHASE\] n=\d+ ticks=L:(\d+)/M:(\d+)/H:(\d+)")
 
 
 def scenarios(ncpus: int) -> dict[str, list[str]]:
     workers = max(2, ncpus - 2)
     base = ["--workers", str(workers), "--jobs", str(2 * workers)]
+    hogs = ["--bg-hogs", str(max(1, ncpus // 2)), "--bg-spawn-ms", "20"]
+    # The three scored scenarios release the workers by one broadcast wake,
+    # fsync's shape. The wake-mode scenarios run the same graph under the
+    # other release patterns a game's job system may use, each: one futex
+    # call per worker; spin: workers poll 50 us before blocking, so a release
+    # inside the window wakes nobody; cascade: worker 0 is woken and each
+    # worker wakes the next. They are opt-in by name (--scenarios each,...)
+    # and never part of the default press, so the history stays comparable.
     return {
         "heavy": base,
-        "contended": base + ["--bg-hogs", str(max(1, ncpus // 2)), "--bg-spawn-ms", "20"],
+        "contended": base + hogs,
         "paced": base + ["--cap-hz", str(PACED_HZ)],
+        "each": base + ["--wake-mode", "each"],
+        "spin": base + ["--wake-mode", "spin"],
+        "cascade": base + ["--wake-mode", "cascade"],
+        "each_contended": base + hogs + ["--wake-mode", "each"],
+        "spin_contended": base + hogs + ["--wake-mode", "spin"],
+        "cascade_contended": base + hogs + ["--wake-mode", "cascade"],
     }
+
+
+DEFAULT_SCENARIOS = ("heavy", "contended", "paced")
 
 
 def build(stamp: str) -> Path | None:
@@ -144,19 +166,25 @@ def _summary(stdout: str) -> dict[str, float]:
     return out
 
 
-def run_once(fb: Path, ipu: float, args: list[str], duration: float, warmup: float,
-             outdir: Path, tag: str) -> dict | None:
-    """One framebench run. Returns the metric dict, or None on failure."""
-    ft_p, wk_p, au_p = (outdir / f"{tag}.{s}" for s in ("frames", "wakes", "audio"))
-    cmd = [str(fb), "--ipu", f"{ipu:.3f}", "--duration", str(duration),
-           "--warmup", str(warmup), *args,
-           "--out", str(ft_p), "--wake-out", str(wk_p), "--audio-out", str(au_p)]
-    r = subprocess.run(cmd, capture_output=True, text=True,
-                       timeout=duration + warmup + 60)
-    if r.returncode != 0:
-        log_error(f"    framebench rc={r.returncode}: {r.stderr.strip()}")
-        return None
-    s = _summary(r.stdout)
+def _samples(outdir: Path, tag: str) -> tuple[Path, ...]:
+    return tuple(outdir / f"{tag}.{s}" for s in ("frames", "wakes", "audio"))
+
+
+def run_cmd(fb: Path, ipu: float, args: list[str], duration: float, warmup: float,
+            outdir: Path, tag: str) -> list[str]:
+    """One framebench run's argv, its samples written beside OUTDIR/TAG."""
+    ft_p, wk_p, au_p = _samples(outdir, tag)
+    return [str(fb), "--ipu", f"{ipu:.3f}", "--duration", str(duration),
+            "--warmup", str(warmup), *args,
+            "--out", str(ft_p), "--wake-out", str(wk_p), "--audio-out", str(au_p)]
+
+
+def run_metrics(stdout: str, args: list[str], duration: float, outdir: Path,
+                tag: str) -> dict | None:
+    """The metric dict of a finished run_cmd run from its summary and samples,
+    or None when it presented too few frames."""
+    ft_p, wk_p, au_p = _samples(outdir, tag)
+    s = _summary(stdout)
     ft = _read(ft_p)
     if len(ft) < duration * 10:
         log_error(f"    only {len(ft)} frames in {duration:.0f}s -- run discarded")
@@ -165,6 +193,7 @@ def run_once(fb: Path, ipu: float, args: list[str], duration: float, warmup: flo
     p99, p999 = percentile(ft, 99), percentile(ft, 99.9)
     slow_mean, _ = mean_stdev([x for x in ft if x >= p99])
     m = {
+        "frames":     len(ft),
         "fps":        len(ft) / s["measured_s"],
         "low1":       1e9 / p99,
         "low1_avg":   1e9 / slow_mean,
@@ -184,6 +213,18 @@ def run_once(fb: Path, ipu: float, args: list[str], duration: float, warmup: flo
         budget = LATE_FACTOR * 1e9 / float(args[args.index("--cap-hz") + 1])
         m["late_pct"] = 100.0 * sum(1 for x in ft if x > budget) / len(ft)
     return m
+
+
+def run_once(fb: Path, ipu: float, args: list[str], duration: float, warmup: float,
+             outdir: Path, tag: str) -> dict | None:
+    """One framebench run. Returns the metric dict, or None on failure."""
+    r = subprocess.run(run_cmd(fb, ipu, args, duration, warmup, outdir, tag),
+                       capture_output=True, text=True,
+                       timeout=duration + warmup + 60)
+    if r.returncode != 0:
+        log_error(f"    framebench rc={r.returncode}: {r.stderr.strip()}")
+        return None
+    return run_metrics(r.stdout, args, duration, outdir, tag)
 
 
 def crashed(guard, expected_ops: str) -> str | None:
@@ -319,7 +360,7 @@ def population(proms: list[Path]) -> str:
     return "\n\n".join(t for t in text if t)
 
 
-def run_trace(fb, ipu, entries, scen, stamp) -> int:
+def run_trace(fb, ipu, entries, scen, stamp, bpf_lines=False) -> int:
     if not montauk_available():
         log_error("montauk not found -- cannot --trace")
         return 1
@@ -339,10 +380,14 @@ def run_trace(fb, ipu, entries, scen, stamp) -> int:
                     log_info(f"  [{sched_name}] tracing {name} (montauk on cpu{drain})")
                     # scx_dsq: every insert and drain, so each thread's wait can
                     # be tied to the queue it was placed on and the kick it got.
+                    # futex: the frame's fan-out wake and its join are futex
+                    # calls on the simulation thread, so a traced pass times
+                    # each one, which is where a scheduler's per-wake cost lands.
                     with montauk_trace("framebench", f"frame-{safe}-{name}", stamp,
                                        events=True, pin_cpu=drain,
                                        sched_detail=True, scx_dsq=True,
-                                       scx_storm=True) as rec:
+                                       scx_storm=True, syscalls="futex",
+                                       bpf_lines=bpf_lines) as rec:
                         m = run_once(fb, ipu, sargs, TRACE_DURATION_S, 1.0,
                                      outdir, f"{safe}-{name}")
                     recs += 1
@@ -372,18 +417,17 @@ def main() -> int:
     ap.add_argument("--warmup", type=float, default=DEFAULT_WARMUP_S,
                     help=f"discarded seconds before measuring (default {DEFAULT_WARMUP_S:.0f})")
     ap.add_argument("--scenarios", type=str, default="",
-                    help="comma-separated subset of heavy,contended,paced (default all)")
-    ap.add_argument("--schedulers", type=str, default="",
-                    help="comma-separated external scx schedulers; EEVDF vs exactly "
-                         "these (PANDEMONIUM only if named)")
-    ap.add_argument("--all-scx", action="store_true",
-                    help="the full installed scx field; overrides --schedulers")
-    ap.add_argument("--pandemonium-only", action="store_true",
-                    help="skip EEVDF and external schedulers")
-    ap.add_argument("--no-eevdf", action="store_true", help="skip the EEVDF baseline")
+                    help="comma-separated scenarios (default heavy,contended,paced); "
+                         "the wake-mode scenarios each, spin, cascade and their "
+                         "_contended forms run only when named")
+    add_field_flags(ap)
     ap.add_argument("--trace", action="store_true",
                     help="diagnostic pass: one montauk capture per (scheduler, "
                          "scenario); timings are traced and not comparable")
+    ap.add_argument("--bpf-lines", action="store_true",
+                    help="with --trace: the traced pass also samples where inside each "
+                         "BPF program the cycles go, line by line (montauk --bpf-lines); "
+                         "it perturbs the trace's PMU counts and timings")
     ap.add_argument("--cores", type=str, default=None,
                     help="accepted for suite uniformity; runs at native width")
     args = ap.parse_args()
@@ -396,29 +440,18 @@ def main() -> int:
     ver, git = get_version(), get_git_info()
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     all_scen = scenarios(ncpus)
-    want = [s.strip() for s in args.scenarios.split(",") if s.strip()] or list(all_scen)
+    want = [s.strip() for s in args.scenarios.split(",") if s.strip()] or list(DEFAULT_SCENARIOS)
     unknown = [s for s in want if s not in all_scen]
     if unknown:
-        log_error(f"unknown scenario(s): {', '.join(unknown)} (heavy, contended, paced)")
+        log_error(f"unknown scenario(s): {', '.join(unknown)} ({', '.join(all_scen)})")
         return 2
     scen = {k: all_scen[k] for k in want}
 
-    entries: list[tuple[str, list[str] | None]] = []
-    if not args.pandemonium_only and not args.no_eevdf:
-        entries.append(("EEVDF", None))
-    named = {s.strip().lower() for s in args.schedulers.split(",") if s.strip()}
-    field_only = bool(named) and not args.all_scx and not args.pandemonium_only
-    if not field_only or named & {"pandemonium", "scx_pandemonium"}:
-        entries.append(("PANDEMONIUM (BPF)", [str(BINARY), "--verbose", "--no-adaptive"]))
-        entries.append(("PANDEMONIUM (ADAPTIVE)", [str(BINARY), "--verbose"]))
-    if not args.pandemonium_only:
-        for ext in (ALL_SCX if args.all_scx else sorted(named)):
-            if ext in ("pandemonium", "scx_pandemonium", "eevdf"):
-                continue
-            if find_scheduler(ext):
-                entries.append((ext, [ext]))
-            else:
-                log_warn(f"  external scheduler {ext} not found in PATH, skipping")
+    entries = field_of(args)
+    if not entries:
+        log_error("no scheduler arm to run: nothing named by --only/--schedulers "
+                  "is on PATH")
+        return 2
 
     log_info("PANDEMONIUM's frame Test is based off and adapted from work done by "
              "Devs at Igalia for scx_lavd.")
@@ -434,12 +467,8 @@ def main() -> int:
         log_info(f"scenarios: {', '.join(scen)}")
         log_info(f"schedulers: {', '.join(n for n, _ in entries)}")
 
-    if is_scx_active():
-        log_warn(f"sched_ext is active ({scx_scheduler_name()}) -- stopping pandemonium service")
-        stop_systemd_scheduler()
-        if not wait_for_deactivation(5.0):
-            log_error("could not deactivate sched_ext")
-            return 1
+    if not clear_loaded_scheduler():
+        return 1
     time.sleep(1)
 
     fb = build(stamp)
@@ -452,7 +481,7 @@ def main() -> int:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     if args.trace:
-        return run_trace(fb, ipu, entries, scen, stamp)
+        return run_trace(fb, ipu, entries, scen, stamp, bpf_lines=args.bpf_lines)
 
     rawdir = LOG_DIR / f"prism-frame-{stamp}"
     results: dict[str, dict[str, list[dict]]] = {n: {s: [] for s in scen} for n, _ in entries}
@@ -483,6 +512,11 @@ def main() -> int:
                 safe = sched_name.replace(" ", "-").replace("(", "").replace(")", "")
                 outdir = rawdir / safe
                 outdir.mkdir(parents=True, exist_ok=True)
+                # PANDEMONIUM's ARMS TAKE SIGUSR1 AS A PHASE CUT, ONE AFTER EACH
+                # SCENARIO, SO EACH SCENARIO READS ITS OWN REGIME TICKS; ANY
+                # OTHER SCHEDULER WOULD EXIT ON IT AND IS NEVER SENT ONE.
+                cuts = guard is not None and cmd[0] == str(BINARY)
+                phased: list[dict | None] = []
                 try:
                     for name, sargs in scen.items():
                         m = run_once(fb, ipu, sargs, args.duration, args.warmup,
@@ -492,6 +526,9 @@ def main() -> int:
                             skipped[sched_name] = f"{reason} (during {name})"
                             log_error(f"[{sched_name}] CRASHED during {name} -- {reason}")
                             break
+                        if cuts:
+                            os.killpg(guard.pgid, signal.SIGUSR1)
+                            phased.append(m)
                         if m is None:
                             continue
                         results[sched_name][name].append(m)
@@ -503,6 +540,13 @@ def main() -> int:
                 finally:
                     if guard is not None:
                         stop_and_wait(guard)
+                # THE nTH [PHASE] LINE IS THE nTH CUT's SCENARIO. THE BPF ARM's
+                # LOOP PRINTS NONE, AND ITS SCENARIOS CARRY NO REGIME ROW.
+                if cuts:
+                    phases = PHASE_RE.findall(guard.drain_stdout())
+                    for m, ph in zip(phased, phases):
+                        if m is not None:
+                            m["reg_l"], m["reg_m"], m["reg_h"] = (float(x) for x in ph)
                 time.sleep(2)
             if it_results:
                 prom = rawdir / f"iter-{it + 1}.prom"

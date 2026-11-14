@@ -94,9 +94,13 @@ def _worktree(k: Kernel) -> Path:
 
 
 def _key(k: Kernel) -> str:
-    return digest({"sha": k.sha, "cc": k.cc, "extra": "\n".join(k.config),
-                   "fragment": sha256_file(FRAGMENT), "payload": sha256_file(PAYLOAD),
-                   "dockerfile": sha256_file(docker.IMAGES["kbuild"][1])})
+    parts = {"sha": k.sha, "cc": k.cc, "extra": "\n".join(k.config),
+             "fragment": sha256_file(FRAGMENT), "payload": sha256_file(PAYLOAD),
+             "dockerfile": sha256_file(docker.IMAGES["kbuild"][1])}
+    # Keyed only when set, so a kernel built with no env keeps the key it has.
+    if k.env:
+        parts["env"] = "\n".join(k.env)
+    return digest(parts)
 
 
 def _dir(k: Kernel) -> Path:
@@ -139,17 +143,19 @@ def ensure(k: Kernel, keep_build: bool = False) -> BuiltKernel:
     frag = stage / "kernel.config"
     frag.write_text(FRAGMENT.read_text() + "".join(f"{c}\n" for c in k.config))
     blog = LOGS / f"kbuild-{slug(k.label)}-{k.sha[:12]}.log"
-    log(f"{k.label}: building {k.sha[:12]} ({k.cc}), log {blog}")
+    log(f"{k.label}: building {k.sha[:12]} ({' '.join((k.cc, *k.env))}), log {blog}")
     r = docker.run("kbuild", ["python3", "/run/build_kernel.py"],
                    [(src, "/src", True), (obj, "/obj", False), (stage, "/out", False),
                     (frag, "/frag/kernel.config", True), (PAYLOAD, "/run/build_kernel.py", True)],
-                   env={"KLOCALVERSION": f"-vmm-{k.sha[:12]}", "KCC": k.cc},
+                   env={**dict(e.split("=", 1) for e in k.env),
+                        "KLOCALVERSION": f"-vmm-{k.sha[:12]}", "KCC": k.cc},
                    as_user=True, log_path=blog)
     if r.returncode != 0 or not (stage / "bzImage").is_file():
         raise RuntimeError(f"{k.label}: kernel build failed (rc={r.returncode}), see {blog}")
     release = (stage / "release").read_text().strip()
     ident = {"label": k.label, "kind": "git", "url": k.url, "sha": k.sha, "cc": k.cc,
-             "config_extra": list(k.config), "key": _key(k), "release": release,
+             "config_extra": list(k.config), "env": list(k.env), "key": _key(k),
+             "release": release,
              "bzimage_sha256": sha256_file(stage / "bzImage")}
     write_json(stage / "identity.json", ident)
     shutil.rmtree(d, ignore_errors=True)

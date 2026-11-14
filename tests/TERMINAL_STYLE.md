@@ -2,8 +2,8 @@
 
 The single reference for everything the suite prints to a terminal. One logger,
 one shape per output kind. Every bench (`prism`, `prism-scale`/
-`pandemonium-tests`, `prism-fork-thread`, `prism-ipc`,
-`prism-power`, `prism-plot`, `prism-strand`) renders through it,
+`pandemonium-tests`, `prism-fork-thread`, `prism-frame`,
+`prism-power`, `prism-plot`) renders through it,
 so a user sees the same grammar everywhere.
 
 Binding rules (from the project doctrine, restated so this file is self-contained):

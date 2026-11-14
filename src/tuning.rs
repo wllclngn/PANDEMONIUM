@@ -17,6 +17,8 @@ pub const LIGHT_ENTER_PCT: u64 = 50; // mean_idle >= THIS BAND -> CANDIDATE LIGH
 
 
 const MIXED_SLICE_NS: u64 = 1_000_000; // 1MS: TIGHT INTERACTIVE CONTROL
+const LIGHT_SLICE_NS: u64 = 2_000_000; // 2MS: LITTLE CONTENTION, FEWER SWITCHES
+const HEAVY_SLICE_NS: u64 = 4_000_000; // 4MS: SATURATED, WIDER FOR THROUGHPUT
 const MIXED_BATCH_NS: u64 = 20_000_000; // 20MS: MATCHES LIGHT/HEAVY/BPF DEFAULT
 
 
@@ -40,7 +42,6 @@ pub struct TuningKnobs {
     pub slice_ns: u64,
     pub batch_slice_ns: u64,
     pub codel_thresh_ns: u64,
-    pub burst_slice_ns: u64,
     // FIEDLER-DERIVED TOPOLOGY TIME CONSTANT, CAPACITY-AWARE IN N.
     // ZERO MEANS RUST HAS NOT YET WRITTEN tau; BPF USES THE PRE-FIRST-TICK
     // FALLBACK CONSTANTS UNTIL A NONZERO VALUE LANDS. WRITTEN BY RUST AT
@@ -50,7 +51,30 @@ pub struct TuningKnobs {
     // SPECTRAL-GAP DEFICIT. CO-LOCATED WITH topology_tau_ns; SAME ZERO/WRITE/
     // CLAMP SEMANTICS.
     pub codel_eq_ns: u64,
+    // THE PLACEMENT BASE COST THE LAYER MEASURED: THE PAIRED REFILL (adaptive.rs
+    // RefillPairs), ON bpf_intf.rs's [PHI_BASE_MIN_NS, PHI_BASE_MAX_NS] AS BOTH
+    // SIDES CLAMP IT. ZERO MEANS UNWRITTEN: BPF APPLIES ITS tau-DERIVED COST, SO
+    // THE BPF ARM NEVER MOVES IT, AND A ZERO WRITTEN AFTER A VALUE RESTORES IT.
+    pub phi_base_ns: u64,
+    // CoDel TARGETS A STANDING TASK MAY HOLD THE CPU FOR: task_slice's BOUND,
+    // THE ONE THAT BINDS (batch_slice_ns SITS ABOVE IT AT EVERY WIDTH).
+    pub standing_targets: u64,
+    // A WAKER THAT BLOCKS WITHIN THIS OF ITS WAKES SEATS A PARTNER AS A SYNC
+    // WAKER DOES (main.bpf.c waker_leaving). 0 = OFF, WHICH THE BPF ARM RUNS.
+    pub waker_leave_ns: u64,
 }
+
+// intf.h's SLICE_STANDING_TARGETS, THE BASE BOTH ARMS RUN, AND SLICE_MIN_NS,
+// THE FLOOR UNDER EVERY SLICE BPF GRANTS; bpf_intf.rs's TEST READS BOTH
+// AGAINST THE HEADER.
+pub const STANDING_TARGETS: u64 = 4;
+pub const SLICE_MIN_NS: u64 = 100_000;
+
+// THE DEPARTURE BOUND THE ADAPTIVE LAYER WRITES. On the captures the waker of a
+// cross-L3 seat left its CPU within 25us on 99.6% of ipc's and 56-71% of
+// frame's (research t30b), and within it a seat on the waker's own CPU waits
+// for nothing.
+pub const WAKER_LEAVE_NS: u64 = 25_000;
 
 impl Default for TuningKnobs {
     fn default() -> Self {
@@ -58,10 +82,29 @@ impl Default for TuningKnobs {
             slice_ns: 1_000_000,
             batch_slice_ns: 20_000_000,
             codel_thresh_ns: 5_000_000,
-            burst_slice_ns: 1_000_000,
             topology_tau_ns: 0,
             codel_eq_ns: 0,
+            phi_base_ns: 0,
+            standing_targets: STANDING_TARGETS,
+            waker_leave_ns: 0,
         }
+    }
+}
+
+impl TuningKnobs {
+    // WHAT BPF APPLIES FOR A WRITTEN SET, ON intf.h's RAILS: EVERY SLICE IT
+    // GRANTS FLOORS AT SLICE_MIN_NS, AND AN UNWRITTEN HOLD STANDS AT
+    // SLICE_STANDING_TARGETS. THE REST IT APPLIES AS WRITTEN, AND phi_base_ns
+    // RESOLVES IN BPF's tick() (Scheduler::read_phi_base_applied). THE LAYER
+    // WRITES THIS, SO THE MAP HOLDS THE VALUE APPLIED.
+    pub fn applied(&self) -> Self {
+        let mut k = *self;
+        k.slice_ns = k.slice_ns.max(SLICE_MIN_NS);
+        k.batch_slice_ns = k.batch_slice_ns.max(SLICE_MIN_NS);
+        if k.standing_targets == 0 {
+            k.standing_targets = STANDING_TARGETS;
+        }
+        k
     }
 }
 
@@ -101,8 +144,8 @@ impl Regime {
 // varied across Light/Mixed/Heavy found only slice, preempt and batch. Slice and
 // batch are now derived from measured queue depth and traffic shape; preempt
 // had no BPF reader and is gone.
-// codel_thresh_ns and burst_slice_ns were IDENTICAL in all three, so they were
-// never regime-dependent -- they were defaults wearing a selector.
+// codel_thresh_ns was IDENTICAL in all three, so it was never
+// regime-dependent -- a default wearing a selector.
 //
 // What remains is a starting point the derivations move from. It is not a
 // policy choice; it is the value a knob holds on a machine we have not measured
@@ -112,9 +155,11 @@ pub fn base_knobs() -> TuningKnobs {
         slice_ns: MIXED_SLICE_NS,
         batch_slice_ns: MIXED_BATCH_NS,
         codel_thresh_ns: 5_000_000,
-        burst_slice_ns: 1_000_000,
         topology_tau_ns: 0,
         codel_eq_ns: 0,
+        phi_base_ns: 0,
+        standing_targets: STANDING_TARGETS,
+        waker_leave_ns: 0,
     }
 }
 
@@ -137,6 +182,13 @@ fn scale_tau_u64(tau_ns: u64, k_q16: u64) -> u64 {
 
 pub fn scaled_regime_knobs(r: Regime, nr_cpus: u64, tau_ns: u64) -> TuningKnobs {
     let mut knobs = base_knobs();
+    // THE REGIME'S PROFILE: THE SLICE A NON-STANDING TASK GETS, BEFORE THE tau
+    // CAP AND THE LOW-CORE CAP BELOW.
+    knobs.slice_ns = match r {
+        Regime::Light => LIGHT_SLICE_NS,
+        Regime::Mixed => MIXED_SLICE_NS,
+        Regime::Heavy => HEAVY_SLICE_NS,
+    };
 
     let slice_cap_tau = scale_tau_u64(tau_ns, K_SLICE_CAP_Q16)
         .clamp(500_000, 8_000_000);
@@ -314,8 +366,26 @@ impl OscillatorState {
         if codel_eq_ns == 0 || self.codel_target_floor_ns >= self.codel_target_max_ns {
             return false;
         }
-        let rest = codel_eq_ns.clamp(self.codel_target_floor_ns, self.codel_target_max_ns);
+        let rest = self.applied_eq(codel_eq_ns);
         self.effective_release_ns() < rest.saturating_add(self.home_dist_extra_ns)
+    }
+
+    // THE EQUILIBRIUM BPF APPLIES FOR A WRITTEN codel_eq_ns: apply_tau_scaling's
+    // TWO COMPARES INTO THE OSCILLATOR'S WINDOW, IN ITS ORDER. ON A PART WHERE
+    // tau NEARS 1ms THE WINDOW's 200us FLOOR SITS ABOVE THE WRITTEN VALUE. 0 IS
+    // UNWRITTEN, AND WITH NO WINDOW READ BACK THE WRITTEN VALUE STANDS.
+    pub fn applied_eq(&self, codel_eq_ns: u64) -> u64 {
+        if codel_eq_ns == 0 || self.codel_target_max_ns == 0 {
+            return codel_eq_ns;
+        }
+        let mut eq = codel_eq_ns;
+        if eq < self.codel_target_floor_ns {
+            eq = self.codel_target_floor_ns;
+        }
+        if eq > self.codel_target_max_ns {
+            eq = self.codel_target_max_ns;
+        }
+        eq
     }
 }
 
@@ -354,8 +424,8 @@ impl QuiescenceState {
 
     // ADVANCE THE GATE ONE TICK. RETURNS THE LATCHED `frozen` FLAG.
     // `occupied` IS WHETHER ANY DEPTH SAMPLE DRAINED THIS TICK WAS ABOVE ZERO.
-    // rqa_det IS None FOR THE FIRST RQA_MIN_SAMPLES TICKS, AND THEN IT HAS NO
-    // VOTE.
+    // rqa_det IS None UNTIL RQA_MIN_SAMPLES BUCKETS HAVE FILLED ITS WINDOW, AND
+    // WHILE None IT HAS NO VOTE.
     pub fn update(
         &mut self,
         hvg_lambda: f64,
@@ -410,5 +480,7 @@ pub fn knobs_differ(a: &TuningKnobs, b: &TuningKnobs) -> bool {
     a.slice_ns != b.slice_ns
         || a.batch_slice_ns != b.batch_slice_ns
         || a.codel_thresh_ns != b.codel_thresh_ns
-        || a.burst_slice_ns != b.burst_slice_ns
+        || a.phi_base_ns != b.phi_base_ns
+        || a.standing_targets != b.standing_targets
+        || a.waker_leave_ns != b.waker_leave_ns
 }

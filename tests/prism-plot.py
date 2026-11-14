@@ -113,13 +113,12 @@ def sched_order(s):
 
 
 # Echoes the CachyOS comparison palette: baseline blue, pandemonium green,
-# cake orange, the scx field in red/purple. PANDEMONIUM variants greens.
+# the scx field in red/purple. PANDEMONIUM variants greens.
 SCHED_COLOR = {
     "EEVDF":                  "#1f77b4",
     "PANDEMONIUM (BPF)":      "#2ca02c",
     "PANDEMONIUM (ADAPTIVE)": "#17becf",
     "scx_bpfland":            "#d62728",
-    "scx_cake":               "#ff7f0e",
     "scx_lavd":               "#9467bd",
     "scx_rusty":              "#8c564b",
     "scx_layered":            "#e377c2",

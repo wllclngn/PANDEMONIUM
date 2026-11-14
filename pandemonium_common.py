@@ -4,16 +4,18 @@ Shared infrastructure for PANDEMONIUM build/test scripts.
 Used by pandemonium.py (build manager) and tests/pandemonium-tests.py (test orchestrator).
 """
 
+import argparse
 import glob
-import math
 import os
 import platform
 import re
+import shlex
 import shutil
 import atexit
 import signal
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -93,10 +95,10 @@ def get_git_info() -> dict:
 # typed is stripped, so indentation is never carried in the text. Grouping is a
 # SECTION line plus a single blank line, never indent. See tests/TERMINAL_STYLE.md.
 
-_LEVELS = {"DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40}
+_LEVELS = {"INFO": 20, "WARN": 30, "ERROR": 40}
 # Pad after the level tag so the message column is identical for every level:
-# [INFO]/[WARN] + 3 spaces, [ERROR]/[DEBUG] + 2 spaces.
-_TAG_PAD = {"INFO": "   ", "WARN": "   ", "ERROR": "  ", "DEBUG": "  "}
+# [INFO]/[WARN] + 3 spaces, [ERROR] + 2 spaces.
+_TAG_PAD = {"INFO": "   ", "WARN": "   ", "ERROR": "  "}
 
 
 def _timestamp() -> str:
@@ -104,23 +106,18 @@ def _timestamp() -> str:
 
 
 class _Log:
-    """The suite's single logger. Free functions log_info/warn/error/debug
+    """The suite's single logger. Free functions log_info/warn/error
     delegate here, so every existing call site gains flat output, level gating,
     and child mode without changing. New affordances: section(), report(),
     blank(), interrupted()."""
 
     def __init__(self):
-        # Terminal floor: INFO by default; verbose lowers to DEBUG, quiet raises
-        # to WARN. DEBUG is for the /tmp logs and -v.
+        # Terminal floor: INFO.
         self.floor = _LEVELS["INFO"]
         # Child mode: a sub-bench spawned under another (PANDEMONIUM_CHILD=1)
         # suppresses banners/preamble/verbatim reports/dmesg so a profile run
         # reads as one uniform progress log.
         self.child = os.environ.get("PANDEMONIUM_CHILD") == "1"
-
-    def set_verbosity(self, quiet: bool = False, verbose: bool = False) -> None:
-        self.floor = _LEVELS["WARN"] if quiet else (
-            _LEVELS["DEBUG"] if verbose else _LEVELS["INFO"])
 
     def _emit(self, level: str, msg) -> None:
         if _LEVELS[level] < self.floor:
@@ -137,9 +134,6 @@ class _Log:
 
     def error(self, msg) -> None:
         self._emit("ERROR", msg)
-
-    def debug(self, msg) -> None:
-        self._emit("DEBUG", msg)
 
     def blank(self) -> None:
         """The only separator. A single blank line between sections."""
@@ -179,10 +173,6 @@ def log_warn(msg: str) -> None:
 
 def log_error(msg: str) -> None:
     log.error(msg)
-
-
-def log_debug(msg: str) -> None:
-    log.debug(msg)
 
 
 # Distros the project supports; each `install_hint` map is keyed by these so a
@@ -297,15 +287,6 @@ def check_kernel_version() -> bool:
     if not log.child:
         log_info(f"Kernel {release} OK (>= {MIN_KERNEL[0]}.{MIN_KERNEL[1]})")
     return True
-
-
-def kernel_at_least(major: int, minor: int) -> bool:
-    """True if the running kernel is >= major.minor."""
-    try:
-        parts = platform.release().split(".")
-        return (int(parts[0]), int(parts[1])) >= (major, minor)
-    except (IndexError, ValueError):
-        return False
 
 
 def ensure_vmlinux_h() -> bool:
@@ -507,11 +488,9 @@ def montauk_envelope(target, *, digest: bool | None = None,
     """The montauk --json envelope for a capture, or None.
 
     THE ONE PLACE THE SUITE OPENS AN ENVELOPE. montauk publishes a typed result
-    per report -- verdict, klass, gauges, offenders -- and the benches were each
-    reaching into the JSON by hand for the two or three fields they happened to
-    want. That is why 21 of montauk's 29 reports had no reader: Not a decision,
-    just that every one of them would have cost another bespoke parser. This trio
-    existed and only prism-locality (orphaned) and prism-strand ever called it.
+    per report -- verdict, klass, gauges, offenders -- and a bench that reaches
+    into the JSON by hand for the two or three fields it wants costs every
+    report another bespoke parser.
 
     THE TARGET'S SHAPE PICKS THE MODE, because `--digest` is accepted for a
     RECORDING DIRECTORY and rejected for a bare .events FILE -- `unknown flag
@@ -677,7 +656,8 @@ def mean(values: list[float]) -> float:
 
 
 def median(values: list[float]) -> float:
-    """Median (interpolated 0.5-quantile) via sublimation."""
+    """The 0.5-quantile via sublimation: the element at floor(n/2), never
+    interpolated, so the upper of the two middle values at an even count."""
     return float(_sub_numeric(values, ["quantile", "0.5"])) if values else 0.0
 
 
@@ -904,6 +884,26 @@ def compute_core_counts(max_cpus: int) -> list[int]:
 # SCHEDULER DETECTION
 
 SCX_OPS = Path("/sys/kernel/sched_ext/root/ops")
+SCX_EVENTS = Path("/sys/kernel/sched_ext/root/events")
+
+
+def read_scx_events() -> dict[str, int]:
+    """The kernel's own sched_ext event counters for the scheduler loaded now,
+    SCX_EV_ dropped from each name: what the core counted that no scheduler's
+    own counters can see (a select_cpu return it could not use, a dispatch to
+    an offline CPU, a slice refilled to the default). They belong to the loaded
+    scheduler and go when it unloads, so an arm's are read before it is
+    stopped. Empty when nothing is loaded or the kernel has no such file."""
+    try:
+        text = SCX_EVENTS.read_text()
+    except OSError:
+        return {}
+    events = {}
+    for line in text.splitlines():
+        name, _, value = line.strip().partition(" ")
+        if name and value.strip().isdigit():
+            events[name.removeprefix("SCX_EV_")] = int(value)
+    return events
 
 
 def is_scx_active() -> bool:
@@ -1111,10 +1111,6 @@ def montauk_analyze_argv(binary: str | None = None) -> list[str]:
     return [binary or MONTAUK, "--analyze"]
 
 
-def montauk_decode_argv(binary: str | None = None) -> list[str]:
-    return [binary or MONTAUK, "--decode"]
-
-
 MONTAUK_ATTACH_TIMEOUT = 10.0
 MONTAUK_LOG_INTERVAL_MS = 100
 # BPF RING SIZE FOR EVERY TRACED CAPTURE. montauk's default is 1M and its own --help names
@@ -1146,6 +1142,21 @@ MONTAUK_QUIESCE_S = 3.0
 
 def montauk_available() -> bool:
     return Path(MONTAUK).exists()
+
+
+_MONTAUK_HELP: dict[str, bool] = {}
+
+
+def montauk_has_flag(flag: str) -> bool:
+    """Whether the installed montauk's --help names FLAG. Probed once per flag,
+    so a bench never hands montauk an option an older build would refuse."""
+    if flag not in _MONTAUK_HELP:
+        try:
+            r = subprocess.run([MONTAUK, "--help"], capture_output=True, text=True, timeout=10)
+            _MONTAUK_HELP[flag] = flag in (r.stdout + r.stderr)
+        except (OSError, subprocess.TimeoutExpired):
+            _MONTAUK_HELP[flag] = False
+    return _MONTAUK_HELP[flag]
 
 
 # PANDEMONIUM's CUSTOM PROFILES FOR scx's SCHEDULER CATALOG (VERSION 2), WHICH
@@ -1221,21 +1232,6 @@ def cpu_max_c() -> float | None:
         return float(v) if v is not None else None
     except (ValueError, AttributeError):
         return None
-
-
-def box_uptime_s() -> float:
-    try:
-        return float(Path("/proc/uptime").read_text().split()[0])
-    except (OSError, ValueError, IndexError):
-        return 0.0
-
-
-def box_governor() -> str:
-    try:
-        return Path("/sys/devices/system/cpu/cpu0/cpufreq/"
-                    "scaling_governor").read_text().strip()
-    except OSError:
-        return "?"
 
 
 # THE BENCH'S OWN NAMES. ANYTHING ELSE montauk RANKS AS BUSY IS THE BOX'S LOAD.
@@ -1402,12 +1398,25 @@ class MontaukTrace:
                  interval_ms=MONTAUK_LOG_INTERVAL_MS, baseline_s=0.0,
                  attach_timeout=MONTAUK_ATTACH_TIMEOUT, events=False,
                  pin_cpu=None, sched_detail=False, scx_storm=False,
-                 scx_dsq=False, trace_classes=None, quiesce_s=MONTAUK_QUIESCE_S):
+                 scx_dsq=False, trace_classes=None, quiesce_s=MONTAUK_QUIESCE_S,
+                 syscalls=None, bpf_lines=False):
         # quiesce_s: the mirror of baseline_s. baseline_s records quiet BEFORE
         # the workload; this records quiet AFTER it, so a strand still open when
         # the workload stopped is observed against an idle system rather than
         # truncated at trace end. See MONTAUK_QUIESCE_S.
         self.quiesce_s = quiesce_s
+        # syscalls: montauk's opt-in syscall class, a comma-separated list of
+        # names or numbers, one timed record per call of the traced tree. A
+        # bench names the primitives its critical path is made of (futex for
+        # the frame's fan-out and join) so a traced pass carries their
+        # durations per call; a scored pass never asks.
+        self.syscalls = syscalls
+        # bpf_lines: montauk's BPF line profiler, opt-in per pass. It samples
+        # hardware cycles on every CPU (about 60k interrupts a second at 12
+        # CPUs) and takes a core counter the trace's own PMU events then
+        # time-share, so a pass asks for it only when the line read is its
+        # question, never as a default of every traced pass.
+        self.bpf_lines = bpf_lines
         # sched_detail: stream CPU_IDLE alongside the decision events, so
         # dispatch-stall can split a PREEMPT-STARVED floored wake into DARK
         # (CPU sat idle, no rescue) vs HELD (CPU busy the whole time) instead
@@ -1459,12 +1468,23 @@ class MontaukTrace:
         cmd = [MONTAUK, "--trace", self.pattern, "--log", str(self.dir),
                "--log-interval-ms", str(self.interval_ms),
                "--trace-ring-bytes", MONTAUK_TRACE_RING]
+        # A traced pass is diagnostic, never a scored number, so it carries the
+        # kernel's per-program BPF run accounting too: Every logged snapshot
+        # then names what each struct_ops member of the scheduler under test
+        # cost per call, with no line added to the scheduler.
+        if montauk_has_flag("--bpf-stats"):
+            cmd += ["--bpf-stats"]
+        # And where inside each member those nanoseconds go, line by line.
+        if self.bpf_lines and montauk_has_flag("--bpf-lines"):
+            cmd += ["--bpf-lines"]
         if self.events_path is not None:
             cmd += ["--trace-out", str(self.events_path)]
         if self.sched_detail:
             cmd += ["--sched-detail"]
         if self.trace_classes:
             cmd += ["--trace-classes", self.trace_classes]
+        if self.syscalls and montauk_has_flag("--trace-syscalls"):
+            cmd += ["--trace-syscalls", self.syscalls]
         if self.pin_cpu is not None:
             cmd = ["taskset", "-c", str(self.pin_cpu)] + cmd
         # EVERY CAPTURE RUNS AT montauk's BASE RATE unless the bench asks for a
@@ -1542,6 +1562,155 @@ class MontaukTrace:
 def montauk_trace(pattern, label, stamp, log_dir=TRACE_DIR, **kw) -> "MontaukTrace":
     """Factory for MontaukTrace -- use as `with montauk_trace(...) as rec:`."""
     return MontaukTrace(pattern, label, stamp, log_dir, **kw)
+
+
+# MONTAUK RECORDING
+#
+# One headless montauk recording around one workload run, for the benches whose
+# numbers are counter deltas and gauges over the run rather than a trace of it.
+
+# montauk's scrape and thermal-sample interval for every run's recording.
+# 250ms is the rate montauk publishes snapshots at, so a faster scrape adds
+# nothing, and it puts each edge of a counter's run delta within a quarter
+# second where the 2s thermal default left up to two.
+MONTAUK_RECORD_MS = 250
+# The recorder's flags an older montauk refuses.
+MONTAUK_RECORD_FLAGS = ("--thermal-interval-ms", "--pmu-system")
+MONTAUK_FIRST_SCRAPE_S = 10.0
+MONTAUK_STOP_S = 10.0
+
+_LIVE_RECORDERS: list["MontaukRecorder"] = []
+
+
+class MontaukRecorder:
+    """One montauk recording around one workload run, in a directory of its
+    own: montauk appends to a reused directory, and its analyzer reduces every
+    .prom a directory holds.
+
+    start() launches montauk headless in its own process group, so a Ctrl+C at
+    the terminal reaches the bench and not montauk, and waits for the first
+    scrape. stop() sends SIGINT, on which montauk samples every collector once
+    more and writes that as its last scrape, so every counter is current to
+    the instant the workload ended. A recorder stays in _LIVE_RECORDERS from
+    start() to stop(), and stop_recorders() ends any an interrupt or an
+    exception left running."""
+
+    def __init__(self, run_dir: Path):
+        self.dir = run_dir
+        self.stdout_path = run_dir.parent / f"{run_dir.name}.stdout"
+        self.proc: subprocess.Popen | None = None
+        self._out = None
+
+    def start(self) -> bool:
+        self.dir.mkdir(parents=True)
+        self._out = open(self.stdout_path, "w")
+        cmd = [MONTAUK, "--headless", "--log", str(self.dir),
+               "--log-interval-ms", str(MONTAUK_RECORD_MS),
+               "--thermal-interval-ms", str(MONTAUK_RECORD_MS),
+               "--pmu-system"]
+        try:
+            self.proc = subprocess.Popen(cmd, stdout=self._out,
+                                         stderr=subprocess.STDOUT,
+                                         process_group=0)
+        except OSError as e:
+            log_error(f"montauk did not start: {e}")
+            return False
+        _LIVE_RECORDERS.append(self)
+        deadline = time.monotonic() + MONTAUK_FIRST_SCRAPE_S
+        while time.monotonic() < deadline:
+            if any(self.dir.glob("montauk_*.prom")):
+                return True
+            if self.proc.poll() is not None:
+                log_error(f"montauk exited {self.proc.returncode} before its "
+                          f"first scrape (see {self.stdout_path})")
+                return False
+            time.sleep(0.05)
+        log_error(f"montauk wrote no scrape within {MONTAUK_FIRST_SCRAPE_S:.0f}s "
+                  f"(see {self.stdout_path})")
+        return False
+
+    def stop(self) -> bool:
+        """True when montauk was still recording and exited on SIGINT, which is
+        what puts the final scrape in the recording."""
+        clean = False
+        if self.proc is not None:
+            if self.proc.poll() is None:
+                self.proc.send_signal(signal.SIGINT)
+                try:
+                    self.proc.wait(timeout=MONTAUK_STOP_S)
+                    clean = True
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+                    self.proc.wait()
+            self.proc = None
+        if self._out is not None:
+            self._out.close()
+            self._out = None
+        if self in _LIVE_RECORDERS:
+            _LIVE_RECORDERS.remove(self)
+        return clean
+
+
+def stop_recorders() -> None:
+    for rec in list(_LIVE_RECORDERS):
+        rec.stop()
+
+
+def record_run(rec_dir: Path, cmd: list[str], timeout: float):
+    """Run CMD under a montauk recording of its own. CMD runs directly, as the
+    user the bench runs as, with no sudo prefix. Returns (recorder, wall_s,
+    CompletedProcess), wall_s timing CMD alone, or None when CMD failed or the
+    recording does not cover the whole run."""
+    rec = MontaukRecorder(rec_dir)
+    try:
+        if not rec.start():
+            return None
+        t0 = time.monotonic()
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        wall_s = time.monotonic() - t0
+    except subprocess.TimeoutExpired:
+        log_error(f"{cmd[0]} timed out after {timeout:g}s")
+        return None
+    finally:
+        clean = rec.stop()
+    if not clean:
+        log_error(f"montauk did not stop on SIGINT, so {rec.dir} has no final "
+                  f"scrape (see {rec.stdout_path})")
+        return None
+    if r.returncode != 0:
+        log_error(f"{cmd[0]} exit {r.returncode}: {r.stderr.strip()[:300]}")
+        return None
+    return rec, wall_s, r
+
+
+def montauk_population(rec_dir: Path, metric: str) -> list[tuple[str, list[dict]]]:
+    """(cell label, groups) for every cell of METRIC in a recording, from
+    montauk's population mode. --by capture gives each .prom a group, so a run
+    that crosses the hour montauk rotates its file on reads as two."""
+    import json as _json
+    rc, so, _se = run_cmd_capture([*montauk_analyze_argv(), str(rec_dir),
+                                   "--by", "capture", "--metric", metric,
+                                   "--no-emit", "--json"])
+    # montauk exits 1 for a recording that carries no series of METRIC, which
+    # is every PMU counter when the PMU did not open.
+    if rc != 0 or not so.strip():
+        return []
+    try:
+        metrics = _json.loads(so).get("population", {}).get("metrics", [])
+    except ValueError:
+        return []
+    return [(c.get("cell", ""), c.get("groups", []))
+            for m in metrics if m.get("metric") == metric
+            for c in m.get("cells", [])]
+
+
+def counter_delta(cells: list[tuple[str, list[dict]]]) -> float | None:
+    """A cumulative counter's increase over the recording: The largest value
+    any group read less the smallest."""
+    groups = [g for _cell, gs in cells for g in gs]
+    if not groups:
+        return None
+    return max(g["max"] for g in groups) - min(g["min"] for g in groups)
 
 
 
@@ -1684,6 +1853,278 @@ def find_scheduler(name: str) -> str | None:
     return shutil.which(name)
 
 
+# PANDEMONIUM'S ARMS. --pandemonium-only fields PANDEMONIUM's BPF and ADAPTIVE
+# arms and nothing else; --adaptive-only and --bpf-only field one of them. Every
+# entry point takes the three as one exclusive group, which leaves
+# args.pandemonium at None (the bench's own field), "both", "adaptive" or
+# "bpf", and builds its PANDEMONIUM arms through pandemonium_arms. A dispatcher
+# hands the selection on with PANDEMONIUM_FLAGS.
+PANDEMONIUM_FLAGS = {"both": "--pandemonium-only", "adaptive": "--adaptive-only", "bpf": "--bpf-only"}
+
+
+def add_pandemonium_flags(ap, note: str = "") -> None:
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("--pandemonium-only", dest="pandemonium", action="store_const", const="both",
+                   help="PANDEMONIUM's BPF and ADAPTIVE arms and nothing else: no EEVDF, "
+                        "no external schedulers" + note)
+    g.add_argument("--adaptive-only", dest="pandemonium", action="store_const", const="adaptive",
+                   help="PANDEMONIUM's ADAPTIVE arm and nothing else" + note)
+    g.add_argument("--bpf-only", dest="pandemonium", action="store_const", const="bpf",
+                   help="PANDEMONIUM's BPF arm (--no-adaptive) and nothing else" + note)
+
+
+def pandemonium_arms(sel: str | None, verbose: bool = True) -> list[tuple[str, list[str]]]:
+    """PANDEMONIUM's arms for a selection, BPF first, both unless the selection
+    names one. The one spelling of the two: --verbose on both, since the
+    per-second line is the only surface for an arm's own counters. A bench
+    passes verbose=False only where that line's cost is what it measures."""
+    flags = ["--verbose"] if verbose else []
+    arms = []
+    if sel != "adaptive":
+        arms.append(("PANDEMONIUM (BPF)", [str(BINARY), *flags, "--no-adaptive"]))
+    if sel != "bpf":
+        arms.append(("PANDEMONIUM (ADAPTIVE)", [str(BINARY), *flags]))
+    return arms
+
+
+def entries_for_cores(entries: list[tuple[str, list[str] | None]],
+                      n: int) -> list[tuple[str, list[str] | None]]:
+    """A field's arms at one width. PANDEMONIUM's arms take --nr-cpus N; an
+    external scheduler reads the online CPUs from the kernel and EEVDF has no
+    command."""
+    adjusted = []
+    for name, cmd in entries:
+        if cmd is not None and "PANDEMONIUM" in name:
+            adjusted.append((name, cmd + ["--nr-cpus", str(n)]))
+        else:
+            adjusted.append((name, None if cmd is None else list(cmd)))
+    return adjusted
+
+
+def fields_pandemonium(entries: list[tuple[str, list[str] | None]]) -> bool:
+    """True when a field holds an arm that runs this tree's binary, which is
+    when a bench has to build it."""
+    return any(cmd is not None and cmd[0] == str(BINARY) for _, cmd in entries)
+
+
+# THE SCHEDULER FIELD. Two axes, the same in every bench. Which schedulers: By
+# default EEVDF and PANDEMONIUM; --schedulers L is EEVDF against exactly L,
+# PANDEMONIUM only if L names it; --all-scx adds every installed SCX_FIELD
+# scheduler; --only L is exactly L, with no EEVDF arm. Which of PANDEMONIUM's
+# arms: --pandemonium-only, --adaptive-only or --bpf-only name them and drop
+# EEVDF, and an external stays only where a list names it, so --only scx_panda
+# --adaptive-only fields the two. scx_chaos (fault injection) is not a
+# contender; scx_layered self-skips without a layer spec.
+SCX_FIELD = [
+    "scx_bpfland", "scx_rusty", "scx_lavd", "scx_flow", "scx_rustland",
+    "scx_p2dq", "scx_tickless", "scx_cosmos", "scx_flash",
+    "scx_beerland", "scx_layered",
+]
+DEFAULT_EXTERNALS: list[str] = []
+PANDEMONIUM_NAMES = {"pandemonium", "scx_pandemonium"}
+
+
+# ARMS BY PATH. --arm NAME=COMMAND fields a scheduler the operator names by its
+# binary, where --only and --schedulers name one installed on PATH: two builds
+# of one scheduler side by side, a checkout's target directory, a binary with
+# flags of its own. NAME is what every report, metrics file and montauk read
+# calls the arm. Arms named alone are the whole field, as --only is; beside
+# --only, --schedulers or a PANDEMONIUM arm flag they join that field. A label
+# that contains PANDEMONIUM is PANDEMONIUM's to every bench (the width flag,
+# the telemetry read). The list is the process's: argparse fills it wherever
+# add_field_flags put the flag and scheduler_field reads it, so no bench hands
+# it on.
+_ARMS: list[tuple[str, list[str]]] = []
+_ARM_LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
+
+
+def parse_arm(spec: str) -> tuple[str, list[str]]:
+    """NAME=COMMAND as (label, argv), the binary made absolute so the arm
+    means the same file under sudo and from any directory. ValueError carries
+    the reason."""
+    label, sep, command = spec.partition("=")
+    label = label.strip()
+    if not sep or not label or not command.strip():
+        raise ValueError(f"--arm {spec!r}: write NAME=/path/to/scheduler, with its flags if any")
+    if not _ARM_LABEL.fullmatch(label):
+        raise ValueError(f"--arm {label!r}: a label is letters, digits, '_', '.' and '-'")
+    if label.upper() == "EEVDF":
+        raise ValueError("--arm EEVDF: EEVDF is the kernel's own arm; name it with --only eevdf")
+    argv = shlex.split(command)
+    exe = os.path.expanduser(argv[0])
+    if os.sep in exe:
+        exe = os.path.abspath(exe)
+        if not (os.path.isfile(exe) and os.access(exe, os.X_OK)):
+            raise ValueError(f"--arm {label}: {exe} is not an executable file")
+    else:
+        found = shutil.which(exe)
+        if not found:
+            raise ValueError(f"--arm {label}: {exe} is not on PATH")
+        exe = os.path.abspath(found)
+    return label, [exe, *argv[1:]]
+
+
+class _ArmAction(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        try:
+            label, argv = parse_arm(values)
+        except ValueError as e:
+            parser.error(str(e))
+        if any(label == seen for seen, _ in _ARMS):
+            parser.error(f"--arm {label}: the label is given twice")
+        _ARMS.append((label, argv))
+        # THE NORMALISED SPEC IS WHAT A DISPATCHER HANDS ITS CHILD.
+        specs = list(getattr(namespace, self.dest, None) or [])
+        specs.append(f"{label}={shlex.join(argv)}")
+        setattr(namespace, self.dest, specs)
+
+
+# A DISTURBANCE UNDER A LIVE ARM. --disturb offline:CPU@START+HOLD takes CPU
+# offline START seconds after each arm activates and brings it back HOLD
+# seconds later, under whatever the bench is running at that moment: the one
+# way the suite exercises hotplug beneath a loaded scheduler, since a width is
+# set before an arm starts. The spec is the process's, like the arms: argparse
+# sets it and start_and_wait arms it for every scheduler it activates. EEVDF
+# has no activation and is not disturbed.
+_DISTURB: tuple[int, float, float] | None = None
+_DISTURB_SPEC = re.compile(r"offline:(\d+)@(\d+(?:\.\d+)?)\+(\d+(?:\.\d+)?)")
+
+
+def parse_disturb(spec: str) -> tuple[int, float, float]:
+    """offline:CPU@START+HOLD as (cpu, start_s, hold_s). ValueError carries the
+    reason."""
+    m = _DISTURB_SPEC.fullmatch(spec.strip())
+    if not m:
+        raise ValueError(f"--disturb {spec!r}: write offline:CPU@START+HOLD, seconds, "
+                         "e.g. offline:11@3+12")
+    cpu, start, hold = int(m.group(1)), float(m.group(2)), float(m.group(3))
+    if cpu == 0:
+        raise ValueError("--disturb: cpu0 cannot be taken offline")
+    if hold <= 0:
+        raise ValueError("--disturb: HOLD is how long the CPU stays offline and must be above 0")
+    return cpu, start, hold
+
+
+class _DisturbAction(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        global _DISTURB
+        try:
+            _DISTURB = parse_disturb(values)
+        except ValueError as e:
+            parser.error(str(e))
+        setattr(namespace, self.dest, values.strip())
+
+
+class Disturbance(threading.Thread):
+    """One offline-and-back of one CPU under one live arm."""
+
+    def __init__(self, cpu: int, start: float, hold: float, arm: str):
+        super().__init__(daemon=True)
+        self.cpu, self.start_s, self.hold_s, self.arm = cpu, start, hold, arm
+        self.taken = False
+        self._done = threading.Event()
+
+    def run(self):
+        if self._done.wait(self.start_s):
+            return
+        if not cpu_is_online(self.cpu):
+            log_warn(f"disturb: cpu{self.cpu} is already offline at this width -- nothing to take")
+            return
+        log_info(f"disturb: taking cpu{self.cpu} offline under {self.arm} for {self.hold_s:g}s")
+        self.taken = set_cpu_online(self.cpu, False)
+        if not self.taken:
+            log_warn(f"disturb: could not take cpu{self.cpu} offline")
+            return
+        self._done.wait(self.hold_s)
+        self._restore()
+
+    def _restore(self):
+        if self.taken:
+            self.taken = False
+            set_cpu_online(self.cpu, True)
+            log_info(f"disturb: cpu{self.cpu} back online under {self.arm}")
+
+    def finish(self):
+        """The arm is stopping: end the disturbance and leave the CPU online."""
+        self._done.set()
+        if self.is_alive():
+            self.join(timeout=10.0)
+        self._restore()
+
+
+def scheduler_field(sel: str | None, pand: list[tuple[str, list[str]]], named=(),
+                    all_scx: bool = False,
+                    exact: bool = False) -> list[tuple[str, list[str] | None]]:
+    """The (label, argv) arms a bench runs, EEVDF's argv None. sel is the
+    PANDEMONIUM selection (args.pandemonium); pand the PANDEMONIUM arms the bench
+    runs for it; named the --schedulers or --only list (a comma string or a
+    list); exact whether it came from --only, where EEVDF runs only if named.
+    An uninstalled external is warned and skipped. Arms given by --arm come
+    last, and named with nothing else they are the field: no EEVDF, no
+    PANDEMONIUM."""
+    if isinstance(named, str):
+        named = named.split(",")
+    names = [s.strip() for s in named if s and s.strip()]
+    lower = {s.lower() for s in names}
+    if _ARMS and not names and not all_scx and not sel:
+        exact = True
+    field: list[tuple[str, list[str] | None]] = []
+    if ("eevdf" in lower) if exact else not sel:
+        field.append(("EEVDF", None))
+    if sel or (not names and not _ARMS) or all_scx or lower & PANDEMONIUM_NAMES:
+        field += pand
+    externals = SCX_FIELD if all_scx else [s for s in names
+                                           if s.lower() not in PANDEMONIUM_NAMES | {"eevdf"}]
+    for s in externals:
+        path = find_scheduler(s)
+        if path:
+            log_info(f"found {s} ({path})")
+            field.append((s, [s]))
+        else:
+            log_warn(f"{s} is not installed, skipping")
+    taken = {name for name, _ in field}
+    for label, argv in _ARMS:
+        if label in taken:
+            log_warn(f"--arm {label}: the field already has an arm of that name, skipping")
+            continue
+        log_info(f"arm {label} ({' '.join(argv)})")
+        field.append((label, list(argv)))
+    return field
+
+
+def add_field_flags(ap, note: str = "") -> None:
+    """The field's flags, the same on every bench, so a dispatcher passes them
+    to any bench unchanged: --schedulers, --all-scx, --only and --arm for which
+    schedulers run, the PANDEMONIUM arm group, and --disturb for what is done
+    to each arm while it runs."""
+    ap.add_argument("--schedulers", default=",".join(DEFAULT_EXTERNALS), metavar="LIST",
+                    help="EEVDF against exactly these comma-separated schedulers, "
+                         "PANDEMONIUM only if named" + note)
+    ap.add_argument("--all-scx", action="store_true",
+                    help="add every installed production scx scheduler" + note)
+    ap.add_argument("--only", default="", metavar="LIST",
+                    help="exactly these schedulers and nothing else: EEVDF only if "
+                         "named, PANDEMONIUM only if named or an arm flag adds it" + note)
+    ap.add_argument("--arm", action=_ArmAction, default=[], metavar="NAME=COMMAND",
+                    help="field a scheduler by its binary under the label NAME, as in "
+                         "--arm old=/builds/a/scx_foo --arm new=/builds/b/scx_foo; "
+                         "repeatable. Arms alone are the whole field; beside --only, "
+                         "--schedulers or an arm flag they join it" + note)
+    ap.add_argument("--disturb", action=_DisturbAction, default=None, metavar="SPEC",
+                    help="disturb each arm while it runs: offline:CPU@START+HOLD takes "
+                         "CPU offline START seconds after the arm activates and brings "
+                         "it back HOLD seconds later, as in offline:11@3+12" + note)
+    add_pandemonium_flags(ap, note)
+
+
+def field_of(args, verbose: bool = True):
+    """scheduler_field over a bench's parsed field flags, PANDEMONIUM's arms
+    as pandemonium_arms spells them."""
+    return scheduler_field(args.pandemonium, pandemonium_arms(args.pandemonium, verbose),
+                           args.only or args.schedulers, args.all_scx,
+                           exact=bool(args.only))
+
+
 # Active scheduler guards, force-ejected on interrupt or normal exit. sched_ext
 # schedulers run in their OWN process group (start_scheduler: preexec_fn=os.setpgrp),
 # so a Ctrl+C to prism's foreground group never reaches them, and __del__-based cleanup
@@ -1695,12 +2136,36 @@ _ACTIVE_GUARDS: set = set()
 
 
 def stop_systemd_scheduler() -> None:
-    """Stop the systemd `pandemonium` service -- the canonical clear of a stale sched_ext
+    """Stop the systemd service behind a registered sched_ext scheduler -- the canonical clear of a stale sched_ext
     registration. Sudo-aware: prefixes sudo only when not already root. Use this instead of
     open-coding `systemctl stop pandemonium` (it was duplicated a dozen ways across the
     suite, half with the wrong sudo handling)."""
     prefix = [] if os.geteuid() == 0 else ["sudo"]
-    subprocess.run(prefix + ["systemctl", "stop", "pandemonium"], capture_output=True)
+    # THE UNIT IS NAMED AFTER THE OPS: pandemonium.service FOR pandemonium,
+    # scx_panda.service FOR scx_panda. STOP THE ONE THE KERNEL NAMES AS WELL AS
+    # pandemonium, SO A RUN NEVER WEDGES ON A SIBLING SCHEDULER'S SERVICE.
+    units = ["pandemonium"]
+    ops = scx_scheduler_name()
+    if ops and ops not in units:
+        units.append(ops)
+    for unit in units:
+        subprocess.run(prefix + ["systemctl", "stop", unit], capture_output=True)
+
+
+def clear_loaded_scheduler(timeout: float = 5.0) -> bool:
+    """Stop whatever sched_ext scheduler is loaded, before a bench starts its
+    own arms: Left registered, every activation after it wedges on it. False,
+    with the reason logged, when it would not leave."""
+    if not is_scx_active():
+        return True
+    name = scx_scheduler_name()
+    log_warn(f"sched_ext is active ({name}) -- stopping its service")
+    stop_systemd_scheduler()
+    if wait_for_deactivation(timeout):
+        return True
+    log_error(f"could not deactivate sched_ext ({name or 'unknown'}) -- clear it: "
+              f"sudo systemctl stop {name or 'pandemonium'}")
+    return False
 
 
 class SchedulerProcess:
@@ -1714,10 +2179,24 @@ class SchedulerProcess:
         self.pgid = os.getpgid(proc.pid)
         self.stdout_path = stdout_path
         self.stderr_path = stderr_path
+        # THE OPS NAME THE KERNEL SHOWED WHEN THIS SCHEDULER ACTIVATED. THE
+        # SURVIVAL CHECK COMPARES AGAINST IT, SO AN EXTERNAL ARM IS JUDGED BY
+        # ITS OWN NAME AND NEVER MARKED CRASHED FOR NOT BEING pandemonium.
+        self.ops_name = ""
+        # WHAT THE ARM LEAVES BEHIND IT: THE KERNEL'S EVENT COUNTERS AS THEY
+        # STOOD WHEN IT WAS STOPPED (stop_and_wait), THE WIDTH IT RAN AT AND
+        # WHEN IT STARTED. THE STDOUT FILE ABOVE IS THE REST.
+        self.events: dict[str, int] = {}
+        self.cores = get_online_cpus()
+        self.started = time.monotonic()
+        self.disturbance: Disturbance | None = None
         _ACTIVE_GUARDS.add(self)
 
     def stop(self):
         _ACTIVE_GUARDS.discard(self)
+        if self.disturbance is not None:
+            self.disturbance.finish()
+            self.disturbance = None
         if self.proc.poll() is not None:
             return
         try:
@@ -1752,13 +2231,15 @@ class SchedulerProcess:
                 pass
         return ""
 
+    # THE STDERR FILE GOES WITH THE GUARD. THE STDOUT FILE STAYS IN
+    # LOG_DIR/sched-stdout: IT CARRIES THE ARM'S EXIT LINES ([KNOBS] WITH ITS
+    # REGIME TICKS, [GRAPH]), THE RECORD OF WHAT THE LAYER DID IN THAT RUN.
     def cleanup(self):
-        for p in [self.stdout_path, self.stderr_path]:
-            if p:
-                try:
-                    os.unlink(p)
-                except (FileNotFoundError, PermissionError):
-                    pass
+        if self.stderr_path:
+            try:
+                os.unlink(self.stderr_path)
+            except (FileNotFoundError, PermissionError):
+                pass
 
     def __del__(self):
         self.stop()
@@ -1781,7 +2262,13 @@ def start_scheduler(cmd: list[str], name: str) -> SchedulerProcess | None:
     # an active scheduler is the user's and teardown leaves it alone.
     note_scheduler_activated()
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    stdout_path = str(LOG_DIR / f"sched-{name}-{os.getpid()}.stdout")
+    # ONE FILE PER ARM, KEPT: EVERY ARM OF A BENCH SHARES THE PROCESS, SO THE PID
+    # ALONE WOULD HAND EACH ARM THE LAST ONE'S FILE.
+    out_dir = LOG_DIR / "sched-stdout"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in name)
+    stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{time.monotonic_ns() % 1_000_000:06d}"
+    stdout_path = str(out_dir / f"sched-{safe}-{stamp}.stdout")
     stdout_f = open(stdout_path, "w")
     stderr_path = str(LOG_DIR / f"sched-{name}-{os.getpid()}.stderr")
     stderr_f = open(stderr_path, "w")
@@ -1836,7 +2323,11 @@ def start_and_wait(cmd: list[str], name: str,
         guard.stop()
         wait_for_deactivation(5.0)
         return None
-    log_info(f"{name} is active")
+    guard.ops_name = scx_scheduler_name()
+    log_info(f"{name} is active (ops {guard.ops_name or 'unknown'})")
+    if _DISTURB is not None:
+        guard.disturbance = Disturbance(*_DISTURB, arm=name)
+        guard.disturbance.start()
     time.sleep(settle_secs)
     return guard
 
@@ -1848,19 +2339,49 @@ def sched_ejected(guard) -> bool:
     for every 'did the scheduler survive this phase' check."""
     if guard is None:
         return False
-    return guard.proc.poll() is not None or not scheduler_active()
+    expected = getattr(guard, "ops_name", "") or "pandemonium"
+    return guard.proc.poll() is not None or not scheduler_active(expected)
+
+
+ARM_RUNS = LOG_DIR / "arm-runs.log"
+
+
+def record_arm_run(guard: SchedulerProcess) -> None:
+    """One line an arm run, appended to LOG_DIR/arm-runs.log and said in the
+    bench's own log: the label, the width, how long it was held, where its own
+    stdout is kept and the kernel's event counters at its stop. A result is
+    read beside these; before this they were side files found by timestamp."""
+    held = time.monotonic() - guard.started
+    events = " ".join(f"{k}={v}" for k, v in sorted(guard.events.items())) or "none read"
+    if not log.child:
+        log_info(f"{guard.name}: sched_ext events at stop: {events}")
+        if guard.stdout_path:
+            log_info(f"{guard.name}: its own log: {guard.stdout_path}")
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with open(ARM_RUNS, "a") as f:
+            f.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [INFO]   arm={guard.name!r} "
+                    f"ops={guard.ops_name or 'none'} cores={guard.cores} held={held:.1f}s "
+                    f"log={guard.stdout_path or 'none'} events: {events}\n")
+    except OSError:
+        pass
 
 
 def stop_and_wait(guard: SchedulerProcess | None) -> str:
-    """Stop a scheduler, wait for deactivation. Returns captured stdout."""
+    """Stop a scheduler, wait for deactivation. Returns captured stdout. The
+    kernel's event counters are read first, while the scheduler they belong to
+    is still loaded, and kept on the guard."""
     if guard is None:
         return ""
+    if not sched_ejected(guard):
+        guard.events = read_scx_events()
     guard.stop()
     stdout = guard.drain_stdout()
     if not wait_for_deactivation(5.0):
         log_warn(f"sched_ext still active after stopping {guard.name}")
     measure_struct_ops_cleanup()
     time.sleep(1)
+    record_arm_run(guard)
     return stdout
 
 
@@ -1929,11 +2450,7 @@ def _write_cross_domain_marker(guard, rec_dir):
     for EEVDF / external schedulers (no [KNOBS] line)."""
     if guard is None or rec_dir is None:
         return
-    try:
-        output = guard.read_output()
-    except Exception:
-        return
-    _write_cross_domain_marker_text(output, rec_dir)
+    _write_cross_domain_marker_text(guard.drain_stdout(), rec_dir)
 
 
 def _write_cross_domain_marker_text(output, rec_dir):
@@ -2097,11 +2614,7 @@ def _write_chaos_markers_text(output, rec_dir):
 def _write_chaos_markers(guard, rec_dir):
     if guard is None or rec_dir is None:
         return
-    try:
-        output = guard.read_output()
-    except Exception:
-        return
-    _write_chaos_markers_text(output, rec_dir)
+    _write_chaos_markers_text(guard.drain_stdout(), rec_dir)
 
 
 def parse_enqueue_stream(stdout_text: str) -> dict:
